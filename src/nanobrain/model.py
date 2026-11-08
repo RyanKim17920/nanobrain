@@ -72,6 +72,11 @@ class ViTMAE3D(nn.Module):
         norm_target: bool = False,
         grad_loss_weight: float = 0.0,
         fg_loss_weight: float = 0.0,
+        # training only: the pixel decoder reads the output of encoder block decoder_layer (1-based,
+        # through its own LayerNorm) instead of the last one, so the blocks above it are trained by
+        # the level head alone and the last layer the probes read is not specialized for pixel
+        # reconstruction. 0 = the last layer (default)
+        decoder_layer: int = 0,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -92,6 +97,8 @@ class ViTMAE3D(nn.Module):
         self.hard_gamma = hard_gamma
         self.hard_max = hard_max
         self.decoder_keep = decoder_keep
+        assert 0 <= decoder_layer <= depth
+        self.decoder_layer = decoder_layer if decoder_layer < depth else 0
 
         patch_dim = patch_size**3
         self.register_buffer("coord_grid", make_coord_grid(grid_size, patch_size), persistent=False)
@@ -126,6 +133,7 @@ class ViTMAE3D(nn.Module):
             ]
         )
         self.norm = LayerNorm(embed_dim)
+        self.decoder_in_norm = LayerNorm(embed_dim) if self.decoder_layer else None
 
         # decoder
         self.decoder_proj = nn.Linear(embed_dim, decoder_embed_dim)
@@ -214,17 +222,24 @@ class ViTMAE3D(nn.Module):
         self,
         x: Float[Tensor, "B N D"],
         coord: Float[Tensor, "B N 3"],
+        return_mid: bool = False,
     ) -> Float[Tensor, "B R+N D"]:
-        # forward_encoder after the patch embedding
+        # forward_encoder after the patch embedding. return_mid: also the decoder input, the
+        # decoder_in_norm'd output of block decoder_layer (the last output when decoder_layer is 0)
         B = x.shape[0]
         x = self.pos_embed(x, coord)
 
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
 
-        for block in self.blocks:
+        mid = None
+        for ii, block in enumerate(self.blocks):
             x = block(x)
+            if return_mid and ii + 1 == self.decoder_layer:
+                mid = self.decoder_in_norm(x)
         x = self.norm(x)
+        if return_mid:
+            return x, (x if mid is None else mid)
         return x
 
     def forward_decoder(
@@ -369,8 +384,8 @@ class ViTMAE3D(nn.Module):
         # forward's loss from sampled sequences
         vis_mask_patches = vis_mask_patches.to(vis_patches.dtype)
         target_mask_patches = target_mask_patches.to(target_patches.dtype)
-        embeds = self.forward_encoder(vis_patches, vis_coord)
-        pred_patches = self.forward_decoder(embeds, target_coord)
+        embeds, mid = self.encode_tokens(self.patch_embed(vis_patches), vis_coord, return_mid=True)
+        pred_patches = self.forward_decoder(mid, target_coord)
         # graft: the v3 loss stack. norm_target z-scores each target sequence; the
         # mse and the gradient penalty run on target_ref, the fg mask weights the mse
         if self.norm_target:
@@ -559,8 +574,8 @@ class ViTMAE3D(nn.Module):
                 return tensors[0].flatten()
             return torch.cat([t.flatten() for t in tensors])
 
-        embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
-        feats = self.decode_features(embeds, cat("target_coord"))
+        embeds, mid = self.encode_tokens(cat("embeds"), cat("vis_coord"), return_mid=True)
+        feats = self.decode_features(mid, cat("target_coord"))
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
         # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
