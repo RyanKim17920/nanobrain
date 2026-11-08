@@ -505,10 +505,11 @@ class ViTMAE3D(nn.Module):
     def _to_cells8(t: Tensor, patch) -> Tensor:
         # native token voxels [R, px*py*pz] -> [R, 1, 8, 8, 8] (nearest; identity at 1 mm), so 2 mm
         # sub-blocks are 2^3 voxel blocks
-        t = t.reshape(-1, 1, *patch)
         if tuple(patch) != (8, 8, 8):
-            t = F.interpolate(t.float(), size=(8, 8, 8), mode="nearest")
-        return t
+            # F.interpolate's nearest (src = floor(dst * in / out)) as one gather: upsample_nearest3d
+            # with ~1e5 batch rows is ~30x slower
+            t = t.reshape(-1, math.prod(patch)).index_select(1, cells8_index(tuple(patch), t.device))
+        return t.reshape(-1, 1, 8, 8, 8)
 
     def mirror_ref(self, vols: Tensor, patch, box, grid, sp) -> Tensor:
         # per token [b, N, 64]: the max within +-1 cell (2 mm cells) of each sub-block's x-mirrored cell
@@ -830,6 +831,14 @@ def patchify3d(x: Tensor, patch_size: int | tuple[int, int, int] = 8) -> Tensor:
     px, py, pz = (patch_size,) * 3 if isinstance(patch_size, int) else patch_size
     x = rearrange(x, "b (gx px) (gy py) (gz pz) -> b (gx gy gz) (px py pz)", px=px, py=py, pz=pz)
     return x
+
+
+@lru_cache(maxsize=4096)
+def cells8_index(patch: tuple[int, int, int], device: torch.device) -> Tensor:
+    # flat voxel index in a px x py x pz patch of each 8^3 nearest-resampled voxel
+    ax = [torch.div(torch.arange(8) * p, 8, rounding_mode="floor") for p in patch]
+    i, j, k = torch.meshgrid(*ax, indexing="ij")
+    return ((i * patch[1] + j) * patch[2] + k).flatten().to(device)
 
 
 @lru_cache(maxsize=4096)
