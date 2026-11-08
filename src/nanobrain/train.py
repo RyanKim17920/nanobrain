@@ -439,6 +439,14 @@ def train(
                 "fino_meta": batch["fino"],
                 "fino_gamma": fino_ramp(args.fino3d.gamma_max, progress),
             }
+        if args.get("sigreg") and args.sigreg.enabled:
+            # sigreg warmup clock: the time schedule's (as fino's), else by step
+            if time_schedule:
+                wall = prev_wall_time + time.monotonic() - start_time
+                sr_progress = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+            else:
+                sr_progress = step / total_steps
+            fino_kwargs["sigreg_progress"] = sr_progress
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,
@@ -480,10 +488,12 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
-            if fino_kwargs:
+            if "fino_gamma" in fino_kwargs:
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
+            for k, v in model_without_ddp.sigreg_stats.items():
+                log_stats[k] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)

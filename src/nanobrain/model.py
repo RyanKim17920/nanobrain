@@ -12,6 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
 from .fino import FinoHeads
+from .sigreg import PooledSigReg
 from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
 from .data import (
     crop_to_mask,
@@ -76,6 +77,8 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # sigreg config block (nanobrain.sigreg), training only, no params; None = off
+        sigreg: dict | None = None,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -177,6 +180,8 @@ class ViTMAE3D(nn.Module):
             assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
+        self.sigreg = PooledSigReg(embed_dim, sigreg) if sigreg is not None else None
+        self.sigreg_stats = {}
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -187,6 +192,7 @@ class ViTMAE3D(nn.Module):
             patch_size=args["patch_size"],
             native=args["native"],
             fino3d=fino if (fino := args.get("fino3d")) and fino.get("enabled") else None,
+            sigreg=sr if (sr := args.get("sigreg")) and sr.get("enabled") else None,
             **args["model_kwargs"],
         )
 
@@ -294,12 +300,13 @@ class ViTMAE3D(nn.Module):
         spacing: list[tuple[float, float, float]] | None = None,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        sigreg_progress: float = 1.0,
     ):
         if isinstance(images, list):
             # native resolution batch, images on their own voxel grids
             return self.forward_native(
                 images, mask, spacing, num_visible, num_predict, num_samples, with_state,
-                fino_meta=fino_meta, fino_gamma=fino_gamma,
+                fino_meta=fino_meta, fino_gamma=fino_gamma, sigreg_progress=sigreg_progress,
             )
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
@@ -492,6 +499,7 @@ class ViTMAE3D(nn.Module):
         with_state: bool = True,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        sigreg_progress: float = 1.0,
     ):
         # images (float) and masks (bool) on their own voxel grids (sample_transform native), fit
         # here to the grid_size mm box in their voxels. images with the same spacing share one
@@ -646,6 +654,13 @@ class ViTMAE3D(nn.Module):
                 meta = meta.pin_memory().to(device, non_blocking=True)
             fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
             loss = loss + fino_loss
+        if self.sigreg is not None and self.training:
+            # anti-collapse on the eval-read global embedding (nanobrain.sigreg); training only
+            vis = embeds[:, self.class_tokens :]
+            sr_loss, self.sigreg_stats = self.sigreg(
+                vis.mean(dim=1), vis if self.sigreg.token_weight else None, sigreg_progress
+            )
+            loss = loss + sr_loss
 
         if not with_state:
             return loss

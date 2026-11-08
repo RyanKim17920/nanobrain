@@ -152,6 +152,23 @@ fino3d:
   bv_mean: null
   bv_std: null
 
+# sigreg (nanobrain.sigreg): LeJEPA SIGReg on the eval-read global embedding (mean of the visible
+# encoder tokens per sequence), per-dim standardized over the batch + a FIFO queue of recent rows,
+# so only correlation / collapse is penalized (no invariance term). weight scales the mean
+# Epps-Pulley integral over num_slices random directions; token_weight (0 = off) adds the same on
+# image-centred visible tokens; warmup = linear ramp over this fraction of training progress.
+# training only, no parameters. enabled false = the base run, bitwise
+sigreg:
+  enabled: false
+  weight: 0.1
+  token_weight: 0.0
+  num_slices: 256
+  knots: 17
+  queue: 1024
+  warmup: 0.05
+  rank_every: 50
+  seed: 0
+
 wandb: false
 wandb_entity: null
 wandb_project: nanobrain
