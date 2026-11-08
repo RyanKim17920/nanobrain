@@ -83,6 +83,15 @@ class ViTMAE3D(nn.Module):
         lat_topk: int = 4,
         teacher_ema: float = 0.998,
         teacher_ema_end: float = 0.9999,
+        # dino = DINO self-distillation on the global token: dino_head (mlp -> l2 bottleneck ->
+        # dino_dim prototypes) on the mean visible-token embedding of each sequence (the vector the
+        # eval's global probes read) is trained to match the teacher's centered, sharpened
+        # distribution for the image's first sequence seen whole (weight; 0 = off)
+        dino_weight: float = 0.0,
+        dino_dim: int = 4096,
+        dino_temp_s: float = 0.1,
+        dino_temp_t: float = 0.04,
+        dino_center: float = 0.9,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -181,6 +190,11 @@ class ViTMAE3D(nn.Module):
         self.teacher_ema = teacher_ema
         self.teacher_ema_end = teacher_ema_end
         self.lat_head = nn.Linear(decoder_embed_dim, embed_dim) if lat_weight else None
+        self.dino_weight = float(dino_weight)
+        self.dino_temp_s, self.dino_temp_t, self.dino_center_m = dino_temp_s, dino_temp_t, dino_center
+        self.dino_head = DINOHead(embed_dim, dino_dim) if dino_weight else None
+        if dino_weight:
+            self.register_buffer("dino_center", torch.zeros(1, dino_dim))
         self.init_weights()
         # after the init: the teacher starts as a copy of the student
         self.teacher = None
@@ -191,7 +205,7 @@ class ViTMAE3D(nn.Module):
 
     @property
     def uses_teacher(self) -> bool:
-        return bool(self.lat_weight)
+        return bool(self.lat_weight or self.dino_weight)
 
     @torch.no_grad()
     def update_teacher(self, momentum: float) -> None:
@@ -682,6 +696,19 @@ class ViTMAE3D(nn.Module):
                 t_final, t_target = self.teacher(cat("t_embeds"), cat("t_coord"), self.lat_topk)
             for part in parts:
                 del part["t_embeds"], part["t_coord"]
+        if self.dino_head is not None:
+            # rows 2i, 2i + 1 (the two sequences of image i) both match the teacher's row i
+            assert num_samples == 2, "dino pairs both sequences of each image with the teacher"
+            student = self.dino_head(embeds[:, self.class_tokens :].float().mean(dim=1)).float()
+            with torch.no_grad():
+                teacher = self.teacher.dino_head(t_final.float().mean(dim=1)).float()
+                probs = F.softmax((teacher - self.dino_center) / self.dino_temp_t, dim=-1)
+                self.dino_center.mul_(self.dino_center_m).add_(
+                    teacher.mean(dim=0, keepdim=True), alpha=1.0 - self.dino_center_m
+                )
+            logp = F.log_softmax(student / self.dino_temp_s, dim=-1)
+            dino = -(probs.repeat_interleave(num_samples, dim=0) * logp).sum(dim=-1).mean()
+            loss = loss + self.dino_weight * dino
         if self.lat_head is not None:
             # rows 2i, 2i + 1 are the two sequences of one image (b-major in every spacing group)
             assert num_samples == 2, "lat pairs sequence 0 of each image with the teacher"
@@ -775,11 +802,27 @@ class ViTMAE3D(nn.Module):
         return outputs
 
 
+class DINOHead(nn.Module):
+    # DINO projection head: 3-layer mlp, l2-normalized bottleneck, weight-normalized prototypes
+    # (norm fixed at 1)
+    def __init__(self, in_dim: int, out_dim: int, hidden: int = 2048, bottleneck: int = 256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, bottleneck),
+        )
+        self.last = nn.Linear(bottleneck, out_dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = F.normalize(self.mlp(x), dim=-1)
+        return F.linear(x, F.normalize(self.last.weight, dim=-1))
+
+
 class TeacherEncoder(nn.Module):
     # frozen EMA copy of the student encoder (patch embedding, position table, class tokens,
     # blocks, final norm; plus the student's projection heads named in HEADS). parameter names
     # match the student's, see ViTMAE3D.update_teacher
-    HEADS = ()
+    HEADS = ("dino_head",)
 
     def __init__(self, student: "ViTMAE3D"):
         super().__init__()
