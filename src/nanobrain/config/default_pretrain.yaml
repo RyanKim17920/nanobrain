@@ -71,7 +71,8 @@ weight_decay: 0.05
 betas: [0.9, 0.95]
 clip_grad: 1.0
 fused_adamw: true
-# adamw, or muon for the block matrices (adamw for the rest). muon's update is scaled to
+# adamw, muon or muonh (muon on the hyperball: fixed init weight norms, no wd; optim.Muon)
+# for the block matrices (adamw for the rest). muon's update is scaled to
 # adamw's rms, so it shares the lr schedule, times muon_lr_mult.
 optimizer: adamw
 muon_lr_mult: 1.0

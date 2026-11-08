@@ -2,6 +2,8 @@
 # References:
 # muon: https://github.com/KellerJordan/Muon
 # moonlight (match_rms_adamw scaling): https://arxiv.org/abs/2502.16982
+# muonh (hyperball): Wen et al. 2026, "Fantastic Pretraining Optimizers and Where to Find Them II:
+# Hyperball Optimization", https://arxiv.org/abs/2606.16899
 
 from collections import defaultdict
 
@@ -39,6 +41,7 @@ class Muon(torch.optim.Optimizer):
         nesterov=True,
         ns_steps=5,
         fused=False,
+        hyperball=False,
     ):
         defaults = dict(
             lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps
@@ -49,6 +52,18 @@ class Muon(torch.optim.Optimizer):
         # few kernels, and the newton-schulz polynomial applied as one matrix (_newtonschulz5_poly).
         # same math as the unfused step up to bf16 rounding
         self.fused = fused
+        # hyperball (muonh): no weight decay; each matrix keeps its init frobenius norm R. the
+        # update is normalized to unit frobenius norm and scaled to the same frobenius length the
+        # plain muon step has (lr 0.2 sqrt(max) ||msign||_F = lr 0.2 sqrt(rows cols)), then the
+        # weight is projected back onto the sphere of radius R:
+        #   W' = R normalize(W - lr 0.2 sqrt(rows cols) normalize(msign(M)))
+        # so the step relative to the radius is lr 0.2 sqrt(rows cols) / R, constant over training
+        self.hyperball = hyperball
+        if hyperball:
+            for group in self.param_groups:
+                assert group["weight_decay"] == 0.0 or group.get("wd_multiplier", 1.0) == 0.0
+                for p in group["params"]:
+                    self.state[p]["radius"] = p.detach().float().norm()
         # with fused, misc.clip_grad leaves these grads unclipped and sets the clip coefficient
         # as grad_scale, which the step applies on the fly
         self.defers_grad_clip = fused
@@ -84,6 +99,13 @@ class Muon(torch.optim.Optimizer):
                 update = zeropower_via_newtonschulz5(torch.stack(updates), group["ns_steps"])
 
                 lr = group["lr"]
+                if self.hyperball:
+                    step_len = lr * 0.2 * (shape[0] * shape[1]) ** 0.5
+                    for p, u in zip(params, update.unbind(0)):
+                        u = u.float()
+                        w = p.float() - step_len * u / (u.norm() + 1e-7)
+                        p.copy_(w * (self.state[p]["radius"] / (w.norm() + 1e-7)))
+                    continue
                 scale = 0.2 * max(shape) ** 0.5
                 torch._foreach_mul_(params, 1 - lr * group["weight_decay"])
                 torch._foreach_add_(params, list(update.to(params[0].dtype).unbind(0)), alpha=-lr * scale)
@@ -110,6 +132,20 @@ class Muon(torch.optim.Optimizer):
                 # python float scalars would be baked into the compiled graph, so they go in
                 # as 0-d tensors (fill_ doesn't sync)
                 coefs = self._coefs(shape, params[0].device)
+                if self.hyperball:
+                    coefs[1].fill_(-lr * 0.2 * (shape[0] * shape[1]) ** 0.5)
+                    _fused_muonh_update(
+                        params,
+                        [p.grad for p in params],
+                        bufs,
+                        [self.state[p]["radius"] for p in params],
+                        coefs[1],
+                        grad_scale,
+                        momentum=group["momentum"],
+                        nesterov=group["nesterov"],
+                        ns_steps=group["ns_steps"],
+                    )
+                    continue
                 coefs[0].fill_(1 - lr * wd)
                 coefs[1].fill_(-lr * 0.2 * max(shape) ** 0.5)
                 _fused_muon_update(
@@ -176,6 +212,37 @@ def _fused_muon_update(
         if p.size(0) > p.size(1):
             u = u.mT
         p.mul_(decay).add_(u.to(p.dtype) * alpha)
+
+
+@torch.compile(fullgraph=True, dynamic=False)
+def _fused_muonh_update(
+    params: list[Tensor],
+    grads: list[Tensor],
+    bufs: list[Tensor],
+    radii: list[Tensor],
+    alpha: Tensor,
+    grad_scale: Tensor | None,
+    momentum: float,
+    nesterov: bool,
+    ns_steps: int,
+):
+    # hyperball muon (see Muon.hyperball): normalized step of frobenius length -alpha, then
+    # projection back to the init frobenius norm. fp32 for the norms and the projection
+    updates = []
+    for g, buf in zip(grads, bufs):
+        if grad_scale is not None:
+            g = g * grad_scale
+        buf.lerp_(g, 1 - momentum)
+        u = g.lerp(buf, momentum) if nesterov else buf
+        u = u.bfloat16()
+        updates.append(u.mT if u.size(0) > u.size(1) else u)
+    X = _newtonschulz5_poly(torch.stack(updates), ns_steps)
+    for p, u, r in zip(params, X.unbind(0), radii):
+        if p.size(0) > p.size(1):
+            u = u.mT
+        u = u.float()
+        w = p.float() + u * (alpha / (u.norm() + 1e-7))
+        p.copy_((w * (r / (w.norm() + 1e-7))).to(p.dtype))
 
 
 class CombinedOptimizer:

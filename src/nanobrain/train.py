@@ -502,7 +502,9 @@ def make_optimizer(args: DictConfig, model: nn.Module):
         misc.update_lr(param_groups, args.lr)
         misc.update_wd(param_groups, args.weight_decay)
         return torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
-    assert args.optimizer == "muon", f"unknown optimizer {args.optimizer}"
+    assert args.optimizer in ("muon", "muonh"), f"unknown optimizer {args.optimizer}"
+    # muonh: muon on the hyperball (fixed init frobenius norm, no weight decay on those matrices)
+    hyperball = args.optimizer == "muonh"
     # muon for the block matrices, adamw for the rest (embeddings, head, norms, biases)
     muon_names = [
         n
@@ -516,7 +518,7 @@ def make_optimizer(args: DictConfig, model: nn.Module):
         {
             "params": [params[n] for n in muon_names],
             "lr_multiplier": args.muon_lr_mult,
-            "wd_multiplier": 1.0,
+            "wd_multiplier": 0.0 if hyperball else 1.0,
         }
     ]
     for groups in (adamw_groups, muon_groups):
@@ -525,7 +527,12 @@ def make_optimizer(args: DictConfig, model: nn.Module):
     return CombinedOptimizer(
         [
             torch.optim.AdamW(adamw_groups, betas=betas, fused=args.fused_adamw),
-            Muon(muon_groups, momentum=args.muon_momentum, fused=args.muon_fused),
+            Muon(
+                muon_groups,
+                momentum=args.muon_momentum,
+                fused=args.muon_fused,
+                hyperball=hyperball,
+            ),
         ]
     )
 
