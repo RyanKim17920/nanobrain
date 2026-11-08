@@ -405,6 +405,18 @@ def train(
         )
 
     optimizer.zero_grad()
+    grl_opt = None
+    if model_without_ddp.grl_head is not None:
+        # the collection classifier steps on its own AdamW with its own clip: its grads stay out of
+        # the global clip_grad norm (they are ~10x the backbone's and would shrink every MAE update)
+        assert loss_scaler is None, "grl: bfloat16 / fp32 only (no loss scaler)"
+        grl_params = list(model_without_ddp.grl_head.parameters())
+        betas = tuple(args.betas) if args.betas is not None else (0.9, 0.999)
+        grl_opt = torch.optim.AdamW(
+            [{"params": [p for p in grl_params if p.ndim >= 2], "weight_decay": args.weight_decay},
+             {"params": [p for p in grl_params if p.ndim < 2], "weight_decay": 0.0}],
+            lr=0.0, betas=betas,
+        )
 
     if args.high_priority_stream and device.type == "cuda":
         # model work on a high priority stream: the prep threads' kernels (priority 0 side streams)
@@ -481,6 +493,13 @@ def train(
 
         # log tensors without syncing, values are only read on log steps
         metric_logger.update(loss=loss_for_log)
+        if grl_opt is not None and need_update:
+            grl_grad = torch.nn.utils.clip_grad_norm_(grl_params, args.clip_grad or float("inf"))
+            for group in grl_opt.param_groups:
+                group["lr"] = lr
+            grl_opt.step()
+            grl_opt.zero_grad(set_to_none=True)
+            metric_logger.update(grl_grad=grl_grad)
         if need_update:
             metric_logger.update(lr=lr, grad=grad_norm)
         if "grl_lam" in fino_kwargs:
@@ -508,6 +527,7 @@ def train(
                 log_stats["grl_lambda"] = fino_kwargs["grl_lam"]
                 log_stats["grl_ce"] = metric_logger.grl_ce.avg
                 log_stats["grl_acc"] = metric_logger.grl_acc.avg
+                log_stats["grl_grad"] = metric_logger.grl_grad.value
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)
@@ -567,8 +587,10 @@ def train(
 def make_optimizer(args: DictConfig, model: nn.Module):
     # cast or else it corrupts the checkpoint
     betas = tuple(args.betas) if args.betas is not None else None
+    # the grl collection classifier steps on its own optimizer (train)
+    grl_names = {n for n, _ in model.named_parameters() if n.startswith("grl_head.")}
     if args.optimizer == "adamw":
-        param_groups = misc.get_param_groups(model)
+        param_groups = misc.get_param_groups(model, skip_names=grl_names)
         misc.update_lr(param_groups, args.lr)
         misc.update_wd(param_groups, args.weight_decay)
         return torch.optim.AdamW(param_groups, betas=betas, fused=args.fused_adamw)
@@ -580,7 +602,7 @@ def make_optimizer(args: DictConfig, model: nn.Module):
         if is_muon_param(n, p, args.muon_encoder_only, args.muon_decoder_only, args.muon_all_matrices)
     ]
     logger.info(f"muon params: {len(muon_names)} matrices")
-    adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names))
+    adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names) | grl_names)
     params = dict(model.named_parameters())
     muon_groups = [
         {
