@@ -582,7 +582,7 @@ class ViTMAE3D(nn.Module):
             b = len(part["ids"])
             part["order"] = order.unflatten(0, (b, num_samples))
             # images and masks gathered together by flat token ids
-            flat_ids = part["order"] + gather_offsets(b, num, device)
+            flat_ids = part["order"] + gather_offsets(b, num, device, len(vols))
             patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
             patches, mask_patches, *aug_patches = patches.view(len(vols), b * num_samples, seq_length, -1)
             coord = geoms[sp][3][0][order]
@@ -895,9 +895,9 @@ def fit_slices(
 
 
 @lru_cache(maxsize=4096)
-def gather_offsets(batch_size: int, num_patches: int, device: torch.device) -> Tensor:
+def gather_offsets(batch_size: int, num_patches: int, device: torch.device, channels: int = 2) -> Tensor:
     # [2, B, 1, 1] flat row offsets of (image | mask, image) in a [2, B, N, P] patch tensor
-    return torch.arange(2 * batch_size, device=device).view(2, batch_size, 1, 1) * num_patches
+    return torch.arange(channels * batch_size, device=device).view(channels, batch_size, 1, 1) * num_patches
 
 
 @lru_cache(maxsize=4096)
