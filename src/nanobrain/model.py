@@ -72,6 +72,11 @@ class ViTMAE3D(nn.Module):
         norm_target: bool = False,
         grad_loss_weight: float = 0.0,
         fg_loss_weight: float = 0.0,
+        # cross-view global loss (native path, num_samples 2): VICReg between projections of the
+        # mean visible-token embedding of the two sequences of each image, i.e. the very vector the
+        # eval's global probes read (weight; 0 = off)
+        pair_weight: float = 0.0,
+        pair_dim: int = 256,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -140,6 +145,13 @@ class ViTMAE3D(nn.Module):
             levels = [float(t) for t in level_thresholds]
             self.level_head = nn.Linear(embed_dim, len(levels) * (patch_size // level_pool) ** 3)
             self.register_buffer("level_thresholds", torch.tensor(levels), persistent=False)
+        self.pair_weight = float(pair_weight)
+        self.pair_proj = None
+        if pair_weight:
+            assert native, "pair_weight: native path only"
+            self.pair_proj = nn.Sequential(
+                nn.Linear(embed_dim, 1024), nn.GELU(), nn.Linear(1024, pair_dim)
+            )
         # training speed, set by train.py (not a model kwarg): see decode_features
         self.decoder_prune_last = False
         self.decoder_pos_embed = SeparablePosEmbed3D(patch_grid_size, decoder_embed_dim)
@@ -618,6 +630,12 @@ class ViTMAE3D(nn.Module):
                 )
                 num, den = num + n, den + d
             loss = loss + self.level_weight * num / den.clamp_min(1e-6)
+        if self.pair_proj is not None:
+            # rows 2i, 2i + 1 are the two sequences of one image (each spacing group is b-major)
+            assert num_samples == 2, "pair_weight pairs sequences 2i, 2i + 1"
+            pooled = embeds[:, self.class_tokens :].float().mean(dim=1)
+            z = self.pair_proj(pooled).float()
+            loss = loss + self.pair_weight * vicreg_loss(z[0::2], z[1::2])
 
         if not with_state:
             return loss
@@ -706,6 +724,22 @@ def vit_mae_3d(checkpoint: str, random_weights: bool = False) -> ViTMAE3D:
     if not random_weights:
         model.load_state_dict(ckpt["model"])
     return model
+
+
+def vicreg_loss(z1: Tensor, z2: Tensor, eps: float = 1e-4) -> Tensor:
+    # VICReg (Bardes et al. 2022) with its 25 / 25 / 1 coefficients
+    inv = F.mse_loss(z1, z2)
+
+    def var_cov(z: Tensor) -> tuple[Tensor, Tensor]:
+        z = z - z.mean(dim=0)
+        var = F.relu(1.0 - (z.var(dim=0) + eps).sqrt()).mean()
+        cov = (z.T @ z) / max(len(z) - 1, 1)
+        off = cov - torch.diag(torch.diag(cov))
+        return var, off.square().sum() / z.shape[1]
+
+    v1, c1 = var_cov(z1)
+    v2, c2 = var_cov(z2)
+    return 25.0 * inv + 25.0 * (v1 + v2) / 2 + (c1 + c2)
 
 
 def patchify3d(x: Tensor, patch_size: int | tuple[int, int, int] = 8) -> Tensor:
