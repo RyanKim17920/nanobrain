@@ -72,6 +72,10 @@ class ViTMAE3D(nn.Module):
         norm_target: bool = False,
         grad_loss_weight: float = 0.0,
         fg_loss_weight: float = 0.0,
+        # register tokens (Darcet et al. 2024) kept inside the encoder: the class_tokens are dropped
+        # before the decoder, so they can hold scratch / attention-sink state but the decoder can
+        # not read global context from them, it must stay in the patch tokens the probes mean-pool
+        decoder_skip_cls: bool = False,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -92,6 +96,7 @@ class ViTMAE3D(nn.Module):
         self.hard_gamma = hard_gamma
         self.hard_max = hard_max
         self.decoder_keep = decoder_keep
+        self.decoder_skip_cls = decoder_skip_cls
 
         patch_dim = patch_size**3
         self.register_buffer("coord_grid", make_coord_grid(grid_size, patch_size), persistent=False)
@@ -246,10 +251,13 @@ class ViTMAE3D(nn.Module):
 
         if self.global_proj is not None:
             pooled = self.global_proj(embeds[:, self.class_tokens :].mean(dim=1, keepdim=True))
+        num_cls = self.class_tokens
+        if self.decoder_skip_cls and num_cls:
+            embeds, num_cls = embeds[:, num_cls:], 0
         if self.training and self.decoder_keep < 1.0:
             # visible order is a random shuffle, so a prefix is a uniform subset
-            keep = int((embeds.shape[1] - self.class_tokens) * self.decoder_keep)
-            embeds = embeds[:, : self.class_tokens + keep]
+            keep = int((embeds.shape[1] - num_cls) * self.decoder_keep)
+            embeds = embeds[:, : num_cls + keep]
         embeds = self.decoder_proj(embeds)
 
         mask_tokens = self.mask_token.expand(B, M, -1)
