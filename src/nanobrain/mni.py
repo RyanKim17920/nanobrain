@@ -106,6 +106,37 @@ def grid_theta(voxel_map: np.ndarray, in_shape, out_shape) -> Tensor:
     return torch.from_numpy(np.ascontiguousarray(theta, dtype=np.float32))
 
 
+def output_box(voxel_map: np.ndarray, in_shape, grid_size) -> tuple[slice, ...]:
+    # the model grid voxels that can sample the image: its voxel box with a 1 voxel margin (where
+    # trilinear sampling with zero padding is still nonzero), mapped to the grid. Outside it the
+    # resample is exactly 0, so only the box is sampled (~2x fewer points)
+    corners = np.array(np.meshgrid(*[[-1.0, size] for size in in_shape], indexing="ij")).reshape(3, -1)
+    inv = np.linalg.inv(voxel_map)
+    out = inv[:3, :3] @ corners + inv[:3, 3:]
+    lo = np.clip(np.floor(out.min(1)).astype(int), 0, np.array(grid_size))
+    hi = np.clip(np.ceil(out.max(1)).astype(int) + 1, lo, np.array(grid_size))
+    return tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+
+
+def box_theta(voxel_map: np.ndarray, in_shape, grid_size) -> tuple[Tensor, tuple[slice, ...]]:
+    # grid_theta of the output box (the box's voxels -> image voxels)
+    box = output_box(voxel_map, in_shape, grid_size)
+    shift = np.eye(4)
+    shift[:3, 3] = [b.start for b in box]
+    shape = [b.stop - b.start for b in box]
+    return grid_theta(voxel_map @ shift, in_shape, shape), box
+
+
+def resample_box(image: Tensor, mask: Tensor, theta: Tensor, box, image_out: Tensor, mask_out: Tensor):
+    # resample into the box of zero filled grid tensors
+    shape = tuple(b.stop - b.start for b in box)
+    if min(shape) <= 0:
+        return
+    image_box, mask_box = resample(image, mask, theta, shape)
+    image_out[box] = image_box
+    mask_out[box] = mask_box
+
+
 def resample(image: Tensor, mask: Tensor, theta: Tensor, grid_size) -> tuple[Tensor, Tensor]:
     # image (normalized, 0 outside the mask, smoothed) and mask on the image voxels -> the model
     # grid: one trilinear grid_sample of both (float32 grid: bf16 coordinates are off by voxels);

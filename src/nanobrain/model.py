@@ -827,10 +827,12 @@ class ViTMAE3D(nn.Module):
             voxel_map, input_affine = mni_lib.sampling_affine(
                 affine, sample["mni_affine"], self.mni_align, self.grid_size
             )
-            theta = mni_lib.grid_theta(voxel_map, image.shape, self.grid_size)
+            theta, box = mni_lib.box_theta(voxel_map, image.shape, self.grid_size)
             image = gaussian_smooth(image, mni_lib.smoothing_sigmas(affine, self.target_spacing))
-            image, mask = mni_lib.resample(image, mask, theta, self.grid_size)
-            return {"image": image, "mask": mask.float(), "affine": input_affine}
+            image_out = image.new_zeros(self.grid_size)
+            mask_out = image.new_zeros(self.grid_size)
+            mni_lib.resample_box(image, mask, theta, box, image_out, mask_out)
+            return {"image": image_out, "mask": mask_out, "affine": input_affine}
         image, mask, affine = reorient_to_ras(image, mask, affine)
         image, mask, affine = resample_to_spacing(image, mask, affine, self.target_spacing)
         image, mask, affine = fit_to_shape(image, mask, affine, self.grid_size)
