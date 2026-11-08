@@ -66,6 +66,10 @@ class ViTMAE3D(nn.Module):
         level_weight: float = 0.0,
         level_thresholds: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 2.5),
         level_pool: int = 2,
+        # training only: gaussian noise on the in-brain voxels of the VISIBLE patches fed to the
+        # encoder, per-sequence sigma ~ U(0, noise_sigma_max) in z-scored units (volumes are
+        # normalized to std 1 over the brain). targets and the level head stay clean (0 = off)
+        noise_sigma_max: float = 0.0,
         # the nanobrain-v3 loss stack, grafted from v3/src/nanobrain/model.py:
         # z-score each target sequence before the mse; foreground-weighted mse; and the
         # xyz gradient penalty on the target-ref patches (dense_neighbor_pool needs
@@ -138,6 +142,7 @@ class ViTMAE3D(nn.Module):
         self.self_recon_head = nn.Linear(embed_dim, patch_dim) if self_recon_weight else None
         self.min_mask_frac = min_mask_frac
         self.level_weight = level_weight
+        self.noise_sigma_max = noise_sigma_max
         self.level_pool = level_pool
         self.level_head = None
         if level_weight:
@@ -561,9 +566,15 @@ class ViTMAE3D(nn.Module):
             vis_patches, part["target_patches"] = patches.split([num_visible, num_predict], 1)
             part["target_mask_patches"] = mask_patches[:, num_visible:]
             part["vis_coord"], part["target_coord"] = coord.split([num_visible, num_predict], 1)
-            part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
             if self.level_head is not None:
                 part["vis_patches"], part["vis_mask"] = vis_patches, mask_patches[:, :num_visible]
+            if self.training and self.noise_sigma_max > 0.0:
+                # clean vis_patches stay the level head target; only the encoder input is noised
+                sigma = torch.rand(vis_patches.shape[0], 1, 1, device=device, dtype=vis_patches.dtype)
+                sigma = sigma * self.noise_sigma_max
+                vm = mask_patches[:, :num_visible].to(vis_patches.dtype)
+                vis_patches = vis_patches + sigma * torch.randn_like(vis_patches) * vm
+            part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
 
         def cat(key: str) -> Tensor:
             # contiguous for one group too, the compiled encoder would recompile on view strides
