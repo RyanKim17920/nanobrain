@@ -1,3 +1,4 @@
+import copy
 import math
 from functools import lru_cache
 
@@ -76,6 +77,15 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # data2vec 2.0 aux loss (training only, 0 = off): a linear head on the decoder features of
+        # the predicted tokens regresses an EMA teacher's target (mean of its top-K block outputs,
+        # each instance normed over the sequence, then layer normed). d2v_share: all num_samples
+        # sequences of an image are permutations of one token set, so the teacher encodes it once
+        # (data2vec 2.0's multi-mask reuse). the teacher lives in train.py (D2VTeacher)
+        d2v_weight: float = 0.0,
+        d2v_top_k: int = 8,
+        d2v_share: bool = True,
+        d2v_ema: tuple[float, float] = (0.999, 0.9999),
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -177,6 +187,16 @@ class ViTMAE3D(nn.Module):
             assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
+        self.d2v_weight = float(d2v_weight)
+        self.d2v_top_k = d2v_top_k
+        self.d2v_share = d2v_share
+        self.d2v_ema = tuple(d2v_ema)
+        self.d2v_head = None
+        self.d2v_stats = {}
+        if d2v_weight:
+            assert native, "d2v: native training only"
+            self.d2v_head = nn.Linear(decoder_embed_dim, embed_dim)
+            self.d2v_head.apply(_init_weights)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -294,12 +314,13 @@ class ViTMAE3D(nn.Module):
         spacing: list[tuple[float, float, float]] | None = None,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        d2v_teacher: "D2VTeacher | None" = None,
     ):
         if isinstance(images, list):
             # native resolution batch, images on their own voxel grids
             return self.forward_native(
                 images, mask, spacing, num_visible, num_predict, num_samples, with_state,
-                fino_meta=fino_meta, fino_gamma=fino_gamma,
+                fino_meta=fino_meta, fino_gamma=fino_gamma, d2v_teacher=d2v_teacher,
             )
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
@@ -492,6 +513,7 @@ class ViTMAE3D(nn.Module):
         with_state: bool = True,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        d2v_teacher: "D2VTeacher | None" = None,
     ):
         # images (float) and masks (bool) on their own voxel grids (sample_transform native), fit
         # here to the grid_size mm box in their voxels. images with the same spacing share one
@@ -533,6 +555,8 @@ class ViTMAE3D(nn.Module):
             parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols})
             parts[-1]["scores"] = scores
 
+        d2v = d2v_teacher is not None and self.d2v_head is not None
+        share = d2v and self.d2v_share and num_samples > 1
         # one argsort for all groups, rows padded with 3.0 (after every score). sorts this long are
         # stable, so these are the per group argsorts
         num_tokens = [part["scores"].shape[1] for part in parts]
@@ -553,6 +577,13 @@ class ViTMAE3D(nn.Module):
             del part["scores"]
             b = len(part["ids"])
             part["order"] = order.unflatten(0, (b, num_samples))
+            if share:
+                # every sample a random permutation of sample 0's tokens (perm: sample 0 positions)
+                perm = torch.rand(b, num_samples, seq_length, device=device).argsort(dim=-1)
+                perm[:, 0] = torch.arange(seq_length, device=device)
+                part["perm"] = perm
+                part["order"] = part["order"][:, :1].expand_as(perm).gather(-1, perm)
+                order = part["order"].flatten(0, 1)
             # images and masks gathered together by flat token ids
             flat_ids = part["order"] + gather_offsets(b, num, device)
             patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
@@ -562,6 +593,10 @@ class ViTMAE3D(nn.Module):
             part["target_mask_patches"] = mask_patches[:, num_visible:]
             part["vis_coord"], part["target_coord"] = coord.split([num_visible, num_predict], 1)
             part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
+            if d2v:
+                # teacher input: the whole sequence (sample 0 only when shared)
+                rows = slice(None, None, num_samples) if share else slice(None)
+                part["t_patches"], part["t_coord"] = patches[rows], coord[rows]
             if self.level_head is not None:
                 part["vis_patches"], part["vis_mask"] = vis_patches, mask_patches[:, :num_visible]
 
@@ -578,6 +613,10 @@ class ViTMAE3D(nn.Module):
 
         embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
         feats = self.decode_features(embeds, cat("target_coord"))
+        if d2v:
+            d2v_loss = self.d2v_loss(
+                d2v_teacher, parts, feats, num_visible, num_samples, share, geoms, native_sps
+            )
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
         # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
@@ -647,9 +686,43 @@ class ViTMAE3D(nn.Module):
             fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
             loss = loss + fino_loss
 
+        if d2v:
+            loss = loss + self.d2v_weight * d2v_loss
+
         if not with_state:
             return loss
         return loss, {"parts": parts, "embeds": embeds}
+
+    def d2v_loss(self, teacher, parts, feats, num_visible, num_samples, share, geoms, native_sps):
+        # data2vec 2.0 aux: mse of d2v_head(decoder features) to the teacher target on the predicted
+        # tokens, each token weighted by its in-mask fraction (as the pixel loss)
+        with torch.no_grad():
+            t_ws = {}
+            if native_sps:
+                t_ws = teacher.patch_embed.native_weights(native_sps, [geoms[sp][0] for sp in native_sps])
+                t_ws = dict(zip(native_sps, t_ws))
+            x = torch.cat([
+                teacher.patch_embed.native(part["t_patches"], part["spacing"], part["patch"], t_ws.get(part["spacing"]))
+                for part in parts
+            ])
+            coord = torch.cat([part.pop("t_coord") for part in parts]).contiguous()
+            for part in parts:
+                del part["t_patches"]
+            target = teacher.encode(x, coord, self.d2v_top_k)
+            if share:
+                # sample s token j is sample 0's token perm[s, j]
+                perm = torch.cat([part.pop("perm") for part in parts])[:, :, num_visible:]
+                target = target[:, None].expand(-1, num_samples, -1, -1)
+                target = target.gather(2, perm[..., None].expand(-1, -1, -1, target.shape[-1]))
+                target = target.flatten(0, 1)
+            else:
+                target = target[:, num_visible:]
+        pred = self.d2v_head(feats).float()
+        err = (pred - target).pow(2).mean(dim=-1)
+        w = torch.cat([part["target_mask_patches"].float().mean(dim=-1) for part in parts])
+        loss = (w * err).sum() / w.sum().clamp_min(1e-6)
+        self.d2v_stats = {"loss": loss.detach()}
+        return loss
 
     def compile_native(self, **kwargs) -> None:
         # the fixed-shape transformer parts. per-spacing tokenization, embedding and head stay eager
@@ -879,6 +952,46 @@ def grid_coords(grid: tuple[int, int, int], device: torch.device) -> Tensor:
 
 # JAX ViT xavier uniform init
 # https://github.com/facebookresearch/capi/blob/main/model.py
+class D2VTeacher(nn.Module):
+    # data2vec 2.0 EMA teacher: copies of the student's tokenizer and encoder blocks, no gradients
+    def __init__(self, model: ViTMAE3D):
+        super().__init__()
+        assert not model.class_tokens, "d2v: class_tokens 0 only"
+        self.patch_embed = copy.deepcopy(model.patch_embed)
+        self.pos_embed = copy.deepcopy(model.pos_embed)
+        self.blocks = copy.deepcopy(model.blocks)
+        self.requires_grad_(False)
+        self.ema = model.d2v_ema
+        self._pairs = None
+
+    def encode(self, x: Tensor, coord: Tensor, top_k: int) -> Tensor:
+        # mean of the last top_k block outputs, each instance normed over tokens; then layer normed
+        x = self.pos_embed(x, coord)
+        target = 0.0
+        for ii, block in enumerate(self.blocks):
+            x = block(x)
+            if ii >= len(self.blocks) - top_k:
+                target = target + F.instance_norm(x.float().transpose(1, 2)).transpose(1, 2)
+        target = target / top_k
+        return F.layer_norm(target, target.shape[-1:])
+
+    def compile(self, **kwargs) -> None:
+        self.encode = torch.compile(self.encode, **kwargs)
+
+    def momentum(self, progress: float) -> float:
+        m0, m1 = self.ema
+        return m0 + (m1 - m0) * min(max(progress, 0.0), 1.0)
+
+    @torch.no_grad()
+    def update(self, model: ViTMAE3D, progress: float) -> None:
+        if self._pairs is None:
+            student = dict(model.named_parameters())
+            pairs = [(p, student[n]) for n, p in self.named_parameters()]
+            self._pairs = ([t for t, _ in pairs], [s for _, s in pairs])
+        tp, sp = self._pairs
+        torch._foreach_lerp_(tp, sp, 1.0 - self.momentum(progress))
+
+
 def _init_weights(m: nn.Module) -> None:
     if isinstance(m, nn.Linear):
         nn.init.xavier_uniform_(m.weight)

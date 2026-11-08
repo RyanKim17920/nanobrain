@@ -37,7 +37,7 @@ from nanobrain.data import (
     resample_to_spacing,
 )
 from nanobrain.fino import ramp as fino_ramp
-from nanobrain.model import ViTMAE3D, patches_to_volume
+from nanobrain.model import D2VTeacher, ViTMAE3D, patches_to_volume
 from nanobrain.optim import CombinedOptimizer, Muon, is_muon_param
 from nanobrain.visualization import plot_mask_pred
 
@@ -141,6 +141,15 @@ def main(args: DictConfig):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"num params: {num_params / 1e6:.1f}M")
 
+    teacher = None
+    if model.d2v_head is not None:
+        assert not args.distributed, "d2v: single gpu only"
+        teacher = D2VTeacher(model).to(device)
+        logger.info(
+            f"d2v aux: weight {model.d2v_weight}, top_k {model.d2v_top_k}, share {model.d2v_share}, "
+            f"ema {model.d2v_ema}"
+        )
+
     batch_flops = count_batch_flops(args, model, device)
     logger.info(f"flops per batch per gpu (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
 
@@ -151,6 +160,8 @@ def main(args: DictConfig):
     if args.compile and args.native:
         # the image shapes vary, so only the fixed-shape transformer parts compile
         model_without_ddp.compile_native()
+        if teacher is not None:
+            teacher.compile()
     elif args.compile and args.cudagraphs:
         assert not args.distributed, "cudagraphs is single gpu only"
         model_without_ddp.compile_cudagraphs()
@@ -215,7 +226,9 @@ def main(args: DictConfig):
         loss_scaler = None
 
     # load checkpoint/resume training
-    start_step, prev_wall_time = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
+    start_step, prev_wall_time = misc.load_model(
+        args, model_without_ddp, optimizer, loss_scaler, teacher=teacher
+    )
 
     # data loader. one endless pass over shuffled epochs, resumed at the next unseen image
     late_indices = switch_at = None
@@ -281,6 +294,7 @@ def main(args: DictConfig):
         device,
         batch_flops,
         stop_event,
+        teacher,
     )
 
     if args.distributed:
@@ -336,6 +350,7 @@ def train(
     device: torch.device,
     batch_flops: float,
     stop_event: threading.Event,
+    teacher: D2VTeacher | None = None,
 ) -> dict:
     model.train()
 
@@ -428,14 +443,17 @@ def train(
         if args.cudagraphs:
             torch.compiler.cudagraph_mark_step_begin()
         fino_kwargs = {}
+        # training progress for FINO's gamma ramp and the d2v EMA (the time schedule's clock when
+        # time keyed)
+        if time_schedule:
+            wall = prev_wall_time + time.monotonic() - start_time
+            progress = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+        else:
+            progress = step / total_steps
+        if teacher is not None:
+            fino_kwargs["d2v_teacher"] = teacher
         if "fino" in batch:
-            # FINO's gamma ramp over training progress (the time schedule's clock when time keyed)
-            if time_schedule:
-                wall = prev_wall_time + time.monotonic() - start_time
-                progress = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
-            else:
-                progress = step / total_steps
-            fino_kwargs = {
+            fino_kwargs |= {
                 "fino_meta": batch["fino"],
                 "fino_gamma": fino_ramp(args.fino3d.gamma_max, progress),
             }
@@ -463,6 +481,9 @@ def train(
             max_norm=args.clip_grad,
         )
 
+        if need_update and teacher is not None:
+            teacher.update(model_without_ddp, progress)
+
         # log tensors without syncing, values are only read on log steps
         metric_logger.update(loss=loss_for_log)
         if need_update:
@@ -480,7 +501,10 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
-            if fino_kwargs:
+            if teacher is not None:
+                log_stats["d2v_loss"] = float(model_without_ddp.d2v_stats["loss"])
+                log_stats["d2v_ema"] = teacher.momentum(progress)
+            if "fino_gamma" in fino_kwargs:
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
@@ -526,7 +550,9 @@ def train(
 
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
         if is_save_step or is_last:
-            misc.save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time)
+            misc.save_model(
+                args, step, model_without_ddp, optimizer, loss_scaler, wall_time, teacher=teacher
+            )
 
         if is_last:
             break

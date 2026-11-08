@@ -305,7 +305,7 @@ def init_distributed_mode(args):
 # checkpoint saving utils adapted from beit3
 
 
-def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=0.0):
+def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=0.0, teacher=None):
     output_dir = Path(args.output_dir)
     last_checkpoint_path = output_dir / "checkpoint-last.pth"
 
@@ -319,6 +319,9 @@ def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=
         "model_class": f"{type(model_without_ddp).__module__}:{type(model_without_ddp).__name__}",
         "git": git_info(),
     }
+    if teacher is not None:
+        # training only state (d2v EMA teacher), outside "model" (the eval contract)
+        to_save["teacher"] = teacher.state_dict()
 
     logger.info(f"saving checkpoint {last_checkpoint_path}")
     save_on_master(to_save, last_checkpoint_path)
@@ -329,7 +332,7 @@ def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=
         save_on_master(to_save, checkpoint_path)
 
 
-def load_model(args, model_without_ddp, optimizer, loss_scaler) -> tuple[int, float]:
+def load_model(args, model_without_ddp, optimizer, loss_scaler, teacher=None) -> tuple[int, float]:
     """Load args.ckpt, or the last checkpoint when auto resuming. Returns (start step, wall time)."""
     auto_resume = getattr(args, "auto_resume", True)
     output_dir = Path(args.output_dir)
@@ -345,6 +348,9 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler) -> tuple[int, fl
         ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=True)
         model_without_ddp.load_state_dict(ckpt["model"])
         logger.info(f"loaded model state from checkpoint {args.ckpt}")
+        if teacher is not None and "teacher" in ckpt:
+            teacher.load_state_dict(ckpt["teacher"])
+            logger.info("loaded d2v teacher state")
 
         if args.resume:
             optimizer.load_state_dict(ckpt["optimizer"])
