@@ -23,7 +23,7 @@ class Fomo300kDataset(Dataset):
         self.shards = members["shard"].tolist()
         self.offsets = members["offset"].to_numpy()
         self.sizes = members["size"].to_numpy()
-        # fino3d per-image metadata [N, 6] (nanobrain.fino.build_meta), None = off
+        # fino3d per-image metadata [N, 6] (+ collection index column with coll_bias) (nanobrain.fino.build_meta), None = off
         self.meta = None
         # nuis_dec per-image nuisance ids [N, 5] (nanobrain.nuisdec.build_nuis), None = off
         self.nuis = None

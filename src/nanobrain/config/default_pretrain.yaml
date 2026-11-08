@@ -145,7 +145,10 @@ fino3d:
   # group classes with fewer images (in the train filelist) are masked
   group_min_count: 300
   exclude_collections: [PT030_OpenNeuro/ds001510]
+  # per-collection learned output offset on every head (training only), zero init
+  coll_bias: false
   # filled at train time from the train filelist, kept in the checkpoint args
+  collections: null
   group_classes: null
   age_mean: null
   age_std: null
