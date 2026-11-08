@@ -361,8 +361,21 @@ def train(
     done = False
     time_schedule = bool(args.get("time_schedule"))
     # training clock origin of the time schedule: wall time at the end of the first step (after
-    # compile and loader warmup). a resumed run keeps the original origin approximately
-    train_t0 = prev_wall_time if start_step > 0 else None
+    # compile and loader warmup). wall time is summed over restarts (checkpoint wall_time), so a
+    # resumed (requeued / preempted) run must keep the ORIGINAL origin, persisted in the output
+    # dir; re-keying to the resume point would restart the anneal. without the file (older runs),
+    # fall back to the first-step origin of a fresh run (~70 s), capped at the resume point
+    t0_path = output_dir / "time_schedule_t0.json"
+    train_t0 = None
+    if start_step > 0:
+        if t0_path.exists():
+            train_t0 = float(json.loads(t0_path.read_text())["train_t0"])
+        else:
+            train_t0 = min(prev_wall_time, 70.0)
+        logger.info(
+            f"resumed at step {start_step}, wall {prev_wall_time:.0f} s: time schedule origin "
+            f"{train_t0:.0f} s"
+        )
 
     optimizer.zero_grad()
 
@@ -456,6 +469,8 @@ def train(
         wall_time = prev_wall_time + time.monotonic() - start_time
         if train_t0 is None:
             train_t0 = wall_time
+            if misc.is_main_process():
+                t0_path.write_text(json.dumps({"train_t0": train_t0, "step": step}))
         done = step == total_steps or wall_time >= time_limit
         is_last = done or stop_event.is_set()
         if args.distributed:
