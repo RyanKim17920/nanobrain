@@ -127,7 +127,6 @@ def main(args: DictConfig):
         # metadata first: the group vocabulary sizes the heads (stored in the checkpoint args)
         from nanobrain.fino import build_meta
 
-        assert args.native, "fino3d: native training only"
         fino_meta = build_meta(
             args.fino3d,
             Path(args.train_filelist).read_text().split(),

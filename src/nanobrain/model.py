@@ -182,7 +182,6 @@ class ViTMAE3D(nn.Module):
         self.fino_heads = None
         self.fino_stats = {}
         if fino3d is not None:
-            assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
 
@@ -311,9 +310,16 @@ class ViTMAE3D(nn.Module):
                 fino_meta=fino_meta, fino_gamma=fino_gamma,
             )
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
-        if not with_state:
+        # fino3d on the 1 mm path (mni_align needs it): the same heads on the mean of the visible
+        # encoder tokens; sequences are image-major, num_samples per image
+        use_fino = self.fino_heads is not None and fino_meta is not None
+        if not with_state and not use_fino:
             return self.patch_loss(*seqs)
         loss, embeds, pred_patches = self.patch_loss(*seqs, with_outputs=True)
+        if use_fino:
+            loss = loss + self.fino_term(embeds, fino_meta, fino_gamma, num_samples)
+        if not with_state:
+            return loss
         vis_patches, vis_mask_patches, _, target_patches, target_mask_patches, _ = seqs
         num_predict = target_patches.shape[1]
         B = images.shape[0]
@@ -334,6 +340,16 @@ class ViTMAE3D(nn.Module):
             "image_ids": image_ids,
         }
         return loss, state
+
+    @torch.compiler.disable
+    def fino_term(self, embeds: Tensor, fino_meta: Tensor, fino_gamma: float, num_samples: int) -> Tensor:
+        # eager (outside the compiled forward): cpu metadata, one pinned non blocking copy
+        pooled = embeds[:, self.class_tokens :].mean(dim=1)
+        meta = fino_meta.cpu().repeat_interleave(num_samples, dim=0)
+        if pooled.device.type == "cuda":
+            meta = meta.pin_memory().to(pooled.device, non_blocking=True)
+        fino_loss, self.fino_stats = self.fino_heads(pooled, meta, float(fino_gamma))
+        return fino_loss
 
     def sample_patches(
         self,

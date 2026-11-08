@@ -274,6 +274,10 @@ def make_batch_transform(
             dst, src = fit_slices(image.shape, grid_size)
             image_out[dst] = image[src]
             mask_out[dst] = mask[src]
-        return {"image": images, "mask": masks}
+        out = {"image": images, "mask": masks}
+        if "fino" in batch[0]:
+            # fino3d metadata (numpy, so send_data left it on the cpu)
+            out["fino"] = torch.from_numpy(np.stack([sample["fino"] for sample in batch]))
+        return out
 
     return fn
