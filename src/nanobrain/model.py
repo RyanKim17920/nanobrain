@@ -12,6 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
 from .fino import FinoHeads
+from .nuisdec import NuisanceEmbed
 from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
 from .data import (
     crop_to_mask,
@@ -76,6 +77,9 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # nuis_dec config block (nanobrain.nuisdec): nuisance embeddings added to the decoder
+        # tokens; None = off (no params, same init)
+        nuis_dec: dict | None = None,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -177,6 +181,12 @@ class ViTMAE3D(nn.Module):
             assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
+        # built after the base init (zero tables draw no rng), so the base params match off
+        self.decoder_nuis = None
+        self.nuis_stats = {}
+        if nuis_dec is not None:
+            assert native, "nuis_dec: native training only"
+            self.decoder_nuis = NuisanceEmbed(decoder_embed_dim, nuis_dec)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -187,6 +197,7 @@ class ViTMAE3D(nn.Module):
             patch_size=args["patch_size"],
             native=args["native"],
             fino3d=fino if (fino := args.get("fino3d")) and fino.get("enabled") else None,
+            nuis_dec=nd if (nd := args.get("nuis_dec")) and nd.get("enabled") else None,
             **args["model_kwargs"],
         )
 
@@ -250,6 +261,7 @@ class ViTMAE3D(nn.Module):
         self,
         embeds: Float[Tensor, "B R+N D"],
         target_coord: Float[Tensor, "B M 3"],
+        nuis: Tensor | None = None,
     ) -> Float[Tensor, "B M D"]:
         # forward_decoder before the head
         B = embeds.shape[0]
@@ -270,6 +282,9 @@ class ViTMAE3D(nn.Module):
             mask_tokens = mask_tokens + pooled
 
         x = torch.cat([embeds, mask_tokens], dim=1)
+        if nuis is not None:
+            # nuis_dec: one nuisance vector per sequence on every decoder token
+            x = x + nuis.unsqueeze(1).to(x.dtype)
 
         if self.decoder_prune_last and len(self.decoder_blocks):
             # the head reads only the mask tokens, so the last block computes just their rows
@@ -294,12 +309,13 @@ class ViTMAE3D(nn.Module):
         spacing: list[tuple[float, float, float]] | None = None,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        nuis_ids: Tensor | None = None,
     ):
         if isinstance(images, list):
             # native resolution batch, images on their own voxel grids
             return self.forward_native(
                 images, mask, spacing, num_visible, num_predict, num_samples, with_state,
-                fino_meta=fino_meta, fino_gamma=fino_gamma,
+                fino_meta=fino_meta, fino_gamma=fino_gamma, nuis_ids=nuis_ids,
             )
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
@@ -492,6 +508,7 @@ class ViTMAE3D(nn.Module):
         with_state: bool = True,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        nuis_ids: Tensor | None = None,
     ):
         # images (float) and masks (bool) on their own voxel grids (sample_transform native), fit
         # here to the grid_size mm box in their voxels. images with the same spacing share one
@@ -577,7 +594,10 @@ class ViTMAE3D(nn.Module):
             return torch.cat([t.flatten() for t in tensors])
 
         embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
-        feats = self.decode_features(embeds, cat("target_coord"))
+        nuis = None
+        if self.decoder_nuis is not None and nuis_ids is not None:
+            nuis = self.nuis_vectors(nuis_ids, parts, num_samples, device)
+        feats = self.decode_features(embeds, cat("target_coord"), nuis=nuis)
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
         # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
@@ -650,6 +670,17 @@ class ViTMAE3D(nn.Module):
         if not with_state:
             return loss
         return loss, {"parts": parts, "embeds": embeds}
+
+    def nuis_vectors(self, nuis_ids: Tensor, parts: list[dict], num_samples: int, device) -> Tensor:
+        # nuis_dec: [rows, decoder dim], rows part by part, image-major (as the encoder rows).
+        # nuis_ids stays on the cpu: one pinned non blocking copy, no sync with the gpu queue
+        rows = torch.tensor([ii for part in parts for ii in part["ids"]]).repeat_interleave(num_samples)
+        ids = nuis_ids.cpu()[rows]
+        if device.type == "cuda":
+            ids = ids.pin_memory().to(device, non_blocking=True)
+        nuis = self.decoder_nuis(ids)
+        self.nuis_stats = {"norm": nuis.detach().float().norm(dim=-1).mean()}
+        return nuis
 
     def compile_native(self, **kwargs) -> None:
         # the fixed-shape transformer parts. per-spacing tokenization, embedding and head stay eager

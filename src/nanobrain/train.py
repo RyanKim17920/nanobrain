@@ -133,6 +133,18 @@ def main(args: DictConfig):
             DATA_ROOT / "fomo300k" / "tables" / "images.parquet",
         )
 
+    nuis_ids = None
+    if args.get("nuis_dec") and args.nuis_dec.enabled:
+        # vocabularies first: they size the embedding tables (stored in the checkpoint args)
+        from nanobrain.nuisdec import build_nuis
+
+        assert args.native, "nuis_dec: native training only"
+        nuis_ids = build_nuis(
+            args.nuis_dec,
+            Path(args.train_filelist).read_text().split(),
+            DATA_ROOT / "fomo300k" / "tables" / "images.parquet",
+        )
+
     # model
     model = ViTMAE3D.from_config(args)
     model.decoder_prune_last = args.decoder_prune_last
@@ -177,6 +189,7 @@ def main(args: DictConfig):
 
     dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
     dataset.meta = fino_meta
+    dataset.nuis = nuis_ids
     logger.info(f"train dataset: {len(dataset)} images")
 
     if args.epochs:
@@ -439,6 +452,8 @@ def train(
                 "fino_meta": batch["fino"],
                 "fino_gamma": fino_ramp(args.fino3d.gamma_max, progress),
             }
+        # nuis_dec: per-image nuisance ids for the decoder (cpu, nanobrain.nuisdec)
+        nuis_kwargs = {"nuis_ids": batch["nuis"]} if "nuis" in batch else {}
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,
@@ -449,6 +464,7 @@ def train(
                 with_state=False,
                 spacing=batch.get("spacing"),
                 **fino_kwargs,
+                **nuis_kwargs,
             )
 
         # the cuda graph's output buffer is overwritten by the next replay
@@ -484,6 +500,9 @@ def train(
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
+            if nuis_kwargs:
+                for k, v in model_without_ddp.nuis_stats.items():
+                    log_stats[f"nuis_{k}"] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)
@@ -624,6 +643,8 @@ def make_batch_transform(args: DictConfig):
             out = {key: [sample[key] for sample in batch] for key in ("image", "mask", "spacing")}
             if "fino" in raw[0]:
                 out["fino"] = torch.from_numpy(np.stack([sample["fino"] for sample in raw]))
+            if "nuis" in raw[0]:
+                out["nuis"] = torch.from_numpy(np.stack([sample["nuis"] for sample in raw]))
             return out
         images = torch.stack([sample["image"] for sample in batch])
         masks = torch.stack([sample["mask"] for sample in batch])
