@@ -94,9 +94,15 @@ class ViTMAE3D(nn.Module):
         pool_dec_depth: int = 2,
         # encoder-input-only bias field + gamma augmentation (targets stay clean); None = off
         biasfield: dict | None = None,
+        # training only (forward_native): shift each image inside its token grid by a random
+        # sub-token offset per axis (0..grid_jitter_mm mm, centred), so the patch grid lands at
+        # different phases relative to anatomy; token coords get the fractional correction.
+        # 0 = off (bitwise the unjittered path)
+        grid_jitter_mm: float = 0.0,
     ):
         super().__init__()
         self.biasfield = biasfield
+        self.grid_jitter_mm = float(grid_jitter_mm)
         self.norm_target = norm_target
         self.grad_loss_weight = float(grad_loss_weight)
         self.fg_loss_weight = float(fg_loss_weight)
@@ -607,7 +613,7 @@ class ViTMAE3D(nn.Module):
             t = t.reshape(-1, math.prod(patch)).index_select(1, cells8_index(tuple(patch), t.device))
         return t.reshape(-1, 1, 8, 8, 8)
 
-    def mirror_ref(self, vols: Tensor, patch, box, grid, sp) -> Tensor:
+    def mirror_ref(self, vols: Tensor, patch, box, grid, sp, xshift: Tensor | None = None) -> Tensor:
         # per token [b, N, 64]: the max within +-1 cell (2 mm cells) of each sub-block's x-mirrored cell
         # (mirror about the box centre, the fit_to_shape centre); 1e4 where that cell is out of the
         # mask, out of the box, or within 4 mm of the midline. at 1 mm = r18's mirror_map
@@ -626,11 +632,20 @@ class ViTMAE3D(nn.Module):
         # x mirror index per cell, in voxels of this spacing: cell width px / 4
         Cx, w = gx * 4, patch[0] / 4
         centre = (torch.arange(Cx, device=img.device, dtype=torch.float64) + 0.5) * w
-        j = torch.floor((box[0] - centre) / w).long()
-        ok = (j >= 0) & (j < Cx) & ((centre - box[0] / 2).abs() * sp[0] >= 4.0)
-        j = j.clamp(0, Cx - 1)
-        mvalid = valid.index_select(1, j) & ok.view(1, -1, 1, 1)
-        ref = torch.where(mvalid, hmax.index_select(1, j), 1e4)
+        if xshift is None:
+            j = torch.floor((box[0] - centre) / w).long()
+            ok = (j >= 0) & (j < Cx) & ((centre - box[0] / 2).abs() * sp[0] >= 4.0)
+            j = j.clamp(0, Cx - 1)
+            mvalid = valid.index_select(1, j) & ok.view(1, -1, 1, 1)
+            ref = torch.where(mvalid, hmax.index_select(1, j), 1e4)
+        else:
+            # grid_jitter: per image the anatomy (and its midline) sits xshift voxels off the box centre
+            c0 = box[0] / 2 + xshift.to(torch.float64).view(b, 1)
+            j = torch.floor((2 * c0 - centre) / w).long()
+            ok = (j >= 0) & (j < Cx) & ((centre - c0).abs() * sp[0] >= 4.0)
+            j = j.clamp(0, Cx - 1).view(b, Cx, 1, 1).expand(-1, -1, *valid.shape[2:])
+            mvalid = valid.gather(1, j) & ok.view(b, Cx, 1, 1)
+            ref = torch.where(mvalid, hmax.gather(1, j), 1e4)
         ref = ref.view(b, gx, 4, gy, 4, gz, 4).permute(0, 1, 3, 5, 2, 4, 6)
         return ref.reshape(b, N, 64)
 
@@ -711,8 +726,21 @@ class ViTMAE3D(nn.Module):
             padded = tuple(num * p for num, p in zip(grid, patch))
             nch = 3 if self.biasfield is not None and self.training else 2
             vols = images[ids[0]].new_zeros((nch, len(ids)) + padded)
+            jitter = self.training and self.grid_jitter_mm > 0
+            if jitter:
+                # per image, per axis voxel shift in [-n//2, n - n//2], n = jitter in voxels of this
+                # spacing (kept below one patch, so it is a pure sub-token phase shift)
+                nmax = torch.tensor(
+                    [min(int(self.grid_jitter_mm / s + 1e-6), p - 1) for s, p in zip(sp, patch)]
+                )
+                shifts = (torch.rand(len(ids), 3) * (nmax + 1)).floor().long() - nmax // 2
+                # anatomy at buffer voxel v + s was at v: token centres move by -s * sp mm
+                part_shift = -(shifts.double() * torch.tensor(sp, dtype=torch.float64)) / token_mm
             for jj, ii in enumerate(ids):
-                src, dst = fit_slices(images[ii].shape, box)
+                if jitter:
+                    src, dst = shifted_slices(images[ii].shape, box, padded, shifts[jj].tolist())
+                else:
+                    src, dst = fit_slices(images[ii].shape, box)
                 vols[0, jj][dst] = images[ii][src]
                 vols[1, jj][dst] = mask[ii][src]
             if nch == 3:
@@ -723,6 +751,14 @@ class ViTMAE3D(nn.Module):
             scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube).flatten(0, 1)
             parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols})
             parts[-1]["scores"] = scores
+            if jitter:
+                # [b * num_samples, 1, 3] coord offsets in token units, sequence rows image-major
+                parts[-1]["coord_shift"] = (
+                    part_shift.float().repeat_interleave(num_samples, 0)[:, None].to(device, non_blocking=True)
+                )
+                if self.level_mirror_head is not None:
+                    # combo: the mirror plane moves with the image (x shift in voxels of this spacing)
+                    parts[-1]["mirror_xshift"] = shifts[:, 0].to(device, non_blocking=True)
 
         # one argsort for all groups, rows padded with 3.0 (after every score). sorts this long are
         # stable, so these are the per group argsorts
@@ -749,6 +785,8 @@ class ViTMAE3D(nn.Module):
             patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
             patches, mask_patches, *aug_patches = patches.view(len(vols), b * num_samples, seq_length, -1)
             coord = geoms[sp][3][0][order]
+            if "coord_shift" in part:
+                coord = coord + part.pop("coord_shift")
             vis_patches, part["target_patches"] = patches.split([num_visible, num_predict], 1)
             enc_patches = aug_patches[0][:, :num_visible] if aug_patches else vis_patches
             part["target_mask_patches"] = mask_patches[:, num_visible:]
@@ -758,7 +796,7 @@ class ViTMAE3D(nn.Module):
                 part["vis_patches"], part["vis_mask"] = vis_patches, mask_patches[:, :num_visible]
             if self.level_mirror_head is not None:
                 # mirror references of the visible tokens [b * S * num_visible, 64]
-                ref = self.mirror_ref(vols, patch, geoms[sp][1], geoms[sp][2], sp)
+                ref = self.mirror_ref(vols, patch, geoms[sp][1], geoms[sp][2], sp, part.pop("mirror_xshift", None))
                 vis_ids = part["order"][..., :num_visible] + (torch.arange(b, device=device) * num).view(-1, 1, 1)
                 part["mirror_ref"] = ref.flatten(0, 1).index_select(0, vis_ids.flatten())
 
@@ -1115,6 +1153,19 @@ def fit_slices(
         num = min(size, target)
         src.append(slice(max(0, -before), max(0, -before) + num))
         dst.append(slice(max(0, before), max(0, before) + num))
+    return tuple(src), tuple(dst)
+
+
+def shifted_slices(
+    shape: tuple[int, ...], box: tuple[int, ...], buffer: tuple[int, ...], shifts: list[int]
+) -> tuple[tuple[slice, ...], tuple[slice, ...]]:
+    # fit_slices' centre placement in the box, moved by shifts voxels, clipped to the buffer
+    src, dst = [], []
+    for size, target, buf, shift in zip(shape, box, buffer, shifts):
+        before = (target - size) // 2 + shift
+        lo, hi = max(0, before), min(buf, before + size)
+        src.append(slice(lo - before, hi - before))
+        dst.append(slice(lo, hi))
     return tuple(src), tuple(dst)
 
 
