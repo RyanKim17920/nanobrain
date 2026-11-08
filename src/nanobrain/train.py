@@ -496,6 +496,8 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
+            for k, v in getattr(model_without_ddp, "pool_dec_stats", {}).items():
+                log_stats[f"pool_dec_{k}"] = float(v)
             if fino_kwargs:
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():

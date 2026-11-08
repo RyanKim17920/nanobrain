@@ -85,6 +85,13 @@ class ViTMAE3D(nn.Module):
         # nuis_dec config block (nanobrain.nuisdec): nuisance embeddings added to the decoder
         # tokens; None = off (no params, same init)
         nuis_dec: dict | None = None,
+        # pool_dec: pooled-bottleneck decoder (BEiT v2 style; weight, 0 = off). A shallow second
+        # decoder sees only [mean of the final encoder tokens] + the encoder's layer pool_dec_layer
+        # patch tokens and reconstructs the same masked patches with the same loss, so its gradient
+        # reaches the final tokens only through their pooled mean. Shares the decoder head
+        pool_dec_weight: float = 0.0,
+        pool_dec_layer: int = 6,
+        pool_dec_depth: int = 2,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -207,6 +214,39 @@ class ViTMAE3D(nn.Module):
         if nuis_dec is not None:
             assert native, "nuis_dec: native training only"
             self.decoder_nuis = NuisanceEmbed(decoder_embed_dim, nuis_dec)
+        # pool_dec, built after the base (and fino) init too: off = no params, same init
+        self.pool_dec_weight = float(pool_dec_weight)
+        self.pool_dec_layer = int(pool_dec_layer)
+        self.pool_dec = None
+        if self.pool_dec_weight:
+            assert native, "pool_dec: native training only"
+            assert 1 <= self.pool_dec_layer < depth
+            self.pool_dec = nn.ModuleDict(
+                {
+                    "mid_norm": LayerNorm(embed_dim),
+                    "mid_proj": nn.Linear(embed_dim, decoder_embed_dim),
+                    "pool_proj": nn.Linear(embed_dim, decoder_embed_dim),
+                    "pos_embed": SeparablePosEmbed3D(patch_grid_size, decoder_embed_dim),
+                    "blocks": nn.ModuleList(
+                        [
+                            Block(
+                                dim=decoder_embed_dim,
+                                num_heads=decoder_num_heads,
+                                qkv_bias=qkv_bias,
+                                proj_bias=proj_bias,
+                                mlp_ratio=mlp_ratio,
+                                qk_norm=decoder_qk_norm,
+                                qk_scale_init=qk_scale_init,
+                            )
+                            for _ in range(pool_dec_depth)
+                        ]
+                    ),
+                    "norm": LayerNorm(decoder_embed_dim),
+                }
+            )
+            self.pool_dec.apply(_init_weights)
+            self.pool_mask_token = nn.Parameter(torch.empty(1, 1, decoder_embed_dim))
+            nn.init.normal_(self.pool_mask_token, std=0.02)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -269,6 +309,42 @@ class ViTMAE3D(nn.Module):
             x = block(x)
         x = self.norm(x)
         return x
+
+    def encode_tokens_mid(
+        self,
+        x: Float[Tensor, "B N D"],
+        coord: Float[Tensor, "B N 3"],
+    ) -> tuple[Float[Tensor, "B R+N D"], Float[Tensor, "B R+N D"]]:
+        # encode_tokens, also returning the residual stream after block pool_dec_layer (pool_dec)
+        B = x.shape[0]
+        x = self.pos_embed(x, coord)
+        if self.class_tokens:
+            x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
+        mid = None
+        for ii, block in enumerate(self.blocks):
+            x = block(x)
+            if ii + 1 == self.pool_dec_layer:
+                mid = x
+        return self.norm(x), mid
+
+    def decode_pooled(
+        self,
+        embeds: Float[Tensor, "B R+N D"],
+        mid: Float[Tensor, "B R+N D"],
+        target_coord: Float[Tensor, "B M 3"],
+    ) -> Float[Tensor, "B M D"]:
+        # pool_dec: [pooled final tokens, mid-layer patch tokens, mask tokens] -> shallow decoder
+        B, M = embeds.shape[0], target_coord.shape[1]
+        pd = self.pool_dec
+        pooled = pd["pool_proj"](embeds[:, self.class_tokens :].mean(dim=1, keepdim=True))
+        mid = pd["mid_proj"](pd["mid_norm"](mid[:, self.class_tokens :]))
+        mask_tokens = pd["pos_embed"](self.pool_mask_token.expand(B, M, -1), target_coord)
+        x = torch.cat([pooled, mid, mask_tokens], dim=1)
+        blocks = pd["blocks"]
+        for block in blocks[:-1]:
+            x = block(x)
+        x = blocks[-1].forward_last_rows(x, M)
+        return pd["norm"](x)
 
     def forward_decoder(
         self,
@@ -669,19 +745,27 @@ class ViTMAE3D(nn.Module):
                 return tensors[0].flatten()
             return torch.cat([t.flatten() for t in tensors])
 
-        embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
+        if self.pool_dec is not None:
+            embeds, mid = self.encode_tokens_mid(cat("embeds"), cat("vis_coord"))
+        else:
+            embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
         nuis = None
         if self.decoder_nuis is not None and nuis_ids is not None:
             nuis = self.nuis_vectors(nuis_ids, parts, num_samples, device)
         feats = self.decode_features(embeds, cat("target_coord"), nuis=nuis)
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
+        pool_feats = [None] * len(parts)
+        pool_losses = []
+        if self.pool_dec is not None:
+            pool_feats = self.decode_pooled(embeds, mid, cat("target_coord"))
+            pool_feats = torch.split(pool_feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
         # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
         # weights the mse per voxel, and the xyz gradient penalty runs per group on its own
         # patch geometry; the global loss is the weight-masked mean across groups
         losses, wts = [], []
         grad_num, grad_den = [], []
-        for part, feat in zip(parts, feats):
+        for part, feat, pool_feat in zip(parts, feats, pool_feats):
             sp = part["spacing"]
             pred = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
             part["pred_patches"] = pred
@@ -697,6 +781,9 @@ class ViTMAE3D(nn.Module):
                 w = w * fg_w
             losses.append((w * mse).flatten())
             wts.append(w.flatten())
+            if pool_feat is not None:
+                pool_pred = self.decoder_head.native(pool_feat, sp, part["patch"], head_ws.get(sp))
+                pool_losses.append((w * F.mse_loss(pool_pred, tgt, reduction="none")).flatten())
             if self.grad_loss_weight > 0.0:
                 BM = pred.shape[0] * pred.shape[1]
                 pv = pred.reshape(BM, px, py, pz)
@@ -711,6 +798,11 @@ class ViTMAE3D(nn.Module):
                 grad_num += [(mx * dx).sum(), (my * dy).sum(), (mz * dz).sum()]
                 grad_den += [mx.sum(), my.sum(), mz.sum()]
         loss = flat_cat(losses).sum() / flat_cat(wts).sum()
+        self.pool_dec_stats = {}
+        if pool_losses:
+            pool_loss = flat_cat(pool_losses).sum() / flat_cat(wts).sum()
+            self.pool_dec_stats = {"loss": pool_loss.detach()}
+            loss = loss + self.pool_dec_weight * pool_loss
         if self.grad_loss_weight > 0.0:
             loss = loss + self.grad_loss_weight * (
                 grad_num[0] / grad_den[0].clamp_min(1.0)
@@ -777,6 +869,9 @@ class ViTMAE3D(nn.Module):
         # the fixed-shape transformer parts. per-spacing tokenization, embedding and head stay eager
         self.encode_tokens = torch.compile(self.encode_tokens, **kwargs)
         self.decode_features = torch.compile(self.decode_features, **kwargs)
+        if self.pool_dec is not None:
+            self.encode_tokens_mid = torch.compile(self.encode_tokens_mid, **kwargs)
+            self.decode_pooled = torch.compile(self.decode_pooled, **kwargs)
 
     def compile_cudagraphs(self) -> None:
         # training speed, same math: sampling + gather compiled as usual, the encoder / decoder / loss
