@@ -275,6 +275,7 @@ def main(args: DictConfig):
         device,
         batch_flops,
         stop_event,
+        switch_event,
     )
 
     if args.distributed:
@@ -330,6 +331,7 @@ def train(
     device: torch.device,
     batch_flops: float,
     stop_event: threading.Event,
+    switch_event: threading.Event | None = None,
 ) -> dict:
     model.train()
 
