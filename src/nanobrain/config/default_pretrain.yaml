@@ -63,6 +63,11 @@ decay_steps: 0
 epochs: null
 warmup_epochs: 0
 decay_epochs: 0
+# input space (mni.py): "off" = RAS, 1 mm, centred in grid_size; rigid | affine = resample onto a
+# 1 mm MNI152NLin6Asym grid with each image's mni_affine (rigid part or full), in training and eval.
+# mni_jitter: training-only random [rotation deg, translation mm, log-scale frac] (uniform +-)
+mni_align: "off"
+mni_jitter: [4.0, 4.0, 0.05]
 # wall-clock keyed lr schedule (train.time_keyed_lr): decay over the last time_decay_frac of the
 # training time and stop at time_limit; total_steps / decay_steps are ignored
 time_schedule: false

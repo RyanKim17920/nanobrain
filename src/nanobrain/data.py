@@ -13,8 +13,10 @@ from torch.utils.data import Dataset, Sampler
 
 
 class Fomo300kDataset(Dataset):
-    def __init__(self, root: str | Path, filelist: str | Path):
+    def __init__(self, root: str | Path, filelist: str | Path, with_mni: bool = False):
         self.root = Path(root)
+        # also return each image's mni_affine (npz field, the same as its _mni.txt)
+        self.with_mni = with_mni
         self.paths = Path(filelist).read_text().split()
         members = pd.read_parquet(
             self.root / "tables" / "shards.parquet", columns=["path", "shard", "offset", "size"]
@@ -41,6 +43,8 @@ class Fomo300kDataset(Dataset):
                 "shape": tuple(npz["shape"].tolist()),
                 "affine": npz["affine"],
             }
+            if self.with_mni:
+                sample["mni_affine"] = npz["mni_affine"]
         return sample
 
 
