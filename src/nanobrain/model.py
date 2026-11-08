@@ -72,6 +72,12 @@ class ViTMAE3D(nn.Module):
         norm_target: bool = False,
         grad_loss_weight: float = 0.0,
         fg_loss_weight: float = 0.0,
+        # dense cross-context consistency (native path, num_samples 2): tokens visible in BOTH
+        # sequences of an image (same patch, different random context) are pulled together,
+        # simsiam style (predictor + stop-grad, symmetric negative cosine) on the last-layer
+        # normed tokens, the very features the eval's dense probes read (weight; 0 = off)
+        tokcon_weight: float = 0.0,
+        tokcon_hidden: int = 1024,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -165,6 +171,13 @@ class ViTMAE3D(nn.Module):
             self.decoder_head = NativeHead(decoder_embed_dim, patch_size)
         else:
             self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim)
+        self.tokcon_weight = float(tokcon_weight)
+        self.tokcon_pred = None
+        if tokcon_weight:
+            assert native, "tokcon_weight: native path only"
+            self.tokcon_pred = nn.Sequential(
+                nn.Linear(embed_dim, tokcon_hidden), nn.GELU(), nn.Linear(tokcon_hidden, embed_dim)
+            )
         self.init_weights()
 
     @classmethod
@@ -466,6 +479,24 @@ class ViTMAE3D(nn.Module):
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         return (weight * bce).sum() / (weight.sum() * target.shape[1]).clamp_min(1e-6)
 
+    def tokcon_terms(self, tokens: Tensor, vis_ids: Tensor, num_tokens: int) -> tuple[Tensor, Tensor]:
+        # tokens [b * 2, N, D] (rows 2i, 2i + 1 = image i), vis_ids [b, 2, N] patch ids. per token of
+        # sequence 0 also visible in sequence 1: symmetric simsiam negative cosine (sum, count)
+        b, _, n = vis_ids.shape
+        tokens = tokens.unflatten(0, (b, 2))
+        a, other = tokens[:, 0], tokens[:, 1]
+        ids0, ids1 = vis_ids[:, 0], vis_ids[:, 1]
+        # position in sequence 1 of every patch id, -1 if not visible there
+        where = ids1.new_full((b, num_tokens), -1)
+        where.scatter_(1, ids1, torch.arange(n, device=ids1.device).expand(b, n))
+        j = where.gather(1, ids0)
+        valid = (j >= 0).float()
+        c = other.gather(1, j.clamp_min(0)[..., None].expand(-1, -1, other.shape[-1]))
+        a, c = a.float(), c.float()
+        pa, pc = self.tokcon_pred(a).float(), self.tokcon_pred(c).float()
+        cos = F.cosine_similarity(pa, c.detach(), dim=-1) + F.cosine_similarity(pc, a.detach(), dim=-1)
+        return -(0.5 * cos * valid).sum(), valid.sum()
+
     def forward_native(
         self,
         images: list[Float[Tensor, "X Y Z"]],
@@ -536,6 +567,7 @@ class ViTMAE3D(nn.Module):
             del part["scores"]
             b = len(part["ids"])
             part["order"] = order.unflatten(0, (b, num_samples))
+            part["num_tokens"] = num
             # images and masks gathered together by flat token ids
             flat_ids = part["order"] + gather_offsets(b, num, device)
             patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
@@ -618,6 +650,16 @@ class ViTMAE3D(nn.Module):
                 )
                 num, den = num + n, den + d
             loss = loss + self.level_weight * num / den.clamp_min(1e-6)
+        if self.tokcon_pred is not None:
+            assert num_samples == 2, "tokcon pairs sequences 2i, 2i + 1"
+            rows = torch.split(embeds, [len(part["ids"]) * num_samples for part in parts])
+            num, den = 0.0, 0.0
+            for part, tokens in zip(parts, rows):
+                n, d = self.tokcon_terms(
+                    tokens[:, self.class_tokens :], part["order"][:, :, :num_visible], part["num_tokens"]
+                )
+                num, den = num + n, den + d
+            loss = loss + self.tokcon_weight * num / den.clamp_min(1.0)
 
         if not with_state:
             return loss
