@@ -72,6 +72,8 @@ class ViTMAE3D(nn.Module):
         norm_target: bool = False,
         grad_loss_weight: float = 0.0,
         fg_loss_weight: float = 0.0,
+        # SwiGLU mlp in the encoder blocks (equal params / flops), the decoder keeps gelu
+        swiglu: bool = False,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -121,6 +123,7 @@ class ViTMAE3D(nn.Module):
                     drop_path=dpr[ii],
                     qk_norm=qk_norm,
                     qk_scale_init=qk_scale_init,
+                    swiglu=swiglu,
                 )
                 for ii in range(depth)
             ]

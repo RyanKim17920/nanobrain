@@ -99,6 +99,25 @@ class Mlp(nn.Module):
         return x
 
 
+class SwiGLU(nn.Module):
+    # gated mlp (Shazeer 2020): fc2(silu(fc1 x) * fc3 x), hidden 2/3 of mlp_ratio * dim rounded to
+    # a multiple of 64, so params and flops match the gelu Mlp
+    def __init__(
+        self,
+        dim: int,
+        mlp_ratio: int | float = 4,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        hidden_features = 64 * round(dim * mlp_ratio * 2 / 3 / 64)
+        self.fc1 = nn.Linear(dim, hidden_features, bias=bias)
+        self.fc3 = nn.Linear(dim, hidden_features, bias=bias)
+        self.fc2 = nn.Linear(hidden_features, dim, bias=bias)
+
+    def forward(self, x: Float[Tensor, "... D"]) -> Float[Tensor, "... D"]:
+        return self.fc2(F.silu(self.fc1(x)) * self.fc3(x))
+
+
 # timm default eps=1e-6
 LayerNorm = partial(nn.LayerNorm, eps=1e-6)
 
@@ -116,6 +135,7 @@ class Block(nn.Module):
         norm_layer: Layer = LayerNorm,
         qk_norm: bool = False,
         qk_scale_init: float = 1.0,
+        swiglu: bool = False,
     ) -> None:
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -131,7 +151,7 @@ class Block(nn.Module):
         self.drop_path1 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(
+        self.mlp = (SwiGLU if swiglu else Mlp)(
             dim=dim,
             mlp_ratio=mlp_ratio,
             bias=proj_bias,
