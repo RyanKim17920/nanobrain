@@ -152,6 +152,16 @@ fino3d:
   bv_mean: null
   bv_std: null
 
+# mni_coord (nanobrain.mni_coord): a linear head on every visible encoder token regresses the MNI
+# mm coordinate of its patch centre (native voxel -> world -> MNI via the npz mni_affine; inputs are
+# not resampled), smooth L1 (beta, normalized units of 80 mm) times weight. Images with
+# images.parquet template_dice < min_dice are masked. enabled false = the base run
+mni_coord:
+  enabled: false
+  weight: 0.1
+  beta: 0.05
+  min_dice: 0.8
+
 wandb: false
 wandb_entity: null
 wandb_project: nanobrain

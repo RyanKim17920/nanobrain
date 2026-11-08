@@ -25,6 +25,8 @@ class Fomo300kDataset(Dataset):
         self.sizes = members["size"].to_numpy()
         # fino3d per-image metadata [N, 6] (nanobrain.fino.build_meta), None = off
         self.meta = None
+        # mni_coord: per-index bool, True = return the image's mni_affine (npz field), None = off
+        self.mni_ok = None
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -43,9 +45,15 @@ class Fomo300kDataset(Dataset):
                 "shape": tuple(npz["shape"].tolist()),
                 "affine": npz["affine"],
             }
+            if self.mni_ok is not None and "mni_affine" in npz.files:
+                sample["_mni"] = np.asarray(npz["mni_affine"], dtype=np.float64)
         if self.meta is not None:
             # numpy, so send_data leaves it on the cpu (no per-step host <-> device sync)
             sample["fino"] = self.meta[index].numpy()
+        if self.mni_ok is not None:
+            # image world mm -> MNI mm (ANTs 12 dof); NaN = no / failed registration (masked)
+            mni = sample.pop("_mni", None)
+            sample["mni_affine"] = mni if mni is not None and self.mni_ok[index] else np.full((4, 4), np.nan)
         return sample
 
 

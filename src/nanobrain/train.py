@@ -177,6 +177,14 @@ def main(args: DictConfig):
 
     dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
     dataset.meta = fino_meta
+    if args.get("mni_coord") and args.mni_coord.enabled:
+        # mni_coord (nanobrain.mni_coord): each visible token regresses its MNI mm coordinate
+        from nanobrain.mni_coord import build_ok
+
+        assert args.native, "mni_coord: native training only"
+        dataset.mni_ok = build_ok(
+            dataset.paths, DATA_ROOT / "fomo300k" / "tables" / "images.parquet", args.mni_coord.min_dice
+        )
     logger.info(f"train dataset: {len(dataset)} images")
 
     if args.epochs:
@@ -448,6 +456,7 @@ def train(
                 num_samples=args.num_samples,
                 with_state=False,
                 spacing=batch.get("spacing"),
+                mni_affine=batch.get("mni"),
                 **fino_kwargs,
             )
 
@@ -484,6 +493,8 @@ def train(
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
+            for k, v in model_without_ddp.mni_stats.items():
+                log_stats[f"mni_{k}"] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)
@@ -624,6 +635,11 @@ def make_batch_transform(args: DictConfig):
             out = {key: [sample[key] for sample in batch] for key in ("image", "mask", "spacing")}
             if "fino" in raw[0]:
                 out["fino"] = torch.from_numpy(np.stack([sample["fino"] for sample in raw]))
+            if "mni_affine" in raw[0]:
+                # RAS voxel -> MNI mm per image (NaN rows: no registration, masked), kept on the cpu
+                out["mni"] = torch.from_numpy(
+                    np.stack([r["mni_affine"] @ b["affine"] for r, b in zip(raw, batch)])
+                )
             return out
         images = torch.stack([sample["image"] for sample in batch])
         masks = torch.stack([sample["mask"] for sample in batch])

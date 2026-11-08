@@ -12,6 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
 from .fino import FinoHeads
+from .mni_coord import MniCoordHead
 from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
 from .data import (
     crop_to_mask,
@@ -76,6 +77,9 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # mni_coord config block (nanobrain.mni_coord), training only head on the visible tokens;
+        # None = off (no params, same init)
+        mni_coord: dict | None = None,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -177,6 +181,14 @@ class ViTMAE3D(nn.Module):
             assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
+        self.mni_head = None
+        self.mni_stats = {}
+        if mni_coord is not None:
+            assert native, "mni_coord: native training only"
+            self.mni_head = MniCoordHead(embed_dim, mni_coord)
+            # zero init (like level_head): starts at the centre, no large first-step gradient
+            nn.init.zeros_(self.mni_head.head.weight)
+            nn.init.zeros_(self.mni_head.head.bias)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -187,6 +199,7 @@ class ViTMAE3D(nn.Module):
             patch_size=args["patch_size"],
             native=args["native"],
             fino3d=fino if (fino := args.get("fino3d")) and fino.get("enabled") else None,
+            mni_coord=mc if (mc := args.get("mni_coord")) and mc.get("enabled") else None,
             **args["model_kwargs"],
         )
 
@@ -294,12 +307,13 @@ class ViTMAE3D(nn.Module):
         spacing: list[tuple[float, float, float]] | None = None,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        mni_affine: Tensor | None = None,
     ):
         if isinstance(images, list):
             # native resolution batch, images on their own voxel grids
             return self.forward_native(
                 images, mask, spacing, num_visible, num_predict, num_samples, with_state,
-                fino_meta=fino_meta, fino_gamma=fino_gamma,
+                fino_meta=fino_meta, fino_gamma=fino_gamma, mni_affine=mni_affine,
             )
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
@@ -492,6 +506,7 @@ class ViTMAE3D(nn.Module):
         with_state: bool = True,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        mni_affine: Tensor | None = None,
     ):
         # images (float) and masks (bool) on their own voxel grids (sample_transform native), fit
         # here to the grid_size mm box in their voxels. images with the same spacing share one
@@ -523,14 +538,17 @@ class ViTMAE3D(nn.Module):
             # the box from its low corner, in one buffer
             padded = tuple(num * p for num, p in zip(grid, patch))
             vols = images[ids[0]].new_zeros((2, len(ids)) + padded)
+            befores = []
             for jj, ii in enumerate(ids):
                 src, dst = fit_slices(images[ii].shape, box)
+                # padded voxel = image voxel + before (pad or crop)
+                befores.append([d.start - s_.start for d, s_ in zip(dst, src)])
                 vols[0, jj][dst] = images[ii][src]
                 vols[1, jj][dst] = mask[ii][src]
             vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
             cube = (grid, self.mask_cube) if self.mask_cube else None
             scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube).flatten(0, 1)
-            parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols})
+            parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols, "befores": befores})
             parts[-1]["scores"] = scores
 
         # one argsort for all groups, rows padded with 3.0 (after every score). sorts this long are
@@ -646,6 +664,29 @@ class ViTMAE3D(nn.Module):
                 meta = meta.pin_memory().to(device, non_blocking=True)
             fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
             loss = loss + fino_loss
+        if self.mni_head is not None and mni_affine is not None:
+            # per visible token its MNI coordinate (nanobrain.mni_coord); cpu affines, one pinned copy
+            ids = [ii for part in parts for ii in part["ids"]]
+            aff = mni_affine.cpu()[torch.tensor(ids)].float()
+            bef = torch.tensor([b for part in parts for b in part["befores"]], dtype=torch.float32)
+            if device.type == "cuda":
+                aff = aff.pin_memory().to(device, non_blocking=True)
+                bef = bef.pin_memory().to(device, non_blocking=True)
+            targets, keeps, start = [], [], 0
+            for part in parts:
+                b = len(part["ids"])
+                grid = geoms[part["spacing"]][2]
+                t, k = self.mni_head.targets(
+                    aff[start : start + b], bef[start : start + b], grid, part["patch"],
+                    part["order"][..., :num_visible],
+                )
+                targets.append(t)
+                keeps.append(k)
+                start += b
+            mni_loss, self.mni_stats = self.mni_head(
+                embeds[:, self.class_tokens :], torch.cat(targets), torch.cat(keeps)
+            )
+            loss = loss + mni_loss
 
         if not with_state:
             return loss
