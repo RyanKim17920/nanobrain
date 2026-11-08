@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from . import mni as mni_lib
 from .data import brle_to_dense
 
 
@@ -45,15 +46,33 @@ def int16_clip(values: np.ndarray, scale: float, clip_quantiles=(0.005, 0.995)):
 
 
 def plan_batch(
-    batch: list[dict], target_spacing: float = 1.0, clip_quantiles=(0.005, 0.995), lean: bool = False
+    batch: list[dict],
+    target_spacing: float = 1.0,
+    clip_quantiles=(0.005, 0.995),
+    lean: bool = False,
+    mni_align: str = "off",
+    mni_jitter=None,
+    grid_size=None,
 ):
     # loader collate_fn: the numpy part of the prep, in the workers
     for sample in batch:
         sample["clip"] = int16_clip(sample["values"].numpy(), sample["scale"], clip_quantiles)
-        orientation = ras_orientation(sample["affine"], sample["shape"])
-        shape = [sample["shape"][axis] for axis in orientation[1]]
-        sample["orientation"] = orientation
-        sample["size"] = resample_size(shape, orientation[2], target_spacing)
+        if mni_align != "off":
+            # mni.py: one grid_sample from the stored voxels onto the MNI grid; the jitter draws come
+            # from the worker's torch rng (seeded per worker by the loader)
+            jitter = None
+            if mni_jitter is not None and any(float(v) for v in mni_jitter):
+                jitter = mni_lib.jitter_matrix(mni_jitter)
+            voxel_map, _ = mni_lib.sampling_affine(
+                sample["affine"], sample.pop("mni_affine"), mni_align, grid_size, jitter
+            )
+            sample["mni_theta"] = mni_lib.grid_theta(voxel_map, sample["shape"], grid_size)
+            sample["mni_sigmas"] = mni_lib.smoothing_sigmas(sample["affine"], target_spacing)
+        else:
+            orientation = ras_orientation(sample["affine"], sample["shape"])
+            shape = [sample["shape"][axis] for axis in orientation[1]]
+            sample["orientation"] = orientation
+            sample["size"] = resample_size(shape, orientation[2], target_spacing)
         if lean:
             # the dense mask as bits (brle_to_dense on the cpu), unpacked on the gpu in 2 kernels
             runs = sample.pop("mask_rle").numpy()
@@ -129,12 +148,16 @@ def normalize_values(values: Tensor, clip_quantiles=(0.005, 0.995), clip=None) -
     return (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
 
 
-def sample_transform(sample: dict, clip_quantiles=(0.005, 0.995)) -> tuple[Tensor, Tensor]:
+def sample_transform(sample: dict, clip_quantiles=(0.005, 0.995), grid_size=None) -> tuple[Tensor, Tensor]:
     # train.sample_transform (resampled path) after plan_batch, without the fit_to_shape copy
     values = sample["values"].float() * sample["scale"]
     values = normalize_values(values, clip_quantiles, clip=sample["clip"])
     mask = brle_to_dense(sample["mask_rle"], shape=sample["shape"])
     image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
+    if "mni_theta" in sample:
+        image = gaussian_smooth(image, sample["mni_sigmas"])
+        image, mask = mni_lib.resample(image, mask, sample["mni_theta"], grid_size)
+        return image, mask.to(torch.uint8)
     flip_axes, order, _ = sample["orientation"]
     if flip_axes:  # flip([]) copies
         image, mask = image.flip(flip_axes), mask.flip(flip_axes)
@@ -192,6 +215,12 @@ def sample_transform_into(sample: dict, image_out: Tensor, mask_out: Tensor, cli
             run_flags(len(mask_rle), mask_rle.device), mask_rle.long(), output_size=math.prod(shape)
         ).reshape(shape)
     image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
+    if "mni_theta" in sample:
+        image = gaussian_smooth(image, sample["mni_sigmas"])
+        image, mask = mni_lib.resample(image, mask, sample["mni_theta"], image_out.shape)
+        image_out.copy_(image)
+        mask_out.copy_(mask)
+        return
     flip_axes, order, _ = sample["orientation"]
     if flip_axes:  # flip([]) copies
         image, mask = image.flip(flip_axes), mask.flip(flip_axes)
@@ -218,7 +247,12 @@ def fit_slices(shape, target_shape):
 
 
 def make_batch_transform(
-    grid_size, target_spacing: float = 1.0, clip_quantiles=(0.005, 0.995), lean: bool = False
+    grid_size,
+    target_spacing: float = 1.0,
+    clip_quantiles=(0.005, 0.995),
+    lean: bool = False,
+    mni_align: str = "off",
+    mni_jitter=None,
 ):
     grid_size = tuple(grid_size)
 
@@ -226,8 +260,8 @@ def make_batch_transform(
         # written into zero filled batch tensors; uint8 masks (0/1)
         if isinstance(batch, dict):
             batch = split_batch(batch)
-        if "size" not in batch[0]:
-            batch = plan_batch(batch, target_spacing, clip_quantiles)
+        if "size" not in batch[0] and "mni_theta" not in batch[0]:
+            batch = plan_batch(batch, target_spacing, clip_quantiles, False, mni_align, mni_jitter, grid_size)
         device = batch[0]["values"].device
         images = torch.zeros(len(batch), *grid_size, device=device)
         masks = torch.zeros(len(batch), *grid_size, device=device, dtype=torch.uint8)
@@ -235,7 +269,7 @@ def make_batch_transform(
             if lean:
                 sample_transform_into(sample, image_out, mask_out, clip_quantiles)
                 continue
-            image, mask = sample_transform(sample, clip_quantiles)
+            image, mask = sample_transform(sample, clip_quantiles, grid_size)
             dst, src = fit_slices(image.shape, grid_size)
             image_out[dst] = image[src]
             mask_out[dst] = mask[src]

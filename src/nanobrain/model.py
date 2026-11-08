@@ -12,10 +12,13 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
 from .fino import FinoHeads
+from . import mni as mni_lib
+from .mni import normalize_mode as normalize_mni
 from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
 from .data import (
     crop_to_mask,
     fit_to_shape,
+    gaussian_smooth,
     native_box,
     normalize_values,
     reorient_to_ras,
@@ -76,8 +79,13 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # input space (mni.py): off = RAS, 1 mm, centred; rigid | affine = the MNI grid via mni_affine,
+        # the same transform as training (eval without jitter)
+        mni_align: str = "off",
     ):
         super().__init__()
+        self.mni_align = normalize_mni(mni_align)
+        assert self.mni_align == "off" or (not native and target_spacing == 1.0), "mni_align: 1 mm path"
         self.norm_target = norm_target
         self.grad_loss_weight = float(grad_loss_weight)
         self.fg_loss_weight = float(fg_loss_weight)
@@ -187,6 +195,7 @@ class ViTMAE3D(nn.Module):
             patch_size=args["patch_size"],
             native=args["native"],
             fino3d=fino if (fino := args.get("fino3d")) and fino.get("enabled") else None,
+            mni_align=args.get("mni_align", "off"),
             **args["model_kwargs"],
         )
 
@@ -672,7 +681,11 @@ class ViTMAE3D(nn.Module):
         mask = torch.from_numpy(np.asarray(sample["brain_mask"].dataobj) > 0)
         affine = sample["image"].affine
         image, mask, affine = crop_to_mask(image, mask, affine)
-        return {"values": image[mask], "mask": mask, "affine": affine}
+        out = {"values": image[mask], "mask": mask, "affine": affine}
+        if self.mni_align != "off":
+            assert sample.get("mni_affine") is not None, "mni_align: the sample needs mni_affine"
+            out["mni_affine"] = np.asarray(sample["mni_affine"], dtype=np.float64)
+        return out
 
     def transform_cuda(self, sample: dict[str, Tensor]) -> dict:
         values = sample["values"]
@@ -680,6 +693,15 @@ class ViTMAE3D(nn.Module):
         affine = sample["affine"]
         values = normalize_values(values, self.clip_quantiles)
         image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
+        if self.mni_align != "off":
+            # prep.sample_transform_into's mni branch, without jitter
+            voxel_map, input_affine = mni_lib.sampling_affine(
+                affine, sample["mni_affine"], self.mni_align, self.grid_size
+            )
+            theta = mni_lib.grid_theta(voxel_map, image.shape, self.grid_size)
+            image = gaussian_smooth(image, mni_lib.smoothing_sigmas(affine, self.target_spacing))
+            image, mask = mni_lib.resample(image, mask, theta, self.grid_size)
+            return {"image": image, "mask": mask.float(), "affine": input_affine}
         image, mask, affine = reorient_to_ras(image, mask, affine)
         image, mask, affine = resample_to_spacing(image, mask, affine, self.target_spacing)
         image, mask, affine = fit_to_shape(image, mask, affine, self.grid_size)
@@ -699,6 +721,7 @@ class ViTMAE3D(nn.Module):
                 "values": sample["values"].to(device),
                 "mask": sample["mask"].to(device),
                 "affine": sample["affine"],
+                "mni_affine": sample.get("mni_affine"),
             }
             sample = self.transform_cuda(sample)
             patches = patchify3d(sample["image"][None], self.patch_size[0])

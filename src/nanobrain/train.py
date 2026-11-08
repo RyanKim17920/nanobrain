@@ -37,6 +37,7 @@ from nanobrain.data import (
     resample_to_spacing,
 )
 from nanobrain.fino import ramp as fino_ramp
+from nanobrain.mni import normalize_mode as normalize_mni
 from nanobrain.model import ViTMAE3D, patches_to_volume
 from nanobrain.optim import CombinedOptimizer, Muon, is_muon_param
 from nanobrain.visualization import plot_mask_pred
@@ -175,7 +176,14 @@ def main(args: DictConfig):
 
     optimizer = make_optimizer(args, model_without_ddp)
 
-    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
+    # mni_align (mni.py): rigid | affine onto the MNI grid, in training and in the eval contract
+    mni_align = normalize_mni(args.get("mni_align"))
+    mni_jitter = tuple(float(v) for v in args.get("mni_jitter") or (0, 0, 0))
+    if mni_align != "off":
+        assert not args.native, "mni_align: 1 mm path only"
+        assert args.target_spacing == 1.0, "mni_align: the MNI grid is 1 mm"
+        logger.info(f"mni_align: {mni_align}, jitter (deg, mm, scale) {mni_jitter}")
+    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist, with_mni=mni_align != "off")
     dataset.meta = fino_meta
     logger.info(f"train dataset: {len(dataset)} images")
 
@@ -246,6 +254,9 @@ def main(args: DictConfig):
             target_spacing=args.target_spacing,
             clip_quantiles=tuple(args.clip_quantiles),
             lean=args.prep_lean,
+            mni_align=mni_align,
+            mni_jitter=mni_jitter,
+            grid_size=tuple(args.grid_size),
         ),
         pin_memory=True,
         drop_last=True,
@@ -254,9 +265,15 @@ def main(args: DictConfig):
     )
     if fast_prep:
         batch_transform = prep.make_batch_transform(
-            args.grid_size, args.target_spacing, tuple(args.clip_quantiles), lean=args.prep_lean
+            args.grid_size,
+            args.target_spacing,
+            tuple(args.clip_quantiles),
+            lean=args.prep_lean,
+            mni_align=mni_align,
+            mni_jitter=mni_jitter,
         )
     else:
+        assert mni_align == "off", "mni_align: the fast prep path (native: false) only"
         batch_transform = make_batch_transform(args)
     if args.prep_threads:
         train_loader = misc.prep_thread(train_loader, batch_transform, device, args.prep_threads)
