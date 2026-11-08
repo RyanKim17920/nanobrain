@@ -72,22 +72,45 @@ class InfiniteSampler(Sampler[int]):
         self.late_indices = late_indices
         self.switch_at = switch_at if late_indices is not None else None
 
+        # struct_anneal: the train loop sets struct_only when the time keyed decay starts. the
+        # sampler runs in the main process (the loader workers only get indices), so the next index
+        # drawn after the flip is already structural; only the batches in flight are not
+        self.struct_indices = None
+        self.struct_only = False
+        self.since_flip = 0
+
     def __iter__(self):
         generator = torch.Generator().manual_seed(self.seed)
         index = 0
-        while self.switch_at is None or index < self.switch_at:
+        while (self.switch_at is None or index < self.switch_at) and not self.struct_only:
             for sample_index in torch.randperm(self.num_samples, generator=generator).tolist():
                 if self.switch_at is not None and index >= self.switch_at:
+                    break
+                if self.struct_only:
                     break
                 if index >= self.start and index % self.world_size == self.rank:
                     yield sample_index
                 index += 1
+        if self.struct_only:
+            self.late_indices = self.struct_indices
         late_generator = torch.Generator().manual_seed(self.seed + 1)
         while True:
             for ii in torch.randperm(len(self.late_indices), generator=late_generator).tolist():
                 if index >= self.start and index % self.world_size == self.rank:
+                    self.since_flip += self.struct_only
                     yield self.late_indices[ii]
                 index += 1
+
+
+STRUCTURAL_SUFFIXES = ("T1w", "T2w", "FLAIR", "T1c")
+
+
+def structural_indices(paths: list[str]) -> list[int]:
+    # BIDS suffix: the last _ token of the file name (.../sub-01_ses-01_T1w.npz -> T1w)
+    return [
+        ii for ii, path in enumerate(paths)
+        if Path(path).name.removesuffix(".npz").rsplit("_", 1)[-1] in STRUCTURAL_SUFFIXES
+    ]
 
 
 def brle_to_dense(mask_rle: torch.Tensor, shape: tuple[int, int, int]) -> torch.Tensor:

@@ -28,6 +28,7 @@ import nanobrain.misc as misc
 import nanobrain.prep as prep
 from nanobrain.data import (
     Fomo300kDataset,
+    STRUCTURAL_SUFFIXES,
     InfiniteSampler,
     brle_to_dense,
     fit_to_shape,
@@ -35,6 +36,7 @@ from nanobrain.data import (
     normalize_values,
     reorient_to_ras,
     resample_to_spacing,
+    structural_indices,
 )
 from nanobrain.fino import ramp as fino_ramp
 from nanobrain.model import ViTMAE3D, patches_to_volume
@@ -234,6 +236,13 @@ def main(args: DictConfig):
         late_indices=late_indices,
         switch_at=switch_at,
     )
+    if args.get("struct_anneal"):
+        assert args.get("time_schedule"), "struct_anneal: flips at the time keyed decay"
+        sampler.struct_indices = structural_indices(dataset.paths)
+        logger.info(
+            f"struct_anneal: {len(sampler.struct_indices)} structural "
+            f"({'/'.join(STRUCTURAL_SUFFIXES)}) of {len(dataset)} images, drawn only in the decay"
+        )
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
@@ -281,6 +290,7 @@ def main(args: DictConfig):
         device,
         batch_flops,
         stop_event,
+        sampler=sampler if sampler.struct_indices is not None else None,
     )
 
     if args.distributed:
@@ -336,6 +346,7 @@ def train(
     device: torch.device,
     batch_flops: float,
     stop_event: threading.Event,
+    sampler: InfiniteSampler | None = None,
 ) -> dict:
     model.train()
 
@@ -416,6 +427,14 @@ def train(
             )
         else:
             lr = float(lr_schedule[step])
+        if sampler is not None and not sampler.struct_only and step >= args.warmup_steps and lr < args.lr:
+            # the time keyed decay has started (lr below peak after warmup)
+            sampler.struct_only = True
+            logger.info(
+                f"struct_anneal: decay started at step {step}, wall "
+                f"{prev_wall_time + time.monotonic() - start_time:.0f} s, lr {lr:.2e}: "
+                f"sampler now draws only the {len(sampler.struct_indices)} structural images"
+            )
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
 
@@ -480,6 +499,9 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
+            if sampler is not None:
+                log_stats["struct_only"] = sampler.struct_only
+                log_stats["struct_since_flip"] = sampler.since_flip
             if fino_kwargs:
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():

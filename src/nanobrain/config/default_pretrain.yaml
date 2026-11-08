@@ -67,6 +67,9 @@ decay_epochs: 0
 # training time and stop at time_limit; total_steps / decay_steps are ignored
 time_schedule: false
 time_decay_frac: 0.2
+# with time_schedule: once the lr decay starts, the sampler draws only structural scans (BIDS
+# suffix T1w / T2w / FLAIR / T1c) of train_filelist (the time keyed anneal_filelist)
+struct_anneal: false
 weight_decay: 0.05
 betas: [0.9, 0.95]
 clip_grad: 1.0
