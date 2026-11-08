@@ -122,6 +122,16 @@ distributed: false
 seed: 7338
 debug: false
 
+# Dojo2024 foreground-weighted mse + 3D gradient-difference loss (ported from dojo/v3-1h-waves model.py,
+# commit d86ed11). voxels with |target| > fg_thresh weigh fg_weight (others 1) in the mse; gdl is the
+# mean over x/y/z of the masked mse between pred and target finite differences inside each patch's
+# voxel grid, times gdl_weight. enabled false = the base run, bitwise
+fg_loss:
+  enabled: false
+  fg_weight: 1.5
+  fg_thresh: 0.05
+  gdl_weight: 0.5
+
 # FINO3D (nanobrain.fino): auxiliary metadata heads on the global embedding (mean of the visible
 # encoder tokens), port of nanopath's FINO. Per target the value is its backbone gradient
 # multiplier (sign; 0 = head off), times gamma ramped 0 -> gamma_max over training; each term's loss
