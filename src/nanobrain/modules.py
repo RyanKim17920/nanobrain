@@ -213,9 +213,18 @@ class SeparablePosEmbed3D(nn.Module):
 # the canonical weight, so 1 mm images and the evals are a plain patch_size model.
 
 
+def kernel_cells(patch_size: int, cells: int | None = None) -> int:
+    # fine cells per axis: 16 when it divides into whole cells per 1 mm voxel (patch 4, 8, 16:
+    # unchanged), else the next multiple of the patch size (patch 6 -> 18, 12 -> 24)
+    if cells is not None:
+        return cells
+    return 16 if 16 % patch_size == 0 else patch_size * math.ceil(16 / patch_size)
+
+
 class NativeEmbed(nn.Linear):
-    def __init__(self, patch_size: int, out_features: int, cells: int = 16):
+    def __init__(self, patch_size: int, out_features: int, cells: int | None = None):
         super().__init__(patch_size**3, out_features)
+        cells = kernel_cells(patch_size, cells)
         assert cells % patch_size == 0
         self.patch_size = patch_size
         self.cells = cells
@@ -253,8 +262,9 @@ class NativeEmbed(nn.Linear):
 
 class NativeHead(nn.Linear):
     # predicts each native voxel as the mean over its extent of the prediction field
-    def __init__(self, in_features: int, patch_size: int, cells: int = 16):
+    def __init__(self, in_features: int, patch_size: int, cells: int | None = None):
         super().__init__(in_features, patch_size**3)
+        cells = kernel_cells(patch_size, cells)
         assert cells % patch_size == 0
         self.patch_size = patch_size
         self.cells = cells
