@@ -259,7 +259,16 @@ def train(
     step = start_step
     done = False
     # wall time at the end of the first step of this process (excludes compile), for time_schedule
+    # persisted in the output dir so a requeued/preempted run keeps the ORIGINAL origin (wall time
+    # is summed over restarts via the checkpoint); re-keying at resume would restart the anneal
+    t0_path = output_dir / "time_schedule_t0.json"
     t_step1 = None
+    if start_step > 0:
+        if t0_path.exists():
+            t_step1 = float(json.loads(t0_path.read_text())["t_step1"])
+        else:
+            t_step1 = min(prev_wall_time, 70.0)
+        logger.info(f"resumed at step {start_step}, wall {prev_wall_time:.0f} s: t_step1 {t_step1:.0f} s")
 
     optimizer.zero_grad()
 
@@ -341,6 +350,8 @@ def train(
         wall_time = prev_wall_time + time.monotonic() - start_time
         if t_step1 is None:
             t_step1 = wall_time
+            if misc.is_main_process():
+                t0_path.write_text(json.dumps({"t_step1": t_step1, "step": step}))
         done = step == total_steps or wall_time >= time_limit
         is_last = done or stop_event.is_set()
 
