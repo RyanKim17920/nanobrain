@@ -173,13 +173,26 @@ def main(args: DictConfig):
         args.decay_steps = round(args.decay_epochs * steps_per_epoch)
         logger.info(f"{args.epochs} epochs of {steps_per_epoch:.1f} steps")
 
-    lr_schedule = make_lr_schedule(
-        args.lr, args.min_lr, args.total_steps, args.warmup_steps, args.decay_steps
-    )
-    logger.info(
-        f"lr schedule: total steps = {args.total_steps}, warmup = {args.warmup_steps}, "
-        f"decay = {args.decay_steps}"
-    )
+    if args.get("time_schedule"):
+        # wall-clock keyed schedule: warmup over warmup_steps, constant, then a linear decay to
+        # min_lr over the last time_decay_frac of the training time, ending at time_limit. the
+        # step count is open ended, so the anneal always lands on the wall whatever the step rate
+        assert args.time_limit, "time_schedule needs time_limit"
+        assert not args.anneal_filelist, "time_schedule: anneal_filelist switches by step count"
+        args.total_steps = 10**9
+        lr_schedule = None
+        logger.info(
+            f"lr schedule: time keyed, warmup = {args.warmup_steps} steps, decay over the last "
+            f"{args.time_decay_frac:.0%} of training time, ends at {args.time_limit} min"
+        )
+    else:
+        lr_schedule = make_lr_schedule(
+            args.lr, args.min_lr, args.total_steps, args.warmup_steps, args.decay_steps
+        )
+        logger.info(
+            f"lr schedule: total steps = {args.total_steps}, warmup = {args.warmup_steps}, "
+            f"decay = {args.decay_steps}"
+        )
 
     # loss scaling not needed for bfloat16 (according to timm)
     if args.amp and args.amp_dtype != "bfloat16":
@@ -346,6 +359,10 @@ def train(
     time_limit = args.time_limit * 60 if args.time_limit else float("inf")
     step = start_step
     done = False
+    time_schedule = bool(args.get("time_schedule"))
+    # training clock origin of the time schedule: wall time at the end of the first step (after
+    # compile and loader warmup). a resumed run keeps the original origin approximately
+    train_t0 = prev_wall_time if start_step > 0 else None
 
     optimizer.zero_grad()
 
@@ -366,7 +383,12 @@ def train(
     for batch_idx, batch in enumerate(batches, start=start_batch):
         need_update = (batch_idx + 1) % args.accum_iter == 0
         log_step = (batch_idx + 1) % print_freq_batches == 0
-        lr = float(lr_schedule[step])
+        if time_schedule:
+            lr = time_keyed_lr(
+                args, step, prev_wall_time + time.monotonic() - start_time, time_limit, train_t0
+            )
+        else:
+            lr = float(lr_schedule[step])
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
 
@@ -432,6 +454,8 @@ def train(
             gc.collect()
             gc.freeze()
         wall_time = prev_wall_time + time.monotonic() - start_time
+        if train_t0 is None:
+            train_t0 = wall_time
         done = step == total_steps or wall_time >= time_limit
         is_last = done or stop_event.is_set()
         if args.distributed:
@@ -509,6 +533,22 @@ def make_optimizer(args: DictConfig, model: nn.Module):
 def ignore_sigterm(worker_id: int):
     # `timeout` signals the whole process group. workers keep loading until the main process exits
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
+def time_keyed_lr(
+    args: DictConfig, step: int, wall_time: float, time_limit: float, train_t0: float | None
+) -> float:
+    lr, min_lr = args.lr, args.min_lr
+    if step < args.warmup_steps:
+        return lr * step / args.warmup_steps
+    if train_t0 is None:
+        return lr
+    progress = (wall_time - train_t0) / max(time_limit - train_t0, 1.0)
+    decay_start = 1.0 - args.time_decay_frac
+    if progress <= decay_start:
+        return lr
+    frac = min((progress - decay_start) / args.time_decay_frac, 1.0)
+    return lr + (min_lr - lr) * frac
 
 
 def make_lr_schedule(

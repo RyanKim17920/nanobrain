@@ -63,6 +63,10 @@ decay_steps: 0
 epochs: null
 warmup_epochs: 0
 decay_epochs: 0
+# wall-clock keyed lr schedule (train.time_keyed_lr): decay over the last time_decay_frac of the
+# training time and stop at time_limit; total_steps / decay_steps are ignored
+time_schedule: false
+time_decay_frac: 0.2
 weight_decay: 0.05
 betas: [0.9, 0.95]
 clip_grad: 1.0
