@@ -1,5 +1,6 @@
 import io
 import math
+import re
 from pathlib import Path
 
 import nibabel as nib
@@ -62,8 +63,12 @@ class InfiniteSampler(Sampler[int]):
         world_size: int = 1,
         late_indices: list[int] | None = None,
         switch_at: int | None = None,
+        groups: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ):
         self.num_samples = num_samples
+        # (members, starts, sizes) from group_indices: each epoch draws one random member per
+        # group, so an epoch has len(sizes) samples (dwi_cap)
+        self.groups = groups
         self.seed = seed
         self.start = start
         self.rank = rank
@@ -76,7 +81,14 @@ class InfiniteSampler(Sampler[int]):
         generator = torch.Generator().manual_seed(self.seed)
         index = 0
         while self.switch_at is None or index < self.switch_at:
-            for sample_index in torch.randperm(self.num_samples, generator=generator).tolist():
+            if self.groups is None:
+                epoch = torch.randperm(self.num_samples, generator=generator)
+            else:
+                members, starts, sizes = self.groups
+                pick = (torch.rand(len(sizes), generator=generator, dtype=torch.float64) * sizes).long()
+                epoch = members[starts + pick.clamp_(max=sizes - 1)]
+                epoch = epoch[torch.randperm(len(epoch), generator=generator)]
+            for sample_index in epoch.tolist():
                 if self.switch_at is not None and index >= self.switch_at:
                     break
                 if index >= self.start and index % self.world_size == self.rank:
@@ -88,6 +100,21 @@ class InfiniteSampler(Sampler[int]):
                 if index >= self.start and index % self.world_size == self.rank:
                     yield self.late_indices[ii]
                 index += 1
+
+
+def group_indices(paths: list[str]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Groups for dwi_cap: the dwi volumes of one session/run (path minus its `_dwi...` suffix,
+    e.g. the b-value shells `_dwi_bval1000.npz`) form one group, every other image is its own
+    group. Returns (members, starts, sizes): members sorted by group, group g is
+    members[starts[g]:starts[g] + sizes[g]]."""
+    dwi = re.compile(r"_dwi[^/]*$")
+    keys: dict[str, list[int]] = {}
+    for ii, path in enumerate(paths):
+        keys.setdefault(dwi.sub("_dwi", path) if dwi.search(path) else path, []).append(ii)
+    sizes = torch.tensor([len(v) for v in keys.values()])
+    starts = torch.cumsum(sizes, 0) - sizes
+    members = torch.tensor([ii for v in keys.values() for ii in v])
+    return members, starts, sizes
 
 
 def brle_to_dense(mask_rle: torch.Tensor, shape: tuple[int, int, int]) -> torch.Tensor:

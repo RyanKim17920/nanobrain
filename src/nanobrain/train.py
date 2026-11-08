@@ -29,6 +29,7 @@ import nanobrain.prep as prep
 from nanobrain.data import (
     Fomo300kDataset,
     InfiniteSampler,
+    group_indices,
     brle_to_dense,
     fit_to_shape,
     native_spacing,
@@ -225,6 +226,15 @@ def main(args: DictConfig):
         late_indices = [ii for ii, path in enumerate(dataset.paths) if path in late]
         switch_at = (args.total_steps - args.decay_steps) * args.accum_iter * args.batch_size * world_size
         logger.info(f"anneal: {len(late_indices)} images from sample {switch_at}")
+    groups = None
+    if args.get("dwi_cap"):
+        # each dwi session/run (all its b-value shells) gives one random volume per epoch. the
+        # lr schedule stays keyed to len(dataset), so warmup/decay steps match the uncapped run
+        groups = group_indices(dataset.paths)
+        logger.info(
+            f"dwi_cap: {len(dataset)} images in {len(groups[2])} groups "
+            f"({int((groups[2] > 1).sum())} multi-volume), epoch = {len(groups[2])} samples"
+        )
     sampler = InfiniteSampler(
         len(dataset),
         seed=args.seed,
@@ -233,6 +243,7 @@ def main(args: DictConfig):
         world_size=world_size,
         late_indices=late_indices,
         switch_at=switch_at,
+        groups=groups,
     )
     fast_prep = not args.native
     train_loader = DataLoader(

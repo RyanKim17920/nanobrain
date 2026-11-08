@@ -11,6 +11,8 @@ output_dir: output
 train_filelist: src/nanobrain/config/fomo300k_images.txt
 # optional subset of train_filelist that the lr decay phase draws from (null = off)
 anneal_filelist: null
+# each dwi session/run (its b-value shells) contributes one random volume per epoch (data.group_indices)
+dwi_cap: false
 num_workers: 8
 prefetch_factor: 2
 # gpu prep of the next batches in background threads on side streams (same math, ~21% faster
