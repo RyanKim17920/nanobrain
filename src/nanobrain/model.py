@@ -93,6 +93,10 @@ class ViTMAE3D(nn.Module):
         blob_radius: tuple[float, float] = (2.0, 9.0),
         blob_contrast: tuple[float, float] = (1.0, 3.0),
         blob_edge: float = 1.5,
+        # encoder attention logits scaled by log(keys) / log(attn_len_ref) (modules.Attention
+        # len_scale_ref): training sees ~num_visible keys, the probes ~3000-4000
+        attn_len_scale: bool = False,
+        attn_len_ref: int = 512,
     ):
         super().__init__()
         self.grid_size = grid_size
@@ -145,6 +149,7 @@ class ViTMAE3D(nn.Module):
                     drop_path=dpr[ii],
                     qk_norm=qk_norm,
                     qk_scale_init=qk_scale_init,
+                    len_scale_ref=attn_len_ref if attn_len_scale else 0,
                 )
                 for ii in range(depth)
             ]
