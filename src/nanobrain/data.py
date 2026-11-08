@@ -25,6 +25,8 @@ class Fomo300kDataset(Dataset):
         self.sizes = members["size"].to_numpy()
         # fino3d per-image metadata [N, 6] (nanobrain.fino.build_meta), None = off
         self.meta = None
+        # nuis_dec per-image nuisance ids [N, 5] (nanobrain.nuisdec.build_nuis), None = off
+        self.nuis = None
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -46,6 +48,8 @@ class Fomo300kDataset(Dataset):
         if self.meta is not None:
             # numpy, so send_data leaves it on the cpu (no per-step host <-> device sync)
             sample["fino"] = self.meta[index].numpy()
+        if self.nuis is not None:
+            sample["nuis"] = self.nuis[index].numpy()
         return sample
 
 

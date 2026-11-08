@@ -152,6 +152,24 @@ fino3d:
   bv_mean: null
   bv_std: null
 
+# NUIS_DEC (nanobrain.nuisdec): nuisance-conditioned MAE decoder (Moyer 2018 explaining away).
+# One learned embedding per acquisition field (0 = unknown, rare values -> other), summed and
+# added to every decoder token before the decoder blocks; tables init to zero (init_std 0) so
+# step 0 is the base forward. Encoder / eval untouched. Per-field toggles below. enabled false =
+# the base run, bitwise
+nuis_dec:
+  enabled: false
+  manufacturer: true
+  field_strength: true
+  contrast: true
+  spacing: true
+  collection: true
+  # values with fewer train-filelist images share the "other" index
+  min_count: 50
+  init_std: 0.0
+  # filled at train time from the train filelist, kept in the checkpoint args
+  vocab: null
+
 wandb: false
 wandb_entity: null
 wandb_project: nanobrain
