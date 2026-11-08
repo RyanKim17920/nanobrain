@@ -82,3 +82,10 @@ debug: false
 wandb: true
 wandb_entity: null
 wandb_project: nanobrain-climb
+aug:
+  biasfield:
+    enabled: false
+    prob: 0.8
+    amp: 0.3
+    gamma: 0.3
+    grid: 4

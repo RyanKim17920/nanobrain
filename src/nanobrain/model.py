@@ -76,8 +76,11 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # encoder-input-only bias field + gamma augmentation (targets stay clean); None = off
+        biasfield: dict | None = None,
     ):
         super().__init__()
+        self.biasfield = biasfield
         self.norm_target = norm_target
         self.grad_loss_weight = float(grad_loss_weight)
         self.fg_loss_weight = float(fg_loss_weight)
@@ -187,6 +190,7 @@ class ViTMAE3D(nn.Module):
             patch_size=args["patch_size"],
             native=args["native"],
             fino3d=fino if (fino := args.get("fino3d")) and fino.get("enabled") else None,
+            biasfield=bf if (bf := (args.get("aug") or {}).get("biasfield")) and bf.get("enabled") else None,
             **args["model_kwargs"],
         )
 
@@ -481,6 +485,26 @@ class ViTMAE3D(nn.Module):
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         return (weight * bce).sum() / (weight.sum() * target.shape[1]).clamp_min(1e-6)
 
+    def biasfield_aug(self, img: Tensor, mask: Tensor) -> Tensor:
+        # img, mask [B X Y Z]. per sample (prob p): multiplicative smooth bias field exp(a * f), f a
+        # trilinear upsample of a random coarse grid scaled to [-1, 1], a ~ U(0, amp); then a gamma
+        # exp(U(-g, g)) on the min-max normalized intensity. only inside the mask (background kept)
+        cfg = self.biasfield
+        B = img.shape[0]
+        dev = img.device
+        res = int(cfg.get("grid", 4))
+        coarse = torch.rand(B, 1, res, res, res, device=dev) * 2 - 1
+        field = F.interpolate(coarse, size=img.shape[1:], mode="trilinear", align_corners=True)[:, 0]
+        field = field / field.abs().amax(dim=(1, 2, 3), keepdim=True).clamp_min(1e-6)
+        amp = torch.rand(B, 1, 1, 1, device=dev) * float(cfg.get("amp", 0.3))
+        out = img * torch.exp(amp * field)
+        g = torch.exp((torch.rand(B, 1, 1, 1, device=dev) * 2 - 1) * float(cfg.get("gamma", 0.3)))
+        lo = out.amin(dim=(1, 2, 3), keepdim=True)
+        hi = out.amax(dim=(1, 2, 3), keepdim=True)
+        out = ((out - lo) / (hi - lo).clamp_min(1e-6)).clamp_min(0) ** g * (hi - lo) + lo
+        use = (torch.rand(B, 1, 1, 1, device=dev) < float(cfg.get("prob", 0.8))) & (mask > 0)
+        return torch.where(use, out, img)
+
     def forward_native(
         self,
         images: list[Float[Tensor, "X Y Z"]],
@@ -522,12 +546,16 @@ class ViTMAE3D(nn.Module):
             # images and masks fit to the box (fit_to_shape) and padded up to whole patches, tiling
             # the box from its low corner, in one buffer
             padded = tuple(num * p for num, p in zip(grid, patch))
-            vols = images[ids[0]].new_zeros((2, len(ids)) + padded)
+            nch = 3 if self.biasfield is not None and self.training else 2
+            vols = images[ids[0]].new_zeros((nch, len(ids)) + padded)
             for jj, ii in enumerate(ids):
                 src, dst = fit_slices(images[ii].shape, box)
                 vols[0, jj][dst] = images[ii][src]
                 vols[1, jj][dst] = mask[ii][src]
-            vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
+            if nch == 3:
+                # channel 2: the encoder's input view; channel 0 stays the clean reconstruction target
+                vols[2] = self.biasfield_aug(vols[0], vols[1])
+            vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (nch, len(ids)))
             cube = (grid, self.mask_cube) if self.mask_cube else None
             scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube).flatten(0, 1)
             parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols})
@@ -556,12 +584,13 @@ class ViTMAE3D(nn.Module):
             # images and masks gathered together by flat token ids
             flat_ids = part["order"] + gather_offsets(b, num, device)
             patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
-            patches, mask_patches = patches.view(2, b * num_samples, seq_length, -1)
+            patches, mask_patches, *aug_patches = patches.view(len(vols), b * num_samples, seq_length, -1)
             coord = geoms[sp][3][0][order]
             vis_patches, part["target_patches"] = patches.split([num_visible, num_predict], 1)
+            enc_patches = aug_patches[0][:, :num_visible] if aug_patches else vis_patches
             part["target_mask_patches"] = mask_patches[:, num_visible:]
             part["vis_coord"], part["target_coord"] = coord.split([num_visible, num_predict], 1)
-            part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
+            part["embeds"] = self.patch_embed.native(enc_patches, sp, patch, embed_ws.get(sp))
             if self.level_head is not None:
                 part["vis_patches"], part["vis_mask"] = vis_patches, mask_patches[:, :num_visible]
 
