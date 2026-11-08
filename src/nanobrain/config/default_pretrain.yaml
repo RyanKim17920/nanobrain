@@ -152,6 +152,18 @@ fino3d:
   bv_mean: null
   bv_std: null
 
+# XVIEW (nanobrain.xview): same-subject cross-image agreement on the pooled embedding. The pair
+# sampler puts a different image of the anchor's subject (partner diff: different session or
+# contrast preferred) next to it in the batch; loss simsiam (predictor + stop-grad) or infonce
+# (projector, temperature tau), weight ramped in with FINO's ramp. enabled false = the base run
+xview:
+  enabled: false
+  weight: 0.05
+  loss: simsiam
+  tau: 0.2
+  hidden: 512
+  partner: diff
+
 wandb: false
 wandb_entity: null
 wandb_project: nanobrain

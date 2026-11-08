@@ -12,6 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
 from .fino import FinoHeads
+from .xview import XViewHead
 from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
 from .data import (
     crop_to_mask,
@@ -76,6 +77,9 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # xview config block (nanobrain.xview), training only same-subject agreement on the pooled
+        # embedding; None = off (no params, same init)
+        xview: dict | None = None,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -177,6 +181,12 @@ class ViTMAE3D(nn.Module):
             assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
+        self.xview_head = None
+        self.xview_stats = {}
+        if xview is not None:
+            assert native, "xview: native training only"
+            self.xview_head = XViewHead(embed_dim, xview)
+            self.xview_head.apply(_init_weights)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -187,6 +197,7 @@ class ViTMAE3D(nn.Module):
             patch_size=args["patch_size"],
             native=args["native"],
             fino3d=fino if (fino := args.get("fino3d")) and fino.get("enabled") else None,
+            xview=xv if (xv := args.get("xview")) and xv.get("enabled") else None,
             **args["model_kwargs"],
         )
 
@@ -294,12 +305,15 @@ class ViTMAE3D(nn.Module):
         spacing: list[tuple[float, float, float]] | None = None,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        xview_valid: Tensor | None = None,
+        xview_ramp: float = 0.0,
     ):
         if isinstance(images, list):
             # native resolution batch, images on their own voxel grids
             return self.forward_native(
                 images, mask, spacing, num_visible, num_predict, num_samples, with_state,
                 fino_meta=fino_meta, fino_gamma=fino_gamma,
+                xview_valid=xview_valid, xview_ramp=xview_ramp,
             )
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
@@ -492,6 +506,8 @@ class ViTMAE3D(nn.Module):
         with_state: bool = True,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        xview_valid: Tensor | None = None,
+        xview_ramp: float = 0.0,
     ):
         # images (float) and masks (bool) on their own voxel grids (sample_transform native), fit
         # here to the grid_size mm box in their voxels. images with the same spacing share one
@@ -646,6 +662,19 @@ class ViTMAE3D(nn.Module):
                 meta = meta.pin_memory().to(device, non_blocking=True)
             fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
             loss = loss + fino_loss
+        if self.xview_head is not None and xview_valid is not None:
+            # image-level pooled embedding (mean over its sequences of the mean visible token), back
+            # in batch order (anchor, partner, ...); rows are part by part, image-major
+            pooled = embeds[:, self.class_tokens :].mean(dim=1)
+            rows = torch.tensor([ii for part in parts for ii in part["ids"]]).repeat_interleave(num_samples)
+            valid = xview_valid.cpu()
+            if device.type == "cuda":
+                rows = rows.pin_memory().to(device, non_blocking=True)
+                valid = valid.pin_memory().to(device, non_blocking=True)
+            B = len(images)
+            z = pooled.new_zeros(B, pooled.shape[1]).index_add(0, rows, pooled) / num_samples
+            xview_loss, self.xview_stats = self.xview_head(z, valid, xview_ramp)
+            loss = loss + xview_loss
 
         if not with_state:
             return loss

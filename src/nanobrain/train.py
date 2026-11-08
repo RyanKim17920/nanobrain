@@ -177,6 +177,19 @@ def main(args: DictConfig):
 
     dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
     dataset.meta = fino_meta
+    xview = bool(args.get("xview") and args.xview.enabled)
+    if xview:
+        from nanobrain.xview import partner_lists
+
+        assert args.native, "xview: native training only"
+        assert args.batch_size % 2 == 0, "xview: pairs need an even batch size"
+        assert not args.anneal_filelist, "xview: anneal_filelist not supported"
+        xview_partners = partner_lists(dataset.paths, args.xview.partner)
+        frac = sum(bool(c) for c in xview_partners) / len(dataset)
+        logger.info(
+            f"xview: loss {args.xview.loss} weight {args.xview.weight} partner {args.xview.partner}, "
+            f"{frac:.1%} of images have a same-subject partner"
+        )
     logger.info(f"train dataset: {len(dataset)} images")
 
     if args.epochs:
@@ -228,12 +241,18 @@ def main(args: DictConfig):
     sampler = InfiniteSampler(
         len(dataset),
         seed=args.seed,
-        start=start_step * args.accum_iter * args.batch_size * world_size,
+        # xview: the base sampler draws the anchors, one per pair
+        start=start_step * args.accum_iter * args.batch_size * world_size // (2 if xview else 1),
         rank=rank,
         world_size=world_size,
         late_indices=late_indices,
         switch_at=switch_at,
     )
+    if xview:
+        from nanobrain.xview import PairSampler
+
+        assert world_size == 1, "xview: pair sampler is single gpu"
+        sampler = PairSampler(sampler, xview_partners, len(dataset), seed=args.seed)
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
@@ -439,6 +458,14 @@ def train(
                 "fino_meta": batch["fino"],
                 "fino_gamma": fino_ramp(args.fino3d.gamma_max, progress),
             }
+        if "xview_valid" in batch:
+            if time_schedule:
+                wall = prev_wall_time + time.monotonic() - start_time
+                progress = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+            else:
+                progress = step / total_steps
+            fino_kwargs["xview_valid"] = batch["xview_valid"]
+            fino_kwargs["xview_ramp"] = fino_ramp(1.0, progress)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,
@@ -480,10 +507,14 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
-            if fino_kwargs:
+            if "fino_gamma" in fino_kwargs:
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
+            if "xview_ramp" in fino_kwargs:
+                log_stats["xview_ramp"] = fino_kwargs["xview_ramp"]
+                for k, v in model_without_ddp.xview_stats.items():
+                    log_stats[f"xview_{k}"] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)
@@ -624,6 +655,10 @@ def make_batch_transform(args: DictConfig):
             out = {key: [sample[key] for sample in batch] for key in ("image", "mask", "spacing")}
             if "fino" in raw[0]:
                 out["fino"] = torch.from_numpy(np.stack([sample["fino"] for sample in raw]))
+            if args.get("xview") and args.xview.enabled:
+                from nanobrain.xview import pair_valid
+
+                out["xview_valid"] = pair_valid([sample["path"] for sample in raw])
             return out
         images = torch.stack([sample["image"] for sample in batch])
         masks = torch.stack([sample["mask"] for sample in batch])
