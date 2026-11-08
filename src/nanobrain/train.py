@@ -436,6 +436,16 @@ def train(
             max_norm=args.clip_grad,
         )
 
+        if need_update and getattr(model_without_ddp, "teacher", None) is not None:
+            # EMA teacher after the optimizer step, momentum ramped over training progress
+            if time_schedule:
+                now = prev_wall_time + time.monotonic() - start_time
+                t0 = train_t0 if train_t0 is not None else now
+                progress = (now - t0) / max(time_limit - t0, 1.0)
+            else:
+                progress = step / max(total_steps, 1)
+            model_without_ddp.update_teacher(model_without_ddp.teacher_momentum(progress))
+
         # log tensors without syncing, values are only read on log steps
         metric_logger.update(loss=loss_for_log)
         if need_update:
@@ -522,7 +532,8 @@ def make_optimizer(args: DictConfig, model: nn.Module):
     muon_names = [
         n
         for n, p in model.named_parameters()
-        if is_muon_param(n, p, args.muon_encoder_only, args.muon_decoder_only, args.muon_all_matrices)
+        if p.requires_grad
+        and is_muon_param(n, p, args.muon_encoder_only, args.muon_decoder_only, args.muon_all_matrices)
     ]
     logger.info(f"muon params: {len(muon_names)} matrices")
     adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names))

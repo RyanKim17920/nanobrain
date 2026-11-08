@@ -1,3 +1,4 @@
+import copy
 import math
 from functools import lru_cache
 
@@ -72,6 +73,16 @@ class ViTMAE3D(nn.Module):
         norm_target: bool = False,
         grad_loss_weight: float = 0.0,
         fg_loss_weight: float = 0.0,
+        # EMA self-teacher (native training only; built from scratch, its weights ride in the state
+        # dict so a requeue resumes it; the eval reads only the student encoder). lat = data2vec
+        # style latent MIM: the decoder also predicts, through lat_head, the teacher's features
+        # (mean of its last lat_topk block outputs, each layer-normed) at the masked tokens of each
+        # image's first sequence, the teacher encoding that sequence's visible + masked tokens
+        # (weight; 0 = off). the ema momentum ramps teacher_ema -> teacher_ema_end over training
+        lat_weight: float = 0.0,
+        lat_topk: int = 4,
+        teacher_ema: float = 0.998,
+        teacher_ema_end: float = 0.9999,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -165,7 +176,41 @@ class ViTMAE3D(nn.Module):
             self.decoder_head = NativeHead(decoder_embed_dim, patch_size)
         else:
             self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim)
+        self.lat_weight = float(lat_weight)
+        self.lat_topk = lat_topk
+        self.teacher_ema = teacher_ema
+        self.teacher_ema_end = teacher_ema_end
+        self.lat_head = nn.Linear(decoder_embed_dim, embed_dim) if lat_weight else None
         self.init_weights()
+        # after the init: the teacher starts as a copy of the student
+        self.teacher = None
+        if self.uses_teacher:
+            assert native, "the EMA teacher is native path only"
+            self.teacher = TeacherEncoder(self)
+        self._ema_pairs = None
+
+    @property
+    def uses_teacher(self) -> bool:
+        return bool(self.lat_weight)
+
+    @torch.no_grad()
+    def update_teacher(self, momentum: float) -> None:
+        # teacher <- momentum * teacher + (1 - momentum) * student, over the teacher's parameters
+        if self.teacher is None:
+            return
+        if self._ema_pairs is None:
+            student = dict(self.named_parameters())
+            names = [n for n, _ in self.teacher.named_parameters()]
+            self._ema_pairs = (
+                [p for _, p in self.teacher.named_parameters()],
+                [student[n] for n in names],
+            )
+        teacher_params, student_params = self._ema_pairs
+        torch._foreach_lerp_(teacher_params, [p.detach() for p in student_params], 1.0 - momentum)
+
+    def teacher_momentum(self, progress: float) -> float:
+        progress = min(max(progress, 0.0), 1.0)
+        return self.teacher_ema_end - (self.teacher_ema_end - self.teacher_ema) * (1.0 - progress)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -498,6 +543,11 @@ class ViTMAE3D(nn.Module):
             embed_ws = self.patch_embed.native_weights(native_sps, sp_patches)
             head_ws = self.decoder_head.native_weights(native_sps, sp_patches)
             embed_ws, head_ws = dict(zip(native_sps, embed_ws)), dict(zip(native_sps, head_ws))
+        teacher_ws = {}
+        if self.teacher is not None and native_sps:
+            with torch.no_grad():
+                teacher_ws = self.teacher.patch_embed.native_weights(native_sps, sp_patches)
+                teacher_ws = dict(zip(native_sps, teacher_ws))
 
         parts = []
         for sp, ids in groups.items():
@@ -545,6 +595,14 @@ class ViTMAE3D(nn.Module):
             part["target_mask_patches"] = mask_patches[:, num_visible:]
             part["vis_coord"], part["target_coord"] = coord.split([num_visible, num_predict], 1)
             part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
+            if self.teacher is not None:
+                # the teacher sees each image's first sequence whole (visible + masked tokens)
+                with torch.no_grad():
+                    t_patches = patches.unflatten(0, (b, num_samples))[:, 0]
+                    part["t_embeds"] = self.teacher.patch_embed.native(
+                        t_patches, sp, patch, teacher_ws.get(sp)
+                    )
+                part["t_coord"] = coord.unflatten(0, (b, num_samples))[:, 0]
             if self.level_head is not None:
                 part["vis_patches"], part["vis_mask"] = vis_patches, mask_patches[:, :num_visible]
 
@@ -561,6 +619,7 @@ class ViTMAE3D(nn.Module):
 
         embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
         feats = self.decode_features(embeds, cat("target_coord"))
+        feats_all = feats
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
         # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
@@ -618,6 +677,21 @@ class ViTMAE3D(nn.Module):
                 )
                 num, den = num + n, den + d
             loss = loss + self.level_weight * num / den.clamp_min(1e-6)
+        if self.teacher is not None:
+            with torch.no_grad():
+                t_final, t_target = self.teacher(cat("t_embeds"), cat("t_coord"), self.lat_topk)
+            for part in parts:
+                del part["t_embeds"], part["t_coord"]
+        if self.lat_head is not None:
+            # rows 2i, 2i + 1 are the two sequences of one image (b-major in every spacing group)
+            assert num_samples == 2, "lat pairs sequence 0 of each image with the teacher"
+            pred = self.lat_head(feats_all[0::2]).float()
+            tgt = t_target[:, num_visible:]
+            # in-mask fraction per token (patch voxel counts differ between spacing groups)
+            w = torch.cat([part["target_mask_patches"].float().mean(dim=-1) for part in parts])
+            w = w[0::2]
+            lat = (pred - tgt).square().mean(dim=-1)
+            loss = loss + self.lat_weight * (w * lat).sum() / w.sum().clamp_min(1e-6)
 
         if not with_state:
             return loss
@@ -627,6 +701,8 @@ class ViTMAE3D(nn.Module):
         # the fixed-shape transformer parts. per-spacing tokenization, embedding and head stay eager
         self.encode_tokens = torch.compile(self.encode_tokens, **kwargs)
         self.decode_features = torch.compile(self.decode_features, **kwargs)
+        if self.teacher is not None:
+            self.teacher.forward = torch.compile(self.teacher.forward, **kwargs)
 
     def compile_cudagraphs(self) -> None:
         # training speed, same math: sampling + gather compiled as usual, the encoder / decoder / loss
@@ -697,6 +773,42 @@ class ViTMAE3D(nn.Module):
                 output["dense_mask"] = in_mask.reshape(patch_grid_size)
             outputs.append(output)
         return outputs
+
+
+class TeacherEncoder(nn.Module):
+    # frozen EMA copy of the student encoder (patch embedding, position table, class tokens,
+    # blocks, final norm; plus the student's projection heads named in HEADS). parameter names
+    # match the student's, see ViTMAE3D.update_teacher
+    HEADS = ()
+
+    def __init__(self, student: "ViTMAE3D"):
+        super().__init__()
+        self.class_tokens = student.class_tokens
+        self.patch_embed = copy.deepcopy(student.patch_embed)
+        self.pos_embed = copy.deepcopy(student.pos_embed)
+        self.cls_token = copy.deepcopy(student.cls_token) if student.class_tokens else None
+        self.blocks = copy.deepcopy(student.blocks)
+        self.norm = copy.deepcopy(student.norm)
+        for name in self.HEADS:
+            head = getattr(student, name, None)
+            setattr(self, name, copy.deepcopy(head) if head is not None else None)
+        self.requires_grad_(False)
+
+    def forward(self, x: Tensor, coord: Tensor, topk: int = 1) -> tuple[Tensor, Tensor]:
+        # (final normed tokens, latent targets = mean of the last topk block outputs, each
+        # layer-normed, then layer-normed), class tokens dropped
+        B = x.shape[0]
+        x = self.pos_embed(x, coord)
+        if self.class_tokens:
+            x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
+        outs = []
+        for ii, block in enumerate(self.blocks):
+            x = block(x)
+            if ii >= len(self.blocks) - topk:
+                outs.append(F.layer_norm(x.float(), x.shape[-1:]))
+        final = self.norm(x)
+        target = F.layer_norm(sum(outs) / len(outs), x.shape[-1:])
+        return final[:, self.class_tokens :], target[:, self.class_tokens :]
 
 
 @register_model
