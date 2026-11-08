@@ -23,6 +23,7 @@ logger = logging.getLogger()
 
 # column order of the per-image metadata tensor; NaN = missing (masked)
 COLUMNS = ("age", "sex", "group", "field_strength", "manufacturer", "brain_volume")
+COLL_COL = len(COLUMNS)  # optional 7th column: collection index (coll_bias), never NaN
 CONTROL = {"control", "controls", "normal", "hc", "cn", "healthy", "healthy control",
            "healthy controls", "typically developing", "td", "nc"}
 MANUFACTURERS = ("siemens", "ge", "philips")
@@ -88,6 +89,18 @@ def build_meta(cfg, paths: list[str], images_parquet: str | Path) -> Tensor:
 
     meta = np.stack([age, sex, group, field, manu, bv], axis=1)
     meta[excluded] = np.nan
+    if cfg.get("coll_bias"):
+        # collection -> index: sorted collections of the train filelist (deterministic, stored in
+        # the checkpoint args); missing / unseen collection -> the dedicated last index
+        if cfg.get("collections") is None:
+            cfg["collections"] = sorted(table["collection"].dropna().unique().tolist())
+        cmap = {c: float(ii) for ii, c in enumerate(cfg["collections"])}
+        cidx = table["collection"].map(cmap).fillna(float(len(cmap))).to_numpy(dtype=np.float64)
+        meta = np.concatenate([meta, cidx[:, None]], axis=1)
+        logger.info(
+            f"fino3d coll_bias: {len(cmap)} collections (+1 unknown index), "
+            f"known-collection fraction {float(np.mean(cidx < len(cmap))):.4f}"
+        )
     known = {c: float(np.mean(~np.isnan(meta[:, ii]))) for ii, c in enumerate(COLUMNS)}
     logger.info(
         f"fino3d: {len(paths)} images, {int(excluded.sum())} masked by exclude_collections, "
@@ -125,6 +138,14 @@ class FinoHeads(nn.Module):
             sign = float(cfg[k])
             self.signs[k] = -abs(sign) if reverse and k in ("field_strength", "manufacturer") else sign
         hidden = int(cfg["hidden"])
+        # per-collection output offsets (training only): label offsets of a source dataset go
+        # into b[collection], so the pooled embedding has no incentive to encode the site
+        self.coll_bias = None
+        if cfg.get("coll_bias"):
+            n_coll = len(cfg["collections"]) + 1
+            self.coll_bias = nn.ModuleDict({k: nn.Embedding(n_coll, d) for k, d in self.dims.items()})
+            for emb in self.coll_bias.values():
+                nn.init.zeros_(emb.weight)
         self.heads = nn.ModuleDict({
             k: nn.Sequential(nn.LayerNorm(embed_dim, elementwise_affine=False),
                              nn.Linear(embed_dim, hidden), nn.GELU(), nn.Linear(hidden, d))
@@ -142,6 +163,8 @@ class FinoHeads(nn.Module):
                 keep = ~torch.isnan(target)
                 # every head runs on every row so the graph (and ddp) sees all params
                 out = head(GradScale.apply(pooled, self.signs[k] * gamma))
+                if self.coll_bias is not None:
+                    out = out + self.coll_bias[k](meta[:, COLL_COL].long())
                 n = keep.sum().clamp_min(1)
                 t = torch.where(keep, target, torch.zeros_like(target))
                 if k in ("age", "brain_volume"):
