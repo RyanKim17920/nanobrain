@@ -110,6 +110,8 @@ def main(args: DictConfig):
         else:
             misc.snapshot_source(*snapshot_args)
 
+    # plot_examples encodes one sequence per image, level_resid pairs two
+    assert not (args.model_kwargs.get("level_resid") and args.plot_period), "set plot_period 0 with level_resid"
     # the example plots assume the 1 mm grid
     assert not (args.native and args.plot_period), "set plot_period 0 with native"
 
@@ -209,6 +211,7 @@ def main(args: DictConfig):
         # the lr decay phase draws only from this subset of train_filelist
         late = set(Path(args.anneal_filelist).read_text().split())
         late_indices = [ii for ii, path in enumerate(dataset.paths) if path in late]
+        assert late_indices, f"{args.anneal_filelist} shares no paths with {args.train_filelist}"
         switch_at = (args.total_steps - args.decay_steps) * args.accum_iter * args.batch_size * world_size
         logger.info(f"anneal: {len(late_indices)} images from sample {switch_at}")
     sampler = InfiniteSampler(
@@ -427,6 +430,9 @@ def train(
         # the cuda graph's output buffer is overwritten by the next replay
         loss_for_log = loss.detach().clone() if args.cudagraphs else loss.detach()
         torch._assert_async(torch.isfinite(loss_for_log), "non-finite loss")
+        mirror_stats = None
+        if log_step and model_without_ddp.level_mirror_stat_names:
+            mirror_stats = model_without_ddp.level_mirror_stats.clone()
 
         grad_norm = misc.backward_step(
             loss / args.accum_iter,
@@ -453,6 +459,8 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
+            if mirror_stats is not None:
+                log_stats.update(zip(model_without_ddp.level_mirror_stat_names, mirror_stats.tolist()))
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)

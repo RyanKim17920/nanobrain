@@ -65,18 +65,36 @@ class ViTMAE3D(nn.Module):
         level_weight: float = 0.0,
         level_thresholds: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0, 2.5),
         level_pool: int = 2,
-        # the nanobrain-v3 loss stack, grafted from v3/src/nanobrain/model.py:
-        # z-score each target sequence before the mse; foreground-weighted mse; and the
-        # xyz gradient penalty on the target-ref patches (dense_neighbor_pool needs
-        # encoder plumbing and is not part of this graft)
-        norm_target: bool = False,
-        grad_loss_weight: float = 0.0,
-        fg_loss_weight: float = 0.0,
+        # extra level channels (1 mm path, num_samples 2; () = off): levels of each visible patch minus
+        # the decoder prediction of it by the image's other sequence, where that sequence predicts it
+        level_resid: tuple[float, ...] = (),
+        # extra level channels on the in-patch gradient magnitude (central differences, z per mm;
+        # 1 mm path; () = off): where the edges are in each sub-block
+        level_grad: tuple[float, ...] = (),
+        # each level threshold's BCE over its batch base-rate entropy (rare levels weigh like common)
+        level_balance: bool = False,
+        # second level head on level_pool2^3 sub-blocks (global thresholds; 1 mm path; 0 = off),
+        # averaged with the first so the total level weight stays level_weight
+        level_pool2: int = 0,
+        # extra level channels (1 mm path, level_pool 2; () = off): in-mask fraction of each sub-block
+        # above each threshold and above margin + the max within +-2-4 mm of its x-mirrored 2 mm cell
+        level_mirror: tuple[float, ...] = (),
+        level_mirror_margin: float = 0.5,
+        # dark analogue (channels after level_mirror's; () = off): fraction below each threshold and
+        # below the min within +-2-4 mm of the x-mirrored 2 mm cell - level_mirror_margin
+        level_mirror_dark: tuple[float, ...] = (),
+        # zero-init linear head on the decoder features: the level BCE on the predicted patches
+        # (level_thresholds / level_pool; weight; 0 = off)
+        decoder_level_weight: float = 0.0,
+        # training only (1 mm path; 0 = off): share of images given 1 to blob_max synthetic focal
+        # hyperintensities, radius log-uniform in blob_radius mm, + blob_contrast z, soft edge blob_edge mm
+        blob_prob: float = 0.0,
+        blob_max: int = 3,
+        blob_radius: tuple[float, float] = (2.0, 9.0),
+        blob_contrast: tuple[float, float] = (1.0, 3.0),
+        blob_edge: float = 1.5,
     ):
         super().__init__()
-        self.norm_target = norm_target
-        self.grad_loss_weight = float(grad_loss_weight)
-        self.fg_loss_weight = float(fg_loss_weight)
         self.grid_size = grid_size
         self.target_spacing = target_spacing
         self.native = native
@@ -92,6 +110,12 @@ class ViTMAE3D(nn.Module):
         self.hard_gamma = hard_gamma
         self.hard_max = hard_max
         self.decoder_keep = decoder_keep
+        assert not (blob_prob and (native or target_spacing != 1.0)), "blob_prob: 1 mm path only"
+        self.blob_prob = blob_prob
+        self.blob_max = blob_max
+        self.blob_radius = tuple(float(v) for v in blob_radius)
+        self.blob_contrast = tuple(float(v) for v in blob_contrast)
+        self.blob_edge = blob_edge
 
         patch_dim = patch_size**3
         self.register_buffer("coord_grid", make_coord_grid(grid_size, patch_size), persistent=False)
@@ -135,11 +159,52 @@ class ViTMAE3D(nn.Module):
         self.min_mask_frac = min_mask_frac
         self.level_weight = level_weight
         self.level_pool = level_pool
+        self.level_resid = tuple(float(t) for t in level_resid)
+        self.level_grad = tuple(float(t) for t in level_grad)
+        self.level_balance = level_balance
+        self.level_pool2 = level_pool2
+        self.level_mirror = tuple(float(t) for t in level_mirror)
+        self.level_mirror_margin = level_mirror_margin
+        self.level_mirror_dark = tuple(float(t) for t in level_mirror_dark)
+        # last training forward's mirror stats, named by level_mirror_stat_names
+        self.level_mirror_stats = None
+        self.level_mirror_stat_names = []
+        if self.level_mirror:
+            self.level_mirror_stat_names += ["mirror_bce", "mirror_valid"]
+            self.level_mirror_stat_names += [f"mirror_pos{t:g}" for t in self.level_mirror]
+        if self.level_mirror_dark:
+            self.level_mirror_stat_names += [] if self.level_mirror else ["mirror_valid"]
+            self.level_mirror_stat_names += ["mirror_dark_bce"]
+            self.level_mirror_stat_names += [f"mirror_dark_pos{t:g}" for t in self.level_mirror_dark]
+        if self.level_mirror or self.level_mirror_dark:
+            assert level_weight > 0 and not native, "level_mirror: level head, 1 mm path only"
+            # 2 mm cells, an even number of them along x so each pairs with its mirror cell
+            assert level_pool == 2 and grid_size[0] % 4 == 0, "level_mirror: level_pool 2, grid x % 4 == 0"
+            # background (0) is in the mirror window at the mask edge: these bounds keep it from moving a threshold
+            mg = level_mirror_margin
+            assert min(self.level_mirror, default=mg) >= mg, "level_mirror: thresholds >= level_mirror_margin"
+            assert max(self.level_mirror_dark, default=-mg) <= -mg, "level_mirror_dark: thresholds <= -margin"
+        self.level_head2 = None
+        if level_weight and level_pool2:
+            assert not native, "level_pool2: 1 mm path only"
+            n_levels = len(level_thresholds)
+            self.level_head2 = nn.Linear(embed_dim, n_levels * (patch_size // level_pool2) ** 3)
         self.level_head = None
         if level_weight:
+            assert not (native and self.level_resid), "level_resid: 1 mm path only"
             levels = [float(t) for t in level_thresholds]
-            self.level_head = nn.Linear(embed_dim, len(levels) * (patch_size // level_pool) ** 3)
+            sub = (patch_size // level_pool) ** 3
+            assert not (native and self.level_grad), "level_grad: 1 mm path only"
+            # channels: levels, resid, grad, mirror, mirror dark
+            n_out = len(levels) + len(self.level_resid) + len(self.level_grad) + len(self.level_mirror)
+            n_out += len(self.level_mirror_dark)
+            self.level_head = nn.Linear(embed_dim, n_out * sub)
+            self.register_buffer("level_grad_thresholds", torch.tensor(self.level_grad), persistent=False)
+            self.register_buffer("level_mirror_thresholds", torch.tensor(self.level_mirror), persistent=False)
+            dark = torch.tensor(self.level_mirror_dark)
+            self.register_buffer("level_mirror_dark_thresholds", dark, persistent=False)
             self.register_buffer("level_thresholds", torch.tensor(levels), persistent=False)
+            self.register_buffer("level_resid_thresholds", torch.tensor(self.level_resid), persistent=False)
         # training speed, set by train.py (not a model kwarg): see decode_features
         self.decoder_prune_last = False
         self.decoder_pos_embed = SeparablePosEmbed3D(patch_grid_size, decoder_embed_dim)
@@ -166,6 +231,16 @@ class ViTMAE3D(nn.Module):
         else:
             self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim)
         self.init_weights()
+        self.decoder_level_weight = decoder_level_weight
+        self.decoder_level_head = None
+        if decoder_level_weight:
+            assert level_weight and not native, "decoder_level_weight: needs level_weight, 1 mm path only"
+            sub = (patch_size // level_pool) ** 3
+            # zero init after init_weights, off the cpu rng stream: the other weights init as without it
+            with torch.random.fork_rng(devices=[]):
+                self.decoder_level_head = nn.Linear(decoder_embed_dim, len(level_thresholds) * sub)
+            nn.init.zeros_(self.decoder_level_head.weight)
+            nn.init.zeros_(self.decoder_level_head.bias)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -194,6 +269,9 @@ class ViTMAE3D(nn.Module):
         if self.level_head is not None:
             nn.init.zeros_(self.level_head.weight)
             nn.init.zeros_(self.level_head.bias)
+        if self.level_head2 is not None:
+            nn.init.zeros_(self.level_head2.weight)
+            nn.init.zeros_(self.level_head2.bias)
         if self.self_recon_head is not None:
             nn.init.zeros_(self.self_recon_head.weight)
             nn.init.zeros_(self.self_recon_head.bias)
@@ -286,11 +364,15 @@ class ViTMAE3D(nn.Module):
             return self.forward_native(
                 images, mask, spacing, num_visible, num_predict, num_samples, with_state
             )
+        assert not self.level_resid or num_samples == 2, "level_resid pairs sequences 2i, 2i + 1"
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
+            if self.level_mirror_stat_names:
+                loss, self.level_mirror_stats = self.patch_loss(*seqs)
+                return loss
             return self.patch_loss(*seqs)
-        loss, embeds, pred_patches = self.patch_loss(*seqs, with_outputs=True)
-        vis_patches, vis_mask_patches, _, target_patches, target_mask_patches, _ = seqs
+        loss, embeds, pred_patches = self.patch_loss(*seqs, with_outputs=True)[:3]
+        vis_patches, vis_mask_patches, _, target_patches, target_mask_patches, _ = seqs[:6]
         num_predict = target_patches.shape[1]
         B = images.shape[0]
 
@@ -324,6 +406,12 @@ class ViTMAE3D(nn.Module):
         B = images.shape[0]
         assert tuple(images.shape[1:]) == tuple(self.grid_size)
 
+        if self.training and self.blob_prob > 0:
+            # before patchify: blobs enter the inputs and every target, shared by an image's sequences
+            images = insert_blobs(
+                images, mask, self.patch_size[0], self.blob_prob, self.blob_max, self.blob_radius,
+                self.blob_contrast, self.blob_edge,
+            )
         patches = patchify3d(images, self.patch_size[0])
         mask_patches = patchify3d(mask, self.patch_size[0])
         coord = self.coord_grid.expand(B, -1, -1)
@@ -348,7 +436,30 @@ class ViTMAE3D(nn.Module):
         )
         vis_coord, target_coord = torch.split(coord, [num_visible, num_predict], dim=1)
         seqs = (vis_patches, vis_mask_patches, vis_coord, target_patches, target_mask_patches, target_coord)
+        if self.level_mirror_stat_names:
+            # the visible patches' mirror references (patch_loss vis_aux)
+            vis_order = order[:, :, :num_visible]
+            aux = [mp[batch_ids, vis_order] for mp in self.mirror_map(images, mask)]
+            seqs += ((aux[0] if len(aux) == 1 else torch.cat(aux, -1)).flatten(0, 1),)
         return seqs, order
+
+    def mirror_map(self, images: Tensor, mask: Tensor) -> list[Tensor]:
+        # mirror references per 2 mm cell as patches [B, N, sub^3]: the max (level_mirror), then the min
+        # (level_mirror_dark) within +-2-4 mm of the x-mirrored cell, from one pass over the 2 mm cells;
+        # 1e4 (max) and -1e4 (min) where that cell is out of the mask or within 4 mm of the midline
+        B, X, Y, Z = images.shape
+        cells = images.float().reshape(B, X // 2, 2, Y // 2, 2, Z // 2, 2)
+        valid = mask.reshape(B, X // 2, 2, Y // 2, 2, Z // 2, 2).amax((2, 4, 6)).flip(1) > 0
+        valid[:, X // 4 - 2 : X // 4 + 2] = False
+        maps = []
+        if self.level_mirror:
+            hmax = F.max_pool3d(cells.amax((2, 4, 6))[:, None], 3, 1, 1)[:, 0]
+            maps.append(patchify3d(torch.where(valid, hmax.flip(1), 1e4), self.patch_size[0] // 2))
+        if self.level_mirror_dark:
+            # min pooling as -max_pool(-x)
+            hmin = -F.max_pool3d(-cells.amin((2, 4, 6))[:, None], 3, 1, 1)[:, 0]
+            maps.append(patchify3d(torch.where(valid, hmin.flip(1), -1e4), self.patch_size[0] // 2))
+        return maps
 
     def sample_patches_contiguous(self, *args):
         # cuda graph inputs: separate dense buffers, uint8 masks stay uint8. the class method, as
@@ -364,59 +475,19 @@ class ViTMAE3D(nn.Module):
         target_patches: Float[Tensor, "B M P"],
         target_mask_patches: Tensor,
         target_coord: Tensor,
+        vis_aux: Tensor | None = None,
         with_outputs: bool = False,
     ):
         # forward's loss from sampled sequences
         vis_mask_patches = vis_mask_patches.to(vis_patches.dtype)
         target_mask_patches = target_mask_patches.to(target_patches.dtype)
         embeds = self.forward_encoder(vis_patches, vis_coord)
-        pred_patches = self.forward_decoder(embeds, target_coord)
-        # graft: the v3 loss stack. norm_target z-scores each target sequence; the
-        # mse and the gradient penalty run on target_ref, the fg mask weights the mse
-        if self.norm_target:
-            mean = target_patches.mean(dim=-1, keepdim=True)
-            var = target_patches.var(dim=-1, keepdim=True)
-            target_ref = (target_patches - mean) / (var + 1e-6) ** 0.5
+        if self.decoder_level_head is not None:
+            feats = self.decode_features(embeds, target_coord)
+            pred_patches = self.decoder_head(feats)
         else:
-            target_ref = target_patches
-        loss = F.mse_loss(pred_patches, target_ref, reduction="none")
-        if self.fg_loss_weight > 0.0:
-            fg_mask = (target_patches.abs() > 0.05).float()
-            fg_weights = 1.0 + self.fg_loss_weight * fg_mask
-            loss = (target_mask_patches * fg_weights * loss).sum() / (target_mask_patches * fg_weights).sum().clamp(min=1.0)
-        else:
-            loss = (target_mask_patches * loss).sum() / target_mask_patches.sum()
-        if self.grad_loss_weight > 0.0:
-            p = self.patch_size[0]
-            BM = pred_patches.shape[0] * pred_patches.shape[1]
-            pred_vol = pred_patches.reshape(BM, p, p, p)
-            tgt_vol = target_ref.reshape(BM, p, p, p)
-            mask_vol = target_mask_patches.reshape(BM, p, p, p)
-            dx_loss = F.mse_loss(
-                pred_vol[:, 1:, :, :] - pred_vol[:, :-1, :, :],
-                tgt_vol[:, 1:, :, :] - tgt_vol[:, :-1, :, :],
-                reduction="none",
-            )
-            dy_loss = F.mse_loss(
-                pred_vol[:, :, 1:, :] - pred_vol[:, :, :-1, :],
-                tgt_vol[:, :, 1:, :] - tgt_vol[:, :, :-1, :],
-                reduction="none",
-            )
-            dz_loss = F.mse_loss(
-                pred_vol[:, :, :, 1:] - pred_vol[:, :, :, :-1],
-                tgt_vol[:, :, :, 1:] - tgt_vol[:, :, :, :-1],
-                reduction="none",
-            )
-            mx = mask_vol[:, 1:, :, :] * mask_vol[:, :-1, :, :]
-            my = mask_vol[:, :, 1:, :] * mask_vol[:, :, :-1, :]
-            mz = mask_vol[:, :, :, 1:] * mask_vol[:, :, :, :-1]
-            grad_loss = (
-                (mx * dx_loss).sum() / mx.sum().clamp(min=1.0)
-                + (my * dy_loss).sum() / my.sum().clamp(min=1.0)
-                + (mz * dz_loss).sum() / mz.sum().clamp(min=1.0)
-            ) / 3.0
-            loss = loss + self.grad_loss_weight * grad_loss
-
+            pred_patches = self.forward_decoder(embeds, target_coord)
+        loss = F.mse_loss(pred_patches, target_patches, reduction="none")
         if self.hard_gamma:
             vox = target_mask_patches.sum(-1)
             tok = (target_mask_patches * loss).sum(-1) / vox.clamp_min(1)
@@ -433,9 +504,22 @@ class ViTMAE3D(nn.Module):
             self_loss = (vis_mask_patches * self_loss).sum() / vis_mask_patches.sum()
             loss = loss + self.self_recon_weight * self_loss
         if self.level_head is not None:
-            loss = loss + self.level_weight * self.level_loss(
-                embeds[:, self.class_tokens :], vis_patches, vis_mask_patches
-            )
+            resid = None
+            if self.level_resid:
+                resid = cross_residual(vis_patches, vis_coord, target_coord, pred_patches)
+            level = self.level_loss(embeds[:, self.class_tokens :], vis_patches, vis_mask_patches, resid, vis_aux)
+            if vis_aux is not None:
+                level, mirror_stats = level
+            loss = loss + self.level_weight * level
+        if self.decoder_level_head is not None:
+            target, weight = self.level_targets(target_patches, target_mask_patches)
+            logits = self.decoder_level_head(feats).float().reshape(target.shape)
+            bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+            dec_loss = (weight * bce).sum() / (weight.sum() * target.shape[1]).clamp_min(1e-6)
+            loss = loss + self.decoder_level_weight * dec_loss
+        if vis_aux is not None:
+            # the mirror stats last, for the train log
+            return (loss, embeds, pred_patches, mirror_stats) if with_outputs else (loss, mirror_stats)
         if with_outputs:
             return loss, embeds, pred_patches
         return loss
@@ -452,9 +536,22 @@ class ViTMAE3D(nn.Module):
         target = F.adaptive_avg_pool3d(above, sub) / weight.clamp_min(1e-6)
         logits = self.level_head(tokens).float().reshape(target.shape)
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        if self.level_balance:
+            # per-threshold sums, balanced once all spacing groups are summed
+            sums = torch.stack([(weight * bce).sum((0, 2, 3, 4)), (weight * target).sum((0, 2, 3, 4))])
+            return sums, weight.sum()
         return (weight * bce).sum(), weight.sum() * target.shape[1]
 
-    def level_loss(self, tokens: Tensor, patches: Tensor, mask: Tensor) -> Tensor:
+    def level_targets(self, patches: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        # level_loss's targets and sub-block weights (decoder_level_head: on the predicted patches)
+        p, q = self.patch_size[0], self.level_pool
+        x = patches.float().reshape(-1, 1, p, p, p)
+        m = mask.float().reshape(-1, 1, p, p, p)
+        above = (x > self.level_thresholds.view(1, -1, 1, 1, 1)).float() * m
+        weight = F.avg_pool3d(m, q)
+        return F.avg_pool3d(above, q) / weight.clamp_min(1e-6), weight
+
+    def level_loss(self, tokens: Tensor, patches: Tensor, mask: Tensor, resid=None, aux=None):
         # level head BCE, sub-blocks weighted by their in-mask fraction
         p, q = self.patch_size[0], self.level_pool
         x = patches.float().reshape(-1, 1, p, p, p)
@@ -462,9 +559,95 @@ class ViTMAE3D(nn.Module):
         above = (x > self.level_thresholds.view(1, -1, 1, 1, 1)).float() * m
         weight = F.avg_pool3d(m, q)
         target = F.avg_pool3d(above, q) / weight.clamp_min(1e-6)
-        logits = self.level_head(tokens).float().reshape(target.shape)
-        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-        return (weight * bce).sum() / (weight.sum() * target.shape[1]).clamp_min(1e-6)
+        T = target.shape[1]
+        logits = self.level_head(tokens).float().reshape(len(x), -1, *target.shape[2:])
+        bce = F.binary_cross_entropy_with_logits(logits[:, :T], target, reduction="none")
+        if self.level_balance:
+            sums = torch.stack([(weight * bce).sum((0, 2, 3, 4)), (weight * target).sum((0, 2, 3, 4))])
+            loss = balanced_level_loss(sums, weight.sum())
+        else:
+            loss = (weight * bce).sum() / (weight.sum() * T).clamp_min(1e-6)
+        if self.level_grad:
+            # gradient magnitude inside the patch: per axis the mean squared difference over the valid
+            # (in-brain, in-patch) neighbour pairs, one-sided at faces
+            g2 = x.new_zeros(x.shape)
+            for axis in (2, 3, 4):
+                both = m.narrow(axis, 1, p - 1) * m.narrow(axis, 0, p - 1)
+                d2 = torch.diff(x, dim=axis).square() * both
+                fwd, bwd = [0, 0] * (4 - axis) + [0, 1], [0, 0] * (4 - axis) + [1, 0]
+                cnt = F.pad(both, fwd) + F.pad(both, bwd)
+                g2 = g2 + (F.pad(d2, fwd) + F.pad(d2, bwd)) / cnt.clamp_min(1)
+            g_above = (g2.sqrt() > self.level_grad_thresholds.view(1, -1, 1, 1, 1)).float() * m
+            g_target = F.avg_pool3d(g_above, q) / weight.clamp_min(1e-6)
+            G0 = T + len(self.level_resid)
+            g_bce = F.binary_cross_entropy_with_logits(
+                logits[:, G0 : G0 + len(self.level_grad)], g_target, reduction="none"
+            )
+            loss = loss + (weight * g_bce).sum() / (weight.sum() * T).clamp_min(1e-6)
+        if resid is not None:
+            # residual channels at the same per-channel weight, on the tokens the other sequence predicts
+            r, hit = resid
+            r_above = (r.reshape(-1, 1, p, p, p) > self.level_resid_thresholds.view(1, -1, 1, 1, 1)).float() * m
+            r_target = F.avg_pool3d(r_above, q) / weight.clamp_min(1e-6)
+            r_weight = weight * hit.reshape(-1, 1, 1, 1, 1)
+            r_bce = F.binary_cross_entropy_with_logits(
+                logits[:, T : T + len(self.level_resid)], r_target, reduction="none"
+            )
+            loss = loss + (r_weight * r_bce).sum() / (r_weight.sum() * T).clamp_min(1e-6)
+        if aux is not None:
+            # mirror channels (after resid, grad) at the same per-channel weight, on sub-blocks with a valid
+            # mirror cell; aux holds the bright then the dark reference (mirror_map)
+            maps = bool(self.level_mirror) + bool(self.level_mirror_dark)
+            ref = aux.float().reshape(-1, maps, *weight.shape[2:])
+            M0 = T + len(self.level_resid) + len(self.level_grad)
+            stats = []
+        if aux is not None and self.level_mirror:
+            mh = ref[:, :1]
+            thr = torch.maximum(self.level_mirror_thresholds.view(1, -1, 1, 1, 1), mh + self.level_mirror_margin)
+            thr = thr.repeat_interleave(q, 2).repeat_interleave(q, 3).repeat_interleave(q, 4)
+            m_target = F.avg_pool3d((x > thr).float() * m, q) / weight.clamp_min(1e-6)
+            m_weight = weight * (mh < 1e3).float()
+            M = len(self.level_mirror)
+            m_bce = F.binary_cross_entropy_with_logits(logits[:, M0 : M0 + M], m_target, reduction="none")
+            loss = loss + (m_weight * m_bce).sum() / (m_weight.sum() * T).clamp_min(1e-6)
+            # per-channel mean bce, valid share of the level weight, positive rate per channel
+            den = m_weight.sum().clamp_min(1e-6)
+            stats += [
+                ((m_weight * m_bce).sum() / (den * M)).view(1),
+                (den / weight.sum().clamp_min(1e-6)).view(1),
+                (m_weight * m_target).sum((0, 2, 3, 4)) / den,
+            ]
+            M0 += M
+        if aux is not None and self.level_mirror_dark:
+            # dark: below each threshold and below the mirror min - margin
+            ml = ref[:, -1:]
+            dark = self.level_mirror_dark_thresholds.view(1, -1, 1, 1, 1)
+            thr = torch.minimum(dark, ml - self.level_mirror_margin)
+            thr = thr.repeat_interleave(q, 2).repeat_interleave(q, 3).repeat_interleave(q, 4)
+            d_target = F.avg_pool3d((x < thr).float() * m, q) / weight.clamp_min(1e-6)
+            d_weight = weight * (ml > -1e3).float()
+            D = len(self.level_mirror_dark)
+            d_bce = F.binary_cross_entropy_with_logits(logits[:, M0 : M0 + D], d_target, reduction="none")
+            loss = loss + (d_weight * d_bce).sum() / (d_weight.sum() * T).clamp_min(1e-6)
+            den = d_weight.sum().clamp_min(1e-6)
+            stats += [] if self.level_mirror else [(den / weight.sum().clamp_min(1e-6)).view(1)]
+            stats += [
+                ((d_weight * d_bce).sum() / (den * D)).view(1),
+                (d_weight * d_target).sum((0, 2, 3, 4)) / den,
+            ]
+        if aux is not None:
+            stats = torch.cat(stats).detach()
+        if self.level_head2 is not None:
+            q2 = self.level_pool2
+            weight2 = F.avg_pool3d(m, q2)
+            target2 = F.avg_pool3d(above, q2) / weight2.clamp_min(1e-6)
+            logits2 = self.level_head2(tokens).float().reshape(target2.shape)
+            bce2 = F.binary_cross_entropy_with_logits(logits2, target2, reduction="none")
+            loss2 = (weight2 * bce2).sum() / (weight2.sum() * T).clamp_min(1e-6)
+            loss = (loss + loss2) / 2
+        if aux is not None:
+            return loss, stats
+        return loss
 
     def forward_native(
         self,
@@ -562,48 +745,19 @@ class ViTMAE3D(nn.Module):
         embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
         feats = self.decode_features(embeds, cat("target_coord"))
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
-        # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
-        # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
-        # weights the mse per voxel, and the xyz gradient penalty runs per group on its own
-        # patch geometry; the global loss is the weight-masked mean across groups
-        losses, wts = [], []
-        grad_num, grad_den = [], []
+        preds, targets, weights = [], [], []
         for part, feat in zip(parts, feats):
             sp = part["spacing"]
             pred = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
             part["pred_patches"] = pred
-            px, py, pz = part["patch"]
-            tgt = part["target_patches"]
-            if self.norm_target:
-                tgt = (tgt - tgt.mean(dim=-1, keepdim=True)) / (tgt.var(dim=-1, keepdim=True) + 1e-6) ** 0.5
-            mse = F.mse_loss(pred, tgt, reduction="none")
-            mask = part["target_mask_patches"]
-            w = mask / pred.shape[-1]
-            if self.fg_loss_weight > 0.0:
-                fg_w = 1.0 + self.fg_loss_weight * (part["target_patches"].abs() > 0.05).to(w.dtype)
-                w = w * fg_w
-            losses.append((w * mse).flatten())
-            wts.append(w.flatten())
-            if self.grad_loss_weight > 0.0:
-                BM = pred.shape[0] * pred.shape[1]
-                pv = pred.reshape(BM, px, py, pz)
-                tv = tgt.reshape(BM, px, py, pz)
-                mv = mask.reshape(BM, px, py, pz).to(w.dtype)
-                dx = F.mse_loss(pv[:, 1:], tv[:, 1:] - tv[:, :-1], reduction="none")
-                dy = F.mse_loss(pv[:, :, 1:], tv[:, :, 1:] - tv[:, :, :-1], reduction="none")
-                dz = F.mse_loss(pv[:, :, :, 1:], tv[:, :, :, 1:] - tv[:, :, :, :-1], reduction="none")
-                mx = mv[:, 1:] * mv[:, :-1]
-                my = mv[:, :, 1:] * mv[:, :, :-1]
-                mz = mv[:, :, :, 1:] * mv[:, :, :, :-1]
-                grad_num += [(mx * dx).sum(), (my * dy).sum(), (mz * dz).sum()]
-                grad_den += [mx.sum(), my.sum(), mz.sum()]
-        loss = flat_cat(losses).sum() / flat_cat(wts).sum()
-        if self.grad_loss_weight > 0.0:
-            loss = loss + self.grad_loss_weight * (
-                grad_num[0] / grad_den[0].clamp_min(1.0)
-                + grad_num[1] / grad_den[1].clamp_min(1.0)
-                + grad_num[2] / grad_den[2].clamp_min(1.0)
-            ) / 3.0
+            preds.append(pred)
+            targets.append(part["target_patches"])
+            # mean over each token's voxels
+            weights.append(part["target_mask_patches"] / pred.shape[-1])
+        # all groups' voxels in one loss
+        weights = flat_cat(weights)
+        loss = F.mse_loss(flat_cat(preds), flat_cat(targets), reduction="none")
+        loss = (weights * loss).sum() / weights.sum()
         # an all 1 mm batch leaves the residuals without a gradient, and ddp needs one every step
         residuals = (self.patch_embed.residual, self.decoder_head.residual)
         residuals += (self.decoder_head.bias_residual,)
@@ -617,7 +771,10 @@ class ViTMAE3D(nn.Module):
                     part["patch"],
                 )
                 num, den = num + n, den + d
-            loss = loss + self.level_weight * num / den.clamp_min(1e-6)
+            if self.level_balance:
+                loss = loss + self.level_weight * balanced_level_loss(num, den)
+            else:
+                loss = loss + self.level_weight * num / den.clamp_min(1e-6)
 
         if not with_state:
             return loss
@@ -706,6 +863,69 @@ def vit_mae_3d(checkpoint: str, random_weights: bool = False) -> ViTMAE3D:
     if not random_weights:
         model.load_state_dict(ckpt["model"])
     return model
+
+
+def balanced_level_loss(sums: Tensor, total: Tensor) -> Tensor:
+    # sums [2, T] (weighted BCE, weighted target): per-threshold mean BCE over its base-rate entropy,
+    # rescaled by the mean entropy
+    total = total.clamp_min(1e-6)
+    per_level, rate = sums[0] / total, (sums[1] / total).clamp(5e-3, 1 - 5e-3)
+    entropy = -(rate * rate.log() + (1 - rate) * torch.log1p(-rate))
+    return (per_level / entropy).mean() * entropy.mean()
+
+
+def cross_residual(
+    vis_patches: Tensor, vis_coord: Tensor, target_coord: Tensor, pred_patches: Tensor
+) -> tuple[Tensor, Tensor]:
+    # each visible patch minus the detached decoder prediction of it by the image's other sequence
+    # (rows 2i, 2i + 1), and whether that sequence predicts it
+    B, N, P = vis_patches.shape
+    other = torch.arange(B, device=vis_patches.device).view(-1, 2).flip(1).reshape(-1)
+    same = (vis_coord[:, :, None] == target_coord[other][:, None]).all(-1)  # [B, N, M]
+    idx = same.int().argmax(-1, keepdim=True).expand(-1, -1, P)
+    pred = torch.gather(pred_patches.detach()[other].float(), 1, idx)
+    return vis_patches.float() - pred, same.any(-1)
+
+
+def insert_blobs(
+    images: Tensor,
+    mask: Tensor,
+    patch: int,
+    prob: float,
+    num: int,
+    radius: tuple[float, float],
+    contrast: tuple[float, float],
+    edge: float,
+    box: int = 40,
+) -> Tensor:
+    # in place, fixed shapes, no host sync: per image (share prob) 1 to num slots on, each a soft edged
+    # ellipsoid with a perturbed boundary in a box^3 voxel box, centred in a patch >= 90% in the mask
+    B, X, Y, Z = images.shape
+    dev = images.device
+    gy, gz = Y // patch, Z // patch
+    ok = mask.view(B, X // patch, patch, gy, patch, gz, patch).float().mean((2, 4, 6)).view(B, 1, -1) >= 0.9
+    # uniform over the qualifying patches (any patch when none qualify)
+    idx = (torch.rand(B, num, ok.shape[2], device=dev) + ok.float()).argmax(-1)
+    cell = torch.stack([idx // (gy * gz), idx // gz % gy, idx % gz], -1)
+    centre = (cell * patch).float() + torch.rand(B, num, 3, device=dev) * patch
+    # box clamped into the grid, distances from the true centre
+    lo = (centre.long() - box // 2).clamp_min(0)
+    lo = torch.minimum(lo, torch.tensor([X - box, Y - box, Z - box], device=dev))
+    r = torch.exp(torch.rand(B, num, 1, device=dev) * math.log(radius[1] / radius[0]) + math.log(radius[0]))
+    axes = r * torch.exp(torch.rand(B, num, 3, device=dev) * 0.4 - 0.2)
+    knots = 0.1 * torch.randn(B * num, 1, 4, 4, 4, device=dev)
+    pert = F.interpolate(knots, size=(box,) * 3, mode="trilinear", align_corners=True).view(B, num, -1)
+    ax = torch.arange(box, device=dev)
+    pos = lo[:, :, None] + torch.stack(torch.meshgrid(ax, ax, ax, indexing="ij"), -1).view(1, 1, -1, 3)
+    d = ((pos - centre[:, :, None]) / axes[:, :, None]).norm(dim=-1) * (1 + pert)
+    on = (torch.rand(B, 1, device=dev) < prob) & (
+        torch.arange(num, device=dev) < torch.randint(1, num + 1, (B, 1), device=dev)
+    )
+    amp = (torch.rand(B, num, 1, device=dev) * (contrast[1] - contrast[0]) + contrast[0]) * on[..., None]
+    flat = (pos[..., 0] * Y + pos[..., 1]) * Z + pos[..., 2]
+    flat = (flat + torch.arange(B, device=dev).view(-1, 1, 1) * (X * Y * Z)).view(-1)
+    val = (amp * torch.sigmoid((1 - d) * r / edge)).view(-1) * mask.view(-1)[flat].to(images.dtype)
+    return images.view(-1).index_add_(0, flat, val).view(B, X, Y, Z)
 
 
 def patchify3d(x: Tensor, patch_size: int | tuple[int, int, int] = 8) -> Tensor:
