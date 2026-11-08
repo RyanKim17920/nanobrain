@@ -48,6 +48,12 @@ time_limit: 60
 total_steps: 22500
 warmup_steps: 6750
 decay_steps: 0
+# Wall-clock schedule: warmup by steps, constant, then linear decay to min_lr over the last
+# time_decay_frac of the time budget (measured from the end of step 1, minus time_margin seconds).
+# Replaces the step schedule when on; total_steps then only caps training.
+time_schedule: false
+time_decay_frac: 0.2
+time_margin: 30
 weight_decay: 0.05
 betas: [0.9, 0.95]
 clip_grad: 1.0

@@ -258,6 +258,8 @@ def train(
     time_limit = args.time_limit * 60 if args.time_limit else float("inf")
     step = start_step
     done = False
+    # wall time at the end of the first step of this process (excludes compile), for time_schedule
+    t_step1 = None
 
     optimizer.zero_grad()
 
@@ -271,7 +273,14 @@ def train(
     for batch_idx, batch in enumerate(batches, start=start_batch):
         need_update = (batch_idx + 1) % args.accum_iter == 0
         log_step = (batch_idx + 1) % print_freq_batches == 0
-        lr = float(lr_schedule[step])
+        if args.time_schedule:
+            elapsed = (prev_wall_time + time.monotonic() - start_time) - t_step1 if t_step1 else 0.0
+            budget = time_limit - (t_step1 or 0.0) - args.time_margin
+            lr = time_lr(
+                step, args.lr, args.min_lr, args.warmup_steps, elapsed, budget, args.time_decay_frac
+            )
+        else:
+            lr = float(lr_schedule[step])
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
 
@@ -330,6 +339,8 @@ def train(
             continue
         step += 1
         wall_time = prev_wall_time + time.monotonic() - start_time
+        if t_step1 is None:
+            t_step1 = wall_time
         done = step == total_steps or wall_time >= time_limit
         is_last = done or stop_event.is_set()
 
@@ -373,6 +384,26 @@ def make_lr_schedule(
     stable = np.full(total_steps - warmup_steps - decay_steps, lr)
     decay = np.linspace(lr, min_lr, decay_steps)
     return np.concatenate([warmup, stable, decay])
+
+
+def time_lr(
+    step: int,
+    lr: float,
+    min_lr: float,
+    warmup_steps: int,
+    elapsed: float,
+    budget: float,
+    decay_frac: float,
+) -> float:
+    """Wall-clock schedule: step-based linear warmup, constant peak, then linear decay to min_lr
+    over the last decay_frac of the time budget (elapsed/budget in seconds, from end of step 1)."""
+    if step < warmup_steps:
+        return lr * step / warmup_steps
+    progress = min(max(elapsed / max(budget, 1e-9), 0.0), 1.0)
+    start = 1.0 - decay_frac
+    if progress <= start or decay_frac <= 0:
+        return lr
+    return lr + (min_lr - lr) * (progress - start) / decay_frac
 
 
 def make_batch_transform(args: DictConfig):
