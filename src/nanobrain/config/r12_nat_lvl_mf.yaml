@@ -31,6 +31,13 @@ model_kwargs:
   drop_path_rate: 0.0
   min_mask_frac: 0.05
   level_weight: 0.5
+# self-supervised objective: mae (default, ViTMAE3D.forward) | dino3d | ijepa | lejepa | data2vec2
+# (objectives.py; hyperparameters in objectives.DEFAULTS, overridden by ssl.<key>). aux_mae_weight > 0
+# adds the MAE pixel loss on extra target tokens of the objective's views (hybrid)
+objective: mae
+aux_mae_weight: 0.0
+cross_sequence_views: false
+ssl: {}
 batch_size: 32
 accum_iter: 1
 base_lr: 0.002

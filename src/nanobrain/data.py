@@ -1,5 +1,6 @@
 import io
 import math
+import random
 from pathlib import Path
 
 import nibabel as nib
@@ -12,10 +13,35 @@ from torch import Tensor
 from torch.utils.data import Dataset, Sampler
 
 
+def session_key(path: str) -> str:
+    # derivatives/<site>[/<ds>]/sub-X/ses-Y/<modality>/<file>: the session dir
+    return path.rsplit("/", 2)[0]
+
+
+def contrast_name(path: str) -> str:
+    # last "_" token of the file stem: T1w, T2w, FLAIR, bval1000, ... (run-1 / run-2 share it)
+    return path.rsplit("/", 1)[-1].rsplit(".", 1)[0].rsplit("_", 1)[-1]
+
+
 class Fomo300kDataset(Dataset):
-    def __init__(self, root: str | Path, filelist: str | Path):
+    def __init__(self, root: str | Path, filelist: str | Path, partner: str | None = None):
+        # partner (xcon): also load a random OTHER image of the same session as partner_* keys.
+        # "diff": prefer a different contrast name, else any other file; "any": any other file
         self.root = Path(root)
         self.paths = Path(filelist).read_text().split()
+        assert partner in (None, "diff", "any"), f"unknown partner policy {partner}"
+        self.partner = partner
+        if partner:
+            sessions: dict[str, list[int]] = {}
+            for ii, path in enumerate(self.paths):
+                sessions.setdefault(session_key(path), []).append(ii)
+            self.partner_ids = []
+            for ii, path in enumerate(self.paths):
+                others = [jj for jj in sessions[session_key(path)] if jj != ii]
+                if partner == "diff":
+                    diff = [jj for jj in others if contrast_name(self.paths[jj]) != contrast_name(path)]
+                    others = diff or others
+                self.partner_ids.append(others)
         members = pd.read_parquet(
             self.root / "tables" / "shards.parquet", columns=["path", "shard", "offset", "size"]
         )
@@ -28,6 +54,14 @@ class Fomo300kDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, index: int) -> dict:
+        sample = self.load(index)
+        if self.partner and self.partner_ids[index]:
+            # python random is seeded per loader worker by torch
+            other = self.load(random.choice(self.partner_ids[index]))
+            sample.update({f"partner_{k}": v for k, v in other.items()})
+        return sample
+
+    def load(self, index: int) -> dict:
         # npz members are stored uncompressed, so read them straight from their offset
         with open(self.root / self.shards[index], "rb") as shard:
             shard.seek(self.offsets[index])
@@ -221,3 +255,37 @@ def normalize_values(
     values = values.clamp(low, high)
     values = (values - values.mean()) / values.std(correction=0).clamp_min(1e-6)
     return values
+
+
+def resample_onto(
+    image: Float[Tensor, "X Y Z"],
+    mask: Bool[Tensor, "X Y Z"],
+    affine: np.ndarray,
+    dst_affine: np.ndarray,
+    dst_shape: tuple[int, int, int],
+) -> tuple[Float[Tensor, "X Y Z"], Bool[Tensor, "X Y Z"]]:
+    # image / mask (voxel -> world: affine) trilinearly onto the dst voxel grid by world coordinates.
+    # voxel indices are voxel centres, so align_corners=True; outside the source grid is zero / off.
+    # the mask is resampled as float and thresholded at 0.5; the image (zero off its mask) is divided
+    # by the resampled mask (normalized convolution, no dark rim at the mask edge)
+    vox = np.linalg.inv(affine) @ dst_affine  # dst voxel index -> src voxel index
+    src_shape = np.array(image.shape, dtype=np.float64)
+    dst = np.array(dst_shape, dtype=np.float64)
+    # normalized [-1, 1] (align_corners) per axis: u = 2 i / (n - 1) - 1
+    to_idx = np.eye(4)
+    to_idx[:3, :3] = np.diag((np.maximum(dst, 2) - 1) / 2)
+    to_idx[:3, 3] = (np.maximum(dst, 2) - 1) / 2
+    to_norm = np.eye(4)
+    to_norm[:3, :3] = np.diag(2 / (np.maximum(src_shape, 2) - 1))
+    to_norm[:3, 3] = -1
+    theta = to_norm @ vox @ to_idx
+    # affine_grid / grid_sample order the coordinates (x, y, z) = (W, H, D), i.e. reversed axes
+    perm = np.eye(4)[[2, 1, 0, 3]]
+    theta = (perm @ theta @ perm)[:3]
+    theta = torch.tensor(theta, dtype=torch.float32, device=image.device)[None]
+    size = (1, 1) + tuple(int(s) for s in dst_shape)
+    grid = F.affine_grid(theta, size, align_corners=True)
+    vols = torch.stack([image.float(), mask.float()])[None]
+    out = F.grid_sample(vols, grid, mode="bilinear", padding_mode="zeros", align_corners=True)[0]
+    new_mask = out[1] > 0.5
+    return torch.where(new_mask, out[0] / out[1].clamp_min(1e-6), 0.0), new_mask

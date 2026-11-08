@@ -4,6 +4,7 @@ import functools
 import gc
 import json
 import logging
+import math
 import os
 import signal
 import threading
@@ -34,9 +35,11 @@ from nanobrain.data import (
     native_spacing,
     normalize_values,
     reorient_to_ras,
+    resample_onto,
     resample_to_spacing,
 )
 from nanobrain.model import ViTMAE3D, patches_to_volume
+from nanobrain.objectives import OBJECTIVES, TrainParams, build_objective, feature_stats
 from nanobrain.optim import CombinedOptimizer, Muon, is_muon_param
 from nanobrain.visualization import plot_mask_pred
 
@@ -128,6 +131,16 @@ def main(args: DictConfig):
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"num params: {num_params / 1e6:.1f}M")
 
+    # self-supervised objective (objectives.py). mae = ViTMAE3D.forward, the original path
+    objective_name = args.get("objective") or "mae"
+    assert objective_name in OBJECTIVES, f"unknown objective {objective_name}"
+    objective = None
+    if objective_name != "mae":
+        assert args.native and not args.distributed, "objectives: native single gpu only"
+        objective = build_objective(args, model).to(device)
+        logger.info(f"objective {objective_name}: {objective.cfg}, aux_mae_weight {objective.aux_mae_weight}")
+        logger.info(f"objective params: {sum(p.numel() for p in objective.parameters()) / 1e6:.1f}M")
+
     batch_flops = count_batch_flops(args, model, device)
     logger.info(f"flops per batch per gpu (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
 
@@ -137,7 +150,12 @@ def main(args: DictConfig):
 
     if args.compile and args.native:
         # the image shapes vary, so only the fixed-shape transformer parts compile
-        model_without_ddp.compile_native()
+        if objective is None:
+            model_without_ddp.compile_native()
+        else:
+            # objective views come in several fixed lengths: static shapes, one graph each
+            model_without_ddp.compile_native(dynamic=False)
+            objective.compile(dynamic=False)
     elif args.compile and args.cudagraphs:
         assert not args.distributed, "cudagraphs is single gpu only"
         model_without_ddp.compile_cudagraphs()
@@ -160,9 +178,18 @@ def main(args: DictConfig):
     else:
         logger.info(f"lr: {args.lr:.2e}")
 
-    optimizer = make_optimizer(args, model_without_ddp)
+    optimizer = make_optimizer(
+        args, model_without_ddp if objective is None else TrainParams(model_without_ddp, objective)
+    )
 
-    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
+    # cross_sequence_views: each image also loads another sequence of the same session (resampled
+    # onto its voxel grid) as a second positive view (objectives with global views)
+    partner = "diff" if args.get("cross_sequence_views") else None
+    assert not partner or (objective is not None and args.native), "cross_sequence_views: objectives only"
+    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist, partner=partner)
+    if partner:
+        frac = sum(bool(ids) for ids in dataset.partner_ids) / len(dataset)
+        logger.info(f"cross_sequence_views: {frac:.1%} of images have a same-session partner")
     logger.info(f"train dataset: {len(dataset)} images")
 
     if args.epochs:
@@ -201,7 +228,9 @@ def main(args: DictConfig):
         loss_scaler = None
 
     # load checkpoint/resume training
-    start_step, prev_wall_time = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
+    start_step, prev_wall_time = misc.load_model(
+        args, model_without_ddp, optimizer, loss_scaler, objective=objective
+    )
 
     # data loader. one endless pass over shuffled epochs, resumed at the next unseen image
     late_indices = switch_at = None
@@ -243,7 +272,7 @@ def main(args: DictConfig):
             args.grid_size, args.target_spacing, tuple(args.clip_quantiles), lean=args.prep_lean
         )
     else:
-        batch_transform = make_batch_transform(args)
+        batch_transform = make_batch_transform(args, partner=bool(partner))
     if args.prep_threads:
         train_loader = misc.prep_thread(train_loader, batch_transform, device, args.prep_threads)
         batch_transform = None
@@ -267,6 +296,7 @@ def main(args: DictConfig):
         device,
         batch_flops,
         stop_event,
+        objective,
     )
 
     if args.distributed:
@@ -322,6 +352,7 @@ def train(
     device: torch.device,
     batch_flops: float,
     stop_event: threading.Event,
+    objective: nn.Module | None = None,
 ) -> dict:
     model.train()
 
@@ -413,16 +444,40 @@ def train(
 
         if args.cudagraphs:
             torch.compiler.cudagraph_mark_step_begin()
+        obj_logs = None
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            loss = model(
-                images,
-                masks,
-                num_visible=args.num_visible,
-                num_predict=args.num_predict,
-                num_samples=args.num_samples,
-                with_state=False,
-                spacing=batch.get("spacing"),
-            )
+            if objective is not None:
+                objective.progress = schedule_progress(
+                    prev_wall_time + time.monotonic() - start_time, time_limit, train_t0, step,
+                    total_steps, time_schedule,
+                )
+                partners = (batch["partner"], batch["partner_mask"]) if "partner" in batch else None
+                loss = objective(
+                    model_without_ddp, images, masks, batch["spacing"], partners, log=log_step
+                )
+                obj_logs = objective.logs
+            elif log_step and args.native:
+                # same loss (forward_native with state), plus the collapse / rank proxy
+                loss, state = model(
+                    images,
+                    masks,
+                    num_visible=args.num_visible,
+                    num_predict=args.num_predict,
+                    num_samples=args.num_samples,
+                    with_state=True,
+                    spacing=batch.get("spacing"),
+                )
+                obj_logs = feature_stats(state["embeds"][0::args.num_samples].float().mean(dim=1))
+            else:
+                loss = model(
+                    images,
+                    masks,
+                    num_visible=args.num_visible,
+                    num_predict=args.num_predict,
+                    num_samples=args.num_samples,
+                    with_state=False,
+                    spacing=batch.get("spacing"),
+                )
 
         # the cuda graph's output buffer is overwritten by the next replay
         loss_for_log = loss.detach().clone() if args.cudagraphs else loss.detach()
@@ -435,6 +490,9 @@ def train(
             need_update=need_update,
             max_norm=args.clip_grad,
         )
+
+        if need_update and objective is not None:
+            objective.ema_update(model_without_ddp)
 
         # log tensors without syncing, values are only read on log steps
         metric_logger.update(loss=loss_for_log)
@@ -453,6 +511,9 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
+            if obj_logs:
+                log_stats.update({k: round(float(v), 5) for k, v in obj_logs.items()})
+                logger.info("ssl: " + "  ".join(f"{k} {v}" for k, v in log_stats.items() if k in obj_logs))
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)
@@ -495,7 +556,9 @@ def train(
 
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
         if is_save_step or is_last:
-            misc.save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time)
+            misc.save_model(
+                args, step, model_without_ddp, optimizer, loss_scaler, wall_time, objective=objective
+            )
 
         if is_last:
             break
@@ -507,6 +570,19 @@ def train(
         "wall_time": prev_wall_time + time.monotonic() - start_time,
         "loss": metric_logger.loss.median,
     }
+
+
+def schedule_progress(
+    wall_time: float, time_limit: float, train_t0: float | None, step: int, total_steps: int,
+    time_schedule: bool,
+) -> float:
+    # training progress in [0, 1] for the objectives' schedules (EMA momentum, teacher temperature,
+    # Gram phase): wall-clock keyed like the lr under time_schedule, else by step
+    if time_schedule or total_steps >= 10**9:
+        if train_t0 is None or not math.isfinite(time_limit):
+            return 0.0
+        return min(max((wall_time - train_t0) / max(time_limit - train_t0, 1.0), 0.0), 1.0)
+    return min(step / max(total_steps, 1), 1.0)
 
 
 def make_optimizer(args: DictConfig, model: nn.Module):
@@ -522,7 +598,8 @@ def make_optimizer(args: DictConfig, model: nn.Module):
     muon_names = [
         n
         for n, p in model.named_parameters()
-        if is_muon_param(n, p, args.muon_encoder_only, args.muon_decoder_only, args.muon_all_matrices)
+        if p.requires_grad
+        and is_muon_param(n, p, args.muon_encoder_only, args.muon_decoder_only, args.muon_all_matrices)
     ]
     logger.info(f"muon params: {len(muon_names)} matrices")
     adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names))
@@ -575,7 +652,7 @@ def make_lr_schedule(
     return np.concatenate([warmup, stable, decay])
 
 
-def make_batch_transform(args: DictConfig):
+def make_batch_transform(args: DictConfig, partner: bool = False):
     def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         batch = [
             sample_transform(
@@ -584,12 +661,14 @@ def make_batch_transform(args: DictConfig):
                 grid_size=tuple(args.grid_size),
                 clip_quantiles=tuple(args.clip_quantiles),
                 native=args.native,
+                partner=partner,
             )
             for sample in batch
         ]
         if args.native:
-            # each image on its own voxel grid
-            return {key: [sample[key] for sample in batch] for key in ("image", "mask", "spacing")}
+            # each image on its own voxel grid (partner: the partner image / mask on that grid too)
+            keys = ("image", "mask", "spacing") + (("partner", "partner_mask") if partner else ())
+            return {key: [sample[key] for sample in batch] for key in keys}
         images = torch.stack([sample["image"] for sample in batch])
         masks = torch.stack([sample["mask"] for sample in batch])
         return {"image": images, "mask": masks}
@@ -604,6 +683,7 @@ def sample_transform(
     grid_size: tuple[int, int, int] = (192, 240, 192),
     clip_quantiles: tuple[float, float] = (0.005, 0.995),
     native: bool = False,
+    partner: bool = False,
 ) -> dict[str, Tensor]:
     # pretraining preprocessing, on gpu. eval preprocessing is ViTMAE3D.transform_cuda, keep in sync
     # (native training still evaluates on 1 mm inputs)
@@ -615,7 +695,23 @@ def sample_transform(
     if native:
         # no resampling. forward_native fits the grid_size mm box in the image's own voxels
         spacing = native_spacing(affine, target_spacing)
-        return {"image": image, "mask": mask, "affine": affine, "spacing": spacing}
+        out = {"image": image, "mask": mask, "affine": affine, "spacing": spacing}
+        if partner:
+            # the session partner (obj-xcon's loader), normalized the same way and resampled onto
+            # this voxel grid by world coordinates; no partner: the image itself
+            if "partner_values" in sample:
+                p_values = normalize_values(
+                    sample["partner_values"].float() * sample["partner_scale"], clip_quantiles
+                )
+                p_mask = brle_to_dense(sample["partner_mask_rle"], shape=sample["partner_shape"])
+                p_image = p_values.new_zeros(p_mask.shape).masked_scatter_(p_mask, p_values)
+                p_image, p_mask, p_affine = reorient_to_ras(p_image, p_mask, sample["partner_affine"])
+                out["partner"], out["partner_mask"] = resample_onto(
+                    p_image, p_mask, p_affine, affine, tuple(image.shape)
+                )
+            else:
+                out["partner"], out["partner_mask"] = image, mask
+        return out
     image, mask, affine = resample_to_spacing(image, mask, affine, target_spacing)
     image, mask, affine = fit_to_shape(image, mask, affine, grid_size)
     return {"image": image, "mask": mask, "affine": affine}
