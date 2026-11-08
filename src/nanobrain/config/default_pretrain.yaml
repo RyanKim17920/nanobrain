@@ -142,6 +142,15 @@ fino3d:
   nuisance_mode: predict
   # brain volume regression (litres, QC mask), standardized; 0 = off
   brain_volume: 0.0
+  # label smoothing of the discrete heads (sex / group / scanner); 0 = off
+  smoothing: 0.0
+  # Rank-N-Contrast age loss on a projector (rnc_dim) of the pooled embedding, in batch; rnc is
+  # the backbone gradient multiplier (0 = off, like the heads), rnc_weight its loss weight,
+  # rnc_tau the cosine temperature
+  rnc: 0.0
+  rnc_weight: 0.03
+  rnc_tau: 0.1
+  rnc_dim: 128
   # group classes with fewer images (in the train filelist) are masked
   group_min_count: 300
   exclude_collections: [PT030_OpenNeuro/ds001510]

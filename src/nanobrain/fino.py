@@ -130,6 +130,18 @@ class FinoHeads(nn.Module):
                              nn.Linear(embed_dim, hidden), nn.GELU(), nn.Linear(hidden, d))
             for k, d in self.dims.items()
         })
+        # label smoothing of the discrete heads (sex bce, group / scanner ce); 0 = off
+        self.smoothing = float(cfg.get("smoothing") or 0.0)
+        # Rank-N-Contrast on age (Zha et al. 2023) over a small projector of the pooled embedding;
+        # rnc = backbone gradient multiplier (0 = off), loss weight rnc_weight
+        self.rnc = float(cfg.get("rnc") or 0.0)
+        self.rnc_weight = float(cfg.get("rnc_weight") or 0.0)
+        self.rnc_tau = float(cfg.get("rnc_tau") or 0.1)
+        self.rnc_proj = None
+        if self.rnc != 0.0:
+            self.rnc_proj = nn.Sequential(
+                nn.LayerNorm(embed_dim, elementwise_affine=False), nn.Linear(embed_dim, hidden),
+                nn.GELU(), nn.Linear(hidden, int(cfg.get("rnc_dim") or 128)))
 
     def forward(self, pooled: Tensor, meta: Tensor, gamma: float) -> tuple[Tensor, dict]:
         # pooled [R, D] global embeddings, meta [R, 6] (NaN = masked)
@@ -147,9 +159,35 @@ class FinoHeads(nn.Module):
                 if k in ("age", "brain_volume"):
                     term = (F.mse_loss(out[:, 0], t, reduction="none") * keep).sum() / n
                 elif k == "sex":
+                    t = t * (1.0 - self.smoothing) + 0.5 * self.smoothing
                     term = (F.binary_cross_entropy_with_logits(out[:, 0], t, reduction="none") * keep).sum() / n
                 else:
-                    term = (F.cross_entropy(out, t.long(), reduction="none") * keep).sum() / n
+                    term = (F.cross_entropy(out, t.long(), reduction="none", label_smoothing=self.smoothing)
+                            * keep).sum() / n
                 loss = loss + self.weight * term
                 stats[k] = term.detach()
+            if self.rnc_proj is not None:
+                z = self.rnc_proj(GradScale.apply(pooled, self.rnc * gamma))
+                term = rnc_loss(z, meta[:, COLUMNS.index("age")], self.rnc_tau)
+                loss = loss + self.rnc_weight * term
+                stats["rnc"] = term.detach()
         return loss, stats
+
+
+def rnc_loss(z: Tensor, y: Tensor, tau: float) -> Tensor:
+    """Rank-N-Contrast: for anchor i and positive j, the negatives are every k with
+    |y_i - y_k| >= |y_i - y_j|; similarity = cosine / tau. Rows with a NaN label are masked
+    (no boolean indexing / host sync: the train step stays sync free)."""
+    r = z.shape[0]
+    valid = ~torch.isnan(y)
+    y = torch.where(valid, y, torch.zeros_like(y))
+    z = F.normalize(z, dim=-1)
+    logits = z @ z.T / tau  # [r, r]
+    eye = torch.eye(r, dtype=torch.bool, device=z.device)
+    pairs = valid[:, None] & valid[None, :] & ~eye  # (i, j) anchor/positive pairs
+    dist = (y[:, None] - y[None, :]).abs()
+    # neg[i, j, k]: k is in the denominator of pair (i, j); k = j always is, so valid pairs are finite
+    neg = (dist[:, None, :] >= dist[:, :, None]) & pairs[:, None, :]
+    denom = torch.logsumexp(logits[:, None, :].expand(r, r, r).masked_fill(~neg, -1e4), dim=-1)
+    pair = (logits - denom) * pairs
+    return -pair.sum() / pairs.sum().clamp_min(1)
