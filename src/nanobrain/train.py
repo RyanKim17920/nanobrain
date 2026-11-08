@@ -178,7 +178,8 @@ def main(args: DictConfig):
         # min_lr over the last time_decay_frac of the training time, ending at time_limit. the
         # step count is open ended, so the anneal always lands on the wall whatever the step rate
         assert args.time_limit, "time_schedule needs time_limit"
-        assert not args.anneal_filelist, "time_schedule: anneal_filelist switches by step count"
+        # anneal_filelist under time_schedule: the sampler switches to it when the decay phase
+        # starts (time keyed, see switch_event below)
         args.total_steps = 10**9
         lr_schedule = None
         logger.info(
@@ -204,13 +205,19 @@ def main(args: DictConfig):
     start_step, prev_wall_time = misc.load_model(args, model_without_ddp, optimizer, loss_scaler)
 
     # data loader. one endless pass over shuffled epochs, resumed at the next unseen image
-    late_indices = switch_at = None
+    late_indices = switch_at = switch_event = None
     if args.anneal_filelist:
         # the lr decay phase draws only from this subset of train_filelist
         late = set(Path(args.anneal_filelist).read_text().split())
         late_indices = [ii for ii, path in enumerate(dataset.paths) if path in late]
-        switch_at = (args.total_steps - args.decay_steps) * args.accum_iter * args.batch_size * world_size
-        logger.info(f"anneal: {len(late_indices)} images from sample {switch_at}")
+        if args.get("time_schedule"):
+            switch_event = threading.Event()
+            logger.info(f"anneal: {len(late_indices)} images from the start of the time decay phase")
+        else:
+            switch_at = (
+                (args.total_steps - args.decay_steps) * args.accum_iter * args.batch_size * world_size
+            )
+            logger.info(f"anneal: {len(late_indices)} images from sample {switch_at}")
     sampler = InfiniteSampler(
         len(dataset),
         seed=args.seed,
@@ -219,6 +226,7 @@ def main(args: DictConfig):
         world_size=world_size,
         late_indices=late_indices,
         switch_at=switch_at,
+        switch_event=switch_event,
     )
     fast_prep = not args.native
     train_loader = DataLoader(
@@ -400,6 +408,13 @@ def train(
             lr = time_keyed_lr(
                 args, step, prev_wall_time + time.monotonic() - start_time, time_limit, train_t0
             )
+            if switch_event is not None and train_t0 is not None and not switch_event.is_set():
+                progress = (prev_wall_time + time.monotonic() - start_time - train_t0) / max(
+                    time_limit - train_t0, 1.0
+                )
+                if progress > 1.0 - args.time_decay_frac:
+                    switch_event.set()
+                    logger.info(f"anneal: sampler switched to the anneal list at step {step}")
         else:
             lr = float(lr_schedule[step])
         if need_update:

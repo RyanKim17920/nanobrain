@@ -57,6 +57,7 @@ class InfiniteSampler(Sampler[int]):
         world_size: int = 1,
         late_indices: list[int] | None = None,
         switch_at: int | None = None,
+        switch_event=None,
     ):
         self.num_samples = num_samples
         self.seed = seed
@@ -66,13 +67,23 @@ class InfiniteSampler(Sampler[int]):
         # from sample index switch_at on, endless shuffled passes over late_indices only (anneal mix)
         self.late_indices = late_indices
         self.switch_at = switch_at if late_indices is not None else None
+        # time keyed anneal: switch to late_indices as soon as switch_event.is_set() (set by the
+        # train loop when the time schedule's decay phase starts); checked per sample
+        self.switch_event = switch_event if late_indices is not None else None
+
+    def _main_phase(self, index: int) -> bool:
+        if self.switch_event is not None:
+            if self.switch_event.is_set():
+                return False
+            return True
+        return self.switch_at is None or index < self.switch_at
 
     def __iter__(self):
         generator = torch.Generator().manual_seed(self.seed)
         index = 0
-        while self.switch_at is None or index < self.switch_at:
+        while self._main_phase(index):
             for sample_index in torch.randperm(self.num_samples, generator=generator).tolist():
-                if self.switch_at is not None and index >= self.switch_at:
+                if not self._main_phase(index):
                     break
                 if index >= self.start and index % self.world_size == self.rank:
                     yield sample_index
