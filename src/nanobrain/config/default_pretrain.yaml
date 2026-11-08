@@ -152,6 +152,18 @@ fino3d:
   bv_mean: null
   bv_std: null
 
+# ctx_tail: context extension in the tail of a time scheduled run. from progress 1 - tail_frac of
+# the time schedule's clock (the clock of the lr anneal and the fino ramp) to the end, each
+# sequence has num_visible visible tokens (num_predict: null keeps the run's num_predict). chunks
+# splits each loader batch into micro-batches with gradient accumulation (same images and lr per
+# optimizer step, less activation memory). enabled false = the base run, bitwise
+ctx_tail:
+  enabled: false
+  tail_frac: 0.3
+  num_visible: 1536
+  num_predict: null
+  chunks: 1
+
 wandb: false
 wandb_entity: null
 wandb_project: nanobrain

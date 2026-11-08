@@ -148,6 +148,12 @@ def main(args: DictConfig):
     if args.distributed:
         model = DDP(model, broadcast_buffers=False)
 
+    ctx_tail = args.get("ctx_tail")
+    if ctx_tail is not None and ctx_tail.enabled:
+        assert args.native and args.get("time_schedule"), "ctx_tail: native, time scheduled runs only"
+        # the tail's sequence length (and micro-batch) is a second static shape: compile it as its
+        # own graph instead of a dynamic-shape graph for both
+        torch._dynamo.config.automatic_dynamic_shapes = False
     if args.compile and args.native:
         # the image shapes vary, so only the fixed-shape transformer parts compile
         model_without_ddp.compile_native()
@@ -392,6 +398,8 @@ def train(
         )
 
     optimizer.zero_grad()
+    ctx_tail = args.get("ctx_tail")
+    tail_logged = False
 
     if args.high_priority_stream and device.type == "cuda":
         # model work on a high priority stream: the prep threads' kernels (priority 0 side streams)
@@ -427,41 +435,70 @@ def train(
 
         if args.cudagraphs:
             torch.compiler.cudagraph_mark_step_begin()
+        # training progress on the time schedule's clock (the lr anneal's), else by step
+        if time_schedule:
+            wall = prev_wall_time + time.monotonic() - start_time
+            progress = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+        else:
+            progress = step / total_steps
         fino_kwargs = {}
         if "fino" in batch:
-            # FINO's gamma ramp over training progress (the time schedule's clock when time keyed)
-            if time_schedule:
-                wall = prev_wall_time + time.monotonic() - start_time
-                progress = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
-            else:
-                progress = step / total_steps
+            # FINO's gamma ramp over training progress
             fino_kwargs = {
                 "fino_meta": batch["fino"],
                 "fino_gamma": fino_ramp(args.fino3d.gamma_max, progress),
             }
-        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
-            loss = model(
-                images,
-                masks,
-                num_visible=args.num_visible,
-                num_predict=args.num_predict,
-                num_samples=args.num_samples,
-                with_state=False,
-                spacing=batch.get("spacing"),
-                **fino_kwargs,
-            )
-
-        # the cuda graph's output buffer is overwritten by the next replay
-        loss_for_log = loss.detach().clone() if args.cudagraphs else loss.detach()
-        torch._assert_async(torch.isfinite(loss_for_log), "non-finite loss")
-
-        grad_norm = misc.backward_step(
-            loss / args.accum_iter,
-            optimizer,
-            scaler=loss_scaler,
-            need_update=need_update,
-            max_norm=args.clip_grad,
+        num_visible, num_predict, chunks = args.num_visible, args.num_predict, 1
+        in_tail = (
+            ctx_tail is not None and ctx_tail.enabled and train_t0 is not None
+            and progress >= 1.0 - ctx_tail.tail_frac
         )
+        if in_tail:
+            num_visible = ctx_tail.num_visible
+            num_predict = ctx_tail.num_predict or args.num_predict
+            chunks = int(ctx_tail.chunks)
+            if not tail_logged:
+                tail_logged = True
+                logger.info(
+                    f"ctx_tail: step {step}, progress {progress:.3f}: num_visible {num_visible}, "
+                    f"num_predict {num_predict}, {chunks} micro-batches of "
+                    f"{len(images) // chunks} images"
+                )
+        # micro-batches (ctx_tail chunks): image-major slices, accumulated into one update
+        n_img = len(images)
+        assert n_img % chunks == 0, f"ctx_tail: batch {n_img} not divisible by {chunks} chunks"
+        size = n_img // chunks
+        loss_for_log = 0.0
+        for chunk in range(chunks):
+            sl = slice(chunk * size, (chunk + 1) * size)
+            kw = dict(fino_kwargs)
+            if chunks > 1 and "fino_meta" in kw:
+                kw["fino_meta"] = kw["fino_meta"][sl]
+            spacing = batch.get("spacing")
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
+                loss = model(
+                    images[sl] if chunks > 1 else images,
+                    masks[sl] if chunks > 1 else masks,
+                    num_visible=num_visible,
+                    num_predict=num_predict,
+                    num_samples=args.num_samples,
+                    with_state=False,
+                    spacing=spacing[sl] if chunks > 1 and spacing is not None else spacing,
+                    **kw,
+                )
+
+            # the cuda graph's output buffer is overwritten by the next replay
+            chunk_loss = loss.detach().clone() if args.cudagraphs else loss.detach()
+            torch._assert_async(torch.isfinite(chunk_loss), "non-finite loss")
+            loss_for_log = loss_for_log + chunk_loss / chunks
+
+            grad_norm = misc.backward_step(
+                loss / (args.accum_iter * chunks),
+                optimizer,
+                scaler=loss_scaler,
+                need_update=need_update and chunk == chunks - 1,
+                max_norm=args.clip_grad,
+            )
 
         # log tensors without syncing, values are only read on log steps
         metric_logger.update(loss=loss_for_log)
@@ -480,6 +517,8 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
+            if in_tail:
+                log_stats["ctx_tail_num_visible"] = num_visible
             if fino_kwargs:
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
