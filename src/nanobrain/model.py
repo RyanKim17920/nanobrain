@@ -76,6 +76,11 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # gstat: label-free global-stats head (weight; 0 = off). A zero-init linear head on the
+        # pooled visible encoder tokens regresses per-volume statistics of the input (gstat_targets)
+        gstat_weight: float = 0.0,
+        gstat_thumb: tuple[int, int, int] = (4, 5, 4),
+        gstat_levels: tuple[float, ...] = (-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0),
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -177,6 +182,18 @@ class ViTMAE3D(nn.Module):
             assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
+        # gstat head, built after the base (and fino) init too: off = no params, same init
+        self.gstat_weight = float(gstat_weight)
+        self.gstat_thumb = tuple(int(t) for t in gstat_thumb)
+        self.gstat_head = None
+        self.gstat_stats = {}
+        if self.gstat_weight:
+            assert native, "gstat: native training only"
+            self.gstat_level_values = tuple(float(t) for t in gstat_levels)
+            num_out = 1 + len(gstat_levels) + math.prod(self.gstat_thumb)
+            self.gstat_head = nn.Linear(embed_dim, num_out)
+            nn.init.zeros_(self.gstat_head.weight)
+            nn.init.zeros_(self.gstat_head.bias)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -519,6 +536,7 @@ class ViTMAE3D(nn.Module):
         parts = []
         for sp, ids in groups.items():
             patch, box, grid, _ = geoms[sp]
+            part = {}
             # images and masks fit to the box (fit_to_shape) and padded up to whole patches, tiling
             # the box from its low corner, in one buffer
             padded = tuple(num * p for num, p in zip(grid, patch))
@@ -527,10 +545,12 @@ class ViTMAE3D(nn.Module):
                 src, dst = fit_slices(images[ii].shape, box)
                 vols[0, jj][dst] = images[ii][src]
                 vols[1, jj][dst] = mask[ii][src]
+            if self.gstat_head is not None:
+                part["gstat"] = self.gstat_targets(vols[0], vols[1], sp)
             vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
             cube = (grid, self.mask_cube) if self.mask_cube else None
             scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube).flatten(0, 1)
-            parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols})
+            parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols, **part})
             parts[-1]["scores"] = scores
 
         # one argsort for all groups, rows padded with 3.0 (after every score). sorts this long are
@@ -647,9 +667,59 @@ class ViTMAE3D(nn.Module):
             fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
             loss = loss + fino_loss
 
+        if self.gstat_head is not None:
+            # the global embedding (as fino3d) regresses the input volume's own statistics
+            pooled = embeds[:, self.class_tokens :].mean(dim=1)
+            stats = [part.pop("gstat") for part in parts]
+            target, valid = (
+                torch.cat([st[k] for st in stats]).repeat_interleave(num_samples, 0) for k in (0, 1)
+            )
+            g_loss, self.gstat_stats = self.gstat_loss(self.gstat_head(pooled).float(), target, valid)
+            loss = loss + self.gstat_weight * g_loss
+
         if not with_state:
             return loss
         return loss, {"parts": parts, "embeds": embeds}
+
+    @torch.no_grad()
+    def gstat_targets(self, image: Tensor, mask: Tensor, spacing: tuple) -> tuple[Tensor, Tensor]:
+        # per-volume statistics of the box-fitted input (b, X, Y, Z), no host sync: log brain volume
+        # (litres), the in-mask fraction above each intensity level (the in-mask cdf), and the
+        # gstat_thumb grid of in-mask mean intensities over the box (cells under 1% brain masked)
+        with torch.autocast(device_type=image.device.type, enabled=False):
+            image, mask = image.float(), mask.float()
+            count = mask.flatten(1).sum(1)
+            log_vol = torch.log(count.clamp_min(1.0) * math.prod(spacing) / 1e6)
+            # intensity stats on a 2x strided subsample (8x fewer voxels)
+            im, m = image[:, ::2, ::2, ::2], mask[:, ::2, ::2, ::2]
+            m_sum = m.flatten(1).sum(1).clamp_min(1.0)
+            levels = torch.stack(
+                [((im > t) * m).flatten(1).sum(1) for t in self.gstat_level_values], dim=1
+            ) / m_sum[:, None]
+            cover = F.adaptive_avg_pool3d(m.unsqueeze(1), self.gstat_thumb).flatten(1)
+            thumb = F.adaptive_avg_pool3d((im * m).unsqueeze(1), self.gstat_thumb).flatten(1)
+            thumb = thumb / cover.clamp_min(1e-6)
+            target = torch.cat([log_vol[:, None], levels, thumb], dim=1)
+            valid = torch.cat(
+                [(count > 0)[:, None].expand(-1, 1 + levels.shape[1]), cover > 0.01], dim=1
+            ).float()
+        return target, valid
+
+    def gstat_loss(self, pred: Tensor, target: Tensor, valid: Tensor) -> tuple[Tensor, dict]:
+        # targets z-scored per column over the batch's valid rows (detached), masked mse; the three
+        # groups (volume, levels, thumbnail) weigh equally. zero-init head: loss 1 at init
+        with torch.no_grad():
+            n = valid.sum(0).clamp_min(1.0)
+            mean = (target * valid).sum(0) / n
+            var = ((target - mean) ** 2 * valid).sum(0) / n
+            z = (target - mean) / var.clamp_min(1e-6).sqrt() * valid
+        err = (pred - z) ** 2 * valid
+        k = len(self.gstat_level_values)
+        groups = (slice(0, 1), slice(1, 1 + k), slice(1 + k, None))
+        terms = [err[:, g].sum() / valid[:, g].sum().clamp_min(1.0) for g in groups]
+        loss = sum(terms) / len(terms)
+        stats = {name: t.detach() for name, t in zip(("vol", "levels", "thumb"), terms)}
+        return loss, stats
 
     def compile_native(self, **kwargs) -> None:
         # the fixed-shape transformer parts. per-spacing tokenization, embedding and head stay eager
