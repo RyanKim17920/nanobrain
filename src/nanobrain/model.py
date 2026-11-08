@@ -76,6 +76,11 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # level_mirror (ported from r18_mir_dec, extended to the native path; () = off): extra level
+        # channels on a separate zero-init head: in-mask fraction of each 2 mm sub-block above each
+        # threshold AND above margin + the max within +-2-4 mm of its x(L-R)-mirrored 2 mm cell
+        level_mirror: tuple[float, ...] = (),
+        level_mirror_margin: float = 0.5,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -177,6 +182,21 @@ class ViTMAE3D(nn.Module):
             assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
+        self.level_mirror = tuple(float(t) for t in level_mirror)
+        self.level_mirror_margin = float(level_mirror_margin)
+        self.level_mirror_head = None
+        self.level_mirror_stats = {}
+        if self.level_mirror:
+            assert level_weight and native, "level_mirror: needs the level head, native path"
+            assert patch_size == 8 and level_pool == 2, "level_mirror: 2 mm cells of 8 mm tokens"
+            # background (0) is in the mirror window at the mask edge: thresholds >= margin keep it inert
+            assert min(self.level_mirror) >= self.level_mirror_margin, "level_mirror: thresholds >= margin"
+            # off the rng stream and zero init: every other weight initializes as without it
+            with torch.random.fork_rng(devices=[]):
+                self.level_mirror_head = nn.Linear(embed_dim, len(self.level_mirror) * 64)
+            nn.init.zeros_(self.level_mirror_head.weight)
+            nn.init.zeros_(self.level_mirror_head.bias)
+            self.register_buffer("level_mirror_thresholds", torch.tensor(self.level_mirror), persistent=False)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -481,6 +501,56 @@ class ViTMAE3D(nn.Module):
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         return (weight * bce).sum() / (weight.sum() * target.shape[1]).clamp_min(1e-6)
 
+    @staticmethod
+    def _to_cells8(t: Tensor, patch) -> Tensor:
+        # native token voxels [R, px*py*pz] -> [R, 1, 8, 8, 8] (nearest; identity at 1 mm), so 2 mm
+        # sub-blocks are 2^3 voxel blocks
+        t = t.reshape(-1, 1, *patch)
+        if tuple(patch) != (8, 8, 8):
+            t = F.interpolate(t.float(), size=(8, 8, 8), mode="nearest")
+        return t
+
+    def mirror_ref(self, vols: Tensor, patch, box, grid, sp) -> Tensor:
+        # per token [b, N, 64]: the max within +-1 cell (2 mm cells) of each sub-block's x-mirrored cell
+        # (mirror about the box centre, the fit_to_shape centre); 1e4 where that cell is out of the
+        # mask, out of the box, or within 4 mm of the midline. at 1 mm = r18's mirror_map
+        img, msk = vols[0], vols[1]
+        b, N = img.shape[:2]
+        gx, gy, gz = grid
+
+        def cellvol(t: Tensor) -> Tensor:
+            c = self._to_cells8(t, patch).view(b, N, 4, 2, 4, 2, 4, 2).amax((3, 5, 7))
+            c = c.view(b, gx, gy, gz, 4, 4, 4).permute(0, 1, 4, 2, 5, 3, 6)
+            return c.reshape(b, gx * 4, gy * 4, gz * 4)
+
+        cells = cellvol(img)
+        valid = cellvol(msk.to(img.dtype)) > 0
+        hmax = F.max_pool3d(cells.float()[:, None], 3, 1, 1)[:, 0]
+        # x mirror index per cell, in voxels of this spacing: cell width px / 4
+        Cx, w = gx * 4, patch[0] / 4
+        centre = (torch.arange(Cx, device=img.device, dtype=torch.float64) + 0.5) * w
+        j = torch.floor((box[0] - centre) / w).long()
+        ok = (j >= 0) & (j < Cx) & ((centre - box[0] / 2).abs() * sp[0] >= 4.0)
+        j = j.clamp(0, Cx - 1)
+        mvalid = valid.index_select(1, j) & ok.view(1, -1, 1, 1)
+        ref = torch.where(mvalid, hmax.index_select(1, j), 1e4)
+        ref = ref.view(b, gx, 4, gy, 4, gz, 4).permute(0, 1, 3, 5, 2, 4, 6)
+        return ref.reshape(b, N, 64)
+
+    def mirror_terms(self, tokens: Tensor, patches: Tensor, mask: Tensor, patch, ref: Tensor):
+        # mirror level channels: (weighted bce sum, valid weight sum, level weight sum, weighted positives [M])
+        x = self._to_cells8(patches.float(), patch)
+        m = self._to_cells8(mask.float(), patch)
+        weight = F.avg_pool3d(m, 2)
+        mh = ref.float().view(-1, 1, 4, 4, 4)
+        thr = torch.maximum(self.level_mirror_thresholds.view(1, -1, 1, 1, 1), mh + self.level_mirror_margin)
+        thr = thr.repeat_interleave(2, 2).repeat_interleave(2, 3).repeat_interleave(2, 4)
+        target = F.avg_pool3d((x > thr).float() * m, 2) / weight.clamp_min(1e-6)
+        m_weight = weight * (mh < 1e3).float()
+        logits = self.level_mirror_head(tokens).float().reshape(target.shape)
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        return (m_weight * bce).sum(), m_weight.sum(), weight.sum(), (m_weight * target).sum((0, 2, 3, 4))
+
     def forward_native(
         self,
         images: list[Float[Tensor, "X Y Z"]],
@@ -564,6 +634,11 @@ class ViTMAE3D(nn.Module):
             part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
             if self.level_head is not None:
                 part["vis_patches"], part["vis_mask"] = vis_patches, mask_patches[:, :num_visible]
+            if self.level_mirror_head is not None:
+                # mirror references of the visible tokens [b * S * num_visible, 64]
+                ref = self.mirror_ref(vols, patch, geoms[sp][1], geoms[sp][2], sp)
+                vis_ids = part["order"][..., :num_visible] + (torch.arange(b, device=device) * num).view(-1, 1, 1)
+                part["mirror_ref"] = ref.flatten(0, 1).index_select(0, vis_ids.flatten())
 
         def cat(key: str) -> Tensor:
             # contiguous for one group too, the compiled encoder would recompile on view strides
@@ -627,14 +702,29 @@ class ViTMAE3D(nn.Module):
         loss = loss + 0.0 * sum(r.sum() for r in residuals)
         if self.level_head is not None:
             num, den = 0.0, 0.0
+            mterms = []
             rows = torch.split(embeds, [len(part["ids"]) * num_samples for part in parts])
             for part, tokens in zip(parts, rows):
-                n, d = self.level_terms(
-                    tokens[:, self.class_tokens :], part.pop("vis_patches"), part.pop("vis_mask"),
-                    part["patch"],
-                )
+                vis_patches, vis_mask = part.pop("vis_patches"), part.pop("vis_mask")
+                n, d = self.level_terms(tokens[:, self.class_tokens :], vis_patches, vis_mask, part["patch"])
                 num, den = num + n, den + d
+                if self.level_mirror_head is not None:
+                    mterms.append(self.mirror_terms(
+                        tokens[:, self.class_tokens :], vis_patches, vis_mask, part["patch"], part.pop("mirror_ref")
+                    ))
             loss = loss + self.level_weight * num / den.clamp_min(1e-6)
+            if mterms:
+                # summed over groups: (weighted bce, valid weight, level weight, weighted positives [M])
+                mb, mw, lw, mp = [sum(t[k] for t in mterms) for k in range(4)]
+                T = len(self.level_thresholds)
+                # same per-channel weight as the level channels (r18: / (valid weight * T))
+                loss = loss + self.level_weight * mb / (mw * T).clamp_min(1e-6)
+                M = len(self.level_mirror)
+                self.level_mirror_stats = {
+                    "bce": (mb / (mw * M).clamp_min(1e-6)).detach(),
+                    "valid": (mw / lw.clamp_min(1e-6)).detach(),
+                    **{f"pos{t:g}": v for t, v in zip(self.level_mirror, (mp / mw.clamp_min(1e-6)).detach())},
+                }
         if self.fino_heads is not None and fino_meta is not None:
             # the global embedding of each sequence: mean of its visible encoder tokens (eval:
             # mean of all brain-touching tokens); rows are part by part, image-major

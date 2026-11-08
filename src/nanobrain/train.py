@@ -484,6 +484,8 @@ def train(
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
+            for k, v in model_without_ddp.level_mirror_stats.items():
+                log_stats[f"mirror_{k}"] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)
