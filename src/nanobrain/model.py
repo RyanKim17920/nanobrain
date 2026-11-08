@@ -12,6 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
 from .fino import FinoHeads
+from .grl import GrlHead
 from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
 from .data import (
     crop_to_mask,
@@ -76,6 +77,9 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # grl config block (nanobrain.grl), training only adversarial collection classifier on
+        # the global embedding; None = off (no params, same init)
+        grl: dict | None = None,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -177,6 +181,12 @@ class ViTMAE3D(nn.Module):
             assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
+        self.grl_head = None
+        self.grl_stats = {}
+        if grl is not None:
+            assert native, "grl: native training only"
+            self.grl_head = GrlHead(embed_dim, grl)
+            self.grl_head.apply(_init_weights)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -187,6 +197,7 @@ class ViTMAE3D(nn.Module):
             patch_size=args["patch_size"],
             native=args["native"],
             fino3d=fino if (fino := args.get("fino3d")) and fino.get("enabled") else None,
+            grl=grl if (grl := args.get("grl")) and grl.get("enabled") else None,
             **args["model_kwargs"],
         )
 
@@ -294,12 +305,13 @@ class ViTMAE3D(nn.Module):
         spacing: list[tuple[float, float, float]] | None = None,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        grl_lam: float = 0.0,
     ):
         if isinstance(images, list):
             # native resolution batch, images on their own voxel grids
             return self.forward_native(
                 images, mask, spacing, num_visible, num_predict, num_samples, with_state,
-                fino_meta=fino_meta, fino_gamma=fino_gamma,
+                fino_meta=fino_meta, fino_gamma=fino_gamma, grl_lam=grl_lam,
             )
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
@@ -492,6 +504,7 @@ class ViTMAE3D(nn.Module):
         with_state: bool = True,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        grl_lam: float = 0.0,
     ):
         # images (float) and masks (bool) on their own voxel grids (sample_transform native), fit
         # here to the grid_size mm box in their voxels. images with the same spacing share one
@@ -635,7 +648,7 @@ class ViTMAE3D(nn.Module):
                 )
                 num, den = num + n, den + d
             loss = loss + self.level_weight * num / den.clamp_min(1e-6)
-        if self.fino_heads is not None and fino_meta is not None:
+        if (self.fino_heads is not None or self.grl_head is not None) and fino_meta is not None:
             # the global embedding of each sequence: mean of its visible encoder tokens (eval:
             # mean of all brain-touching tokens); rows are part by part, image-major
             pooled = embeds[:, self.class_tokens :].mean(dim=1)
@@ -644,8 +657,13 @@ class ViTMAE3D(nn.Module):
             meta = fino_meta.cpu()[rows]
             if device.type == "cuda":
                 meta = meta.pin_memory().to(device, non_blocking=True)
-            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
-            loss = loss + fino_loss
+            if self.fino_heads is not None:
+                fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
+                loss = loss + fino_loss
+            if self.grl_head is not None:
+                # column 6 = collection class id (nanobrain.grl), appended after the fino columns
+                grl_loss, self.grl_stats = self.grl_head(pooled, meta[:, 6], grl_lam)
+                loss = loss + grl_loss
 
         if not with_state:
             return loss

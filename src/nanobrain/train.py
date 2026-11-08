@@ -37,6 +37,7 @@ from nanobrain.data import (
     resample_to_spacing,
 )
 from nanobrain.fino import ramp as fino_ramp
+from nanobrain.grl import lam_schedule as grl_lam_schedule
 from nanobrain.model import ViTMAE3D, patches_to_volume
 from nanobrain.optim import CombinedOptimizer, Muon, is_muon_param
 from nanobrain.visualization import plot_mask_pred
@@ -132,6 +133,18 @@ def main(args: DictConfig):
             Path(args.train_filelist).read_text().split(),
             DATA_ROOT / "fomo300k" / "tables" / "images.parquet",
         )
+    if args.get("grl") and args.grl.enabled:
+        # collection class ids ride along as column 6 of the per-image metadata (nanobrain.grl);
+        # the class vocabulary sizes the head (stored in the checkpoint args)
+        from nanobrain.fino import COLUMNS
+        from nanobrain.grl import build_collection_ids
+
+        assert args.native, "grl: native training only"
+        paths = Path(args.train_filelist).read_text().split()
+        ids = build_collection_ids(args.grl, paths, DATA_ROOT / "fomo300k" / "tables" / "images.parquet")
+        if fino_meta is None:
+            fino_meta = torch.full((len(paths), len(COLUMNS)), float("nan"))
+        fino_meta = torch.cat([fino_meta, ids[:, None]], dim=1)
 
     # model
     model = ViTMAE3D.from_config(args)
@@ -439,6 +452,9 @@ def train(
                 "fino_meta": batch["fino"],
                 "fino_gamma": fino_ramp(args.fino3d.gamma_max, progress),
             }
+            if args.get("grl") and args.grl.enabled:
+                # DANN ramp 0 -> lam_max over the first ramp_frac of the same clock
+                fino_kwargs["grl_lam"] = grl_lam_schedule(args.grl.lam_max, progress, args.grl.ramp_frac)
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,
@@ -467,6 +483,10 @@ def train(
         metric_logger.update(loss=loss_for_log)
         if need_update:
             metric_logger.update(lr=lr, grad=grad_norm)
+        if "grl_lam" in fino_kwargs:
+            # gpu tensors, no sync: read (window average) on log steps only
+            stats = model_without_ddp.grl_stats
+            metric_logger.update(grl_ce=stats["ce"], grl_acc=stats["acc"])
 
         throughput.step()
         if log_step:
@@ -484,6 +504,10 @@ def train(
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
+            if "grl_lam" in fino_kwargs:
+                log_stats["grl_lambda"] = fino_kwargs["grl_lam"]
+                log_stats["grl_ce"] = metric_logger.grl_ce.avg
+                log_stats["grl_acc"] = metric_logger.grl_acc.avg
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)

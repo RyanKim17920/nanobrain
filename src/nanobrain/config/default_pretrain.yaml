@@ -152,6 +152,21 @@ fino3d:
   bv_mean: null
   bv_std: null
 
+# GRL (nanobrain.grl): DANN domain-adversarial collection classifier on the same global embedding
+# the fino3d heads read. LN + Linear(D, hidden) + GELU + Linear(hidden, K+1); classes = collections
+# with >= min_count train images + "other"; missing collection ignored. The classifier's CE enters
+# the loss times `weight`; the encoder gets -lambda * weight * grad, lambda = lam_max * (2 / (1 +
+# exp(-10 p)) - 1), p = training progress / ramp_frac. enabled false = the base run, bitwise
+grl:
+  enabled: false
+  lam_max: 0.1
+  ramp_frac: 0.3
+  weight: 1.0
+  min_count: 50
+  hidden: 256
+  # filled at train time from the train filelist, kept in the checkpoint args
+  collection_classes: null
+
 wandb: false
 wandb_entity: null
 wandb_project: nanobrain
