@@ -152,6 +152,12 @@ fino3d:
   bv_mean: null
   bv_std: null
 
+# Kendall 2018 uncertainty weighting over recon / level / each fino head: sum exp(-s_i) L_i + s_i,
+# s_i learned (init 0 = base), own adamw group (no wd, lr follows the schedule, peak = lr here)
+loss_balance:
+  enabled: false
+  lr: 0.01
+
 wandb: false
 wandb_entity: null
 wandb_project: nanobrain

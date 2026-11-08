@@ -76,6 +76,8 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # uncertainty loss balancing (Kendall 2018), training only; None = off (bitwise base)
+        loss_balance: bool = False,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -177,6 +179,16 @@ class ViTMAE3D(nn.Module):
             assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
+        # learned log-variances s_i, one per loss term: total = sum_i exp(-s_i) * L_i + s_i
+        # (L_i keeps its fixed weight, so s = 0 is the base). order: recon, level, fino heads
+        self.balance_names = []
+        self.log_vars = None
+        if loss_balance:
+            assert native, "loss_balance: native training only"
+            self.balance_names = ["recon"] + (["level"] if self.level_head is not None else [])
+            if self.fino_heads is not None:
+                self.balance_names += [f"fino_{k}" for k in self.fino_heads.heads]
+            self.log_vars = nn.Parameter(torch.zeros(len(self.balance_names)))
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -187,6 +199,7 @@ class ViTMAE3D(nn.Module):
             patch_size=args["patch_size"],
             native=args["native"],
             fino3d=fino if (fino := args.get("fino3d")) and fino.get("enabled") else None,
+            loss_balance=bool((lb := args.get("loss_balance")) and lb.get("enabled")),
             **args["model_kwargs"],
         )
 
@@ -625,6 +638,9 @@ class ViTMAE3D(nn.Module):
         residuals = (self.patch_embed.residual, self.decoder_head.residual)
         residuals += (self.decoder_head.bias_residual,)
         loss = loss + 0.0 * sum(r.sum() for r in residuals)
+        lv = self.log_vars
+        if lv is not None:
+            loss = torch.exp(-lv[0]) * loss + lv[0]  # recon term (fixed weights kept inside)
         if self.level_head is not None:
             num, den = 0.0, 0.0
             rows = torch.split(embeds, [len(part["ids"]) * num_samples for part in parts])
@@ -634,7 +650,10 @@ class ViTMAE3D(nn.Module):
                     part["patch"],
                 )
                 num, den = num + n, den + d
-            loss = loss + self.level_weight * num / den.clamp_min(1e-6)
+            level = self.level_weight * num / den.clamp_min(1e-6)
+            if lv is not None:
+                level = torch.exp(-lv[1]) * level + lv[1]
+            loss = loss + level
         if self.fino_heads is not None and fino_meta is not None:
             # the global embedding of each sequence: mean of its visible encoder tokens (eval:
             # mean of all brain-touching tokens); rows are part by part, image-major
@@ -644,7 +663,8 @@ class ViTMAE3D(nn.Module):
             meta = fino_meta.cpu()[rows]
             if device.type == "cuda":
                 meta = meta.pin_memory().to(device, non_blocking=True)
-            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
+            fino_lv = lv[len(self.balance_names) - len(self.fino_heads.heads):] if lv is not None else None
+            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma, fino_lv)
             loss = loss + fino_loss
 
         if not with_state:

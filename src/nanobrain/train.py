@@ -3,6 +3,7 @@ import datetime
 import functools
 import gc
 import json
+import math
 import logging
 import os
 import signal
@@ -484,6 +485,11 @@ def train(
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
+            if model_without_ddp.log_vars is not None:
+                lvs = model_without_ddp.log_vars.detach().float().cpu().tolist()
+                for nm, v in zip(model_without_ddp.balance_names, lvs):
+                    log_stats[f"lb_s_{nm}"] = v
+                    log_stats[f"lb_w_{nm}"] = math.exp(-v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)
@@ -556,8 +562,17 @@ def make_optimizer(args: DictConfig, model: nn.Module):
         if is_muon_param(n, p, args.muon_encoder_only, args.muon_decoder_only, args.muon_all_matrices)
     ]
     logger.info(f"muon params: {len(muon_names)} matrices")
-    adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names))
+    skip = set(muon_names) | {"log_vars"}
+    adamw_groups = misc.get_param_groups(model, skip_names=skip)
     params = dict(model.named_parameters())
+    if "log_vars" in params:
+        # loss balance log-variances: own adamw group, no weight decay, lr peak = loss_balance.lr
+        # (follows the lr schedule), never muon
+        adamw_groups.append({
+            "params": [params["log_vars"]],
+            "lr_multiplier": float(args.loss_balance.lr) / float(args.lr),
+            "wd_multiplier": 0.0,
+        })
     muon_groups = [
         {
             "params": [params[n] for n in muon_names],

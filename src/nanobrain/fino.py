@@ -131,13 +131,13 @@ class FinoHeads(nn.Module):
             for k, d in self.dims.items()
         })
 
-    def forward(self, pooled: Tensor, meta: Tensor, gamma: float) -> tuple[Tensor, dict]:
+    def forward(self, pooled: Tensor, meta: Tensor, gamma: float, log_vars: Tensor | None = None) -> tuple[Tensor, dict]:
         # pooled [R, D] global embeddings, meta [R, 6] (NaN = masked)
         pooled = pooled.float()
         loss = pooled.new_zeros(())
         stats = {}
         with torch.autocast(device_type=pooled.device.type, enabled=False):
-            for k, head in self.heads.items():
+            for ii, (k, head) in enumerate(self.heads.items()):
                 target = meta[:, COLUMNS.index(k)]
                 keep = ~torch.isnan(target)
                 # every head runs on every row so the graph (and ddp) sees all params
@@ -150,6 +150,9 @@ class FinoHeads(nn.Module):
                     term = (F.binary_cross_entropy_with_logits(out[:, 0], t, reduction="none") * keep).sum() / n
                 else:
                     term = (F.cross_entropy(out, t.long(), reduction="none") * keep).sum() / n
-                loss = loss + self.weight * term
+                term_w = self.weight * term
+                if log_vars is not None:  # uncertainty balance: exp(-s) * L + s
+                    term_w = torch.exp(-log_vars[ii]) * term_w + log_vars[ii]
+                loss = loss + term_w
                 stats[k] = term.detach()
         return loss, stats
