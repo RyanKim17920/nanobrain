@@ -72,6 +72,10 @@ class ViTMAE3D(nn.Module):
         norm_target: bool = False,
         grad_loss_weight: float = 0.0,
         fg_loss_weight: float = 0.0,
+        # CrossMAE-style decoder (Fu et al. 2024): the mask tokens cross-attend to the projected
+        # encoder tokens (no self-attention, no rows for the visible tokens), so each target is
+        # predicted from the visible set alone and the decoder costs ~half
+        decoder_cross: bool = False,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -92,6 +96,7 @@ class ViTMAE3D(nn.Module):
         self.hard_gamma = hard_gamma
         self.hard_max = hard_max
         self.decoder_keep = decoder_keep
+        self.decoder_cross = decoder_cross
 
         patch_dim = patch_size**3
         self.register_buffer("coord_grid", make_coord_grid(grid_size, patch_size), persistent=False)
@@ -256,6 +261,12 @@ class ViTMAE3D(nn.Module):
         mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
         if self.global_proj is not None:
             mask_tokens = mask_tokens + pooled
+
+        if self.decoder_cross:
+            x = mask_tokens
+            for block in self.decoder_blocks:
+                x = block(x, context=embeds)
+            return self.decoder_norm(x)
 
         x = torch.cat([embeds, mask_tokens], dim=1)
 
