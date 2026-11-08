@@ -31,6 +31,10 @@ model_kwargs:
   drop_path_rate: 0.0
   min_mask_frac: 0.05
   level_weight: 0.5
+  # EMA-teacher latent auxiliary on the predicted tokens (model.py; 0 = off)
+  jepa_weight: 0.0
+  jepa_momentum: 0.996
+  jepa_view: target
 batch_size: 32
 accum_iter: 1
 base_lr: 0.002

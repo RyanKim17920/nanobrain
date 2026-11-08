@@ -1,3 +1,4 @@
+import copy
 import math
 from functools import lru_cache
 
@@ -76,6 +77,14 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # I-JEPA / data2vec style latent auxiliary on top of the pixel loss (weight; 0 = off, no
+        # params): a linear head on the decoder features of the predicted tokens regresses the
+        # layer-normed last-layer features of an EMA teacher encoder at those positions. the teacher
+        # encodes the predicted tokens only (jepa_view "target") or visible + predicted ("full");
+        # its momentum ramps jepa_momentum -> 1 (cosine) over training progress (ema_update)
+        jepa_weight: float = 0.0,
+        jepa_momentum: float = 0.996,
+        jepa_view: str = "target",
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -177,6 +186,19 @@ class ViTMAE3D(nn.Module):
             assert native, "fino3d: native training only"
             self.fino_heads = FinoHeads(embed_dim, fino3d)
             self.fino_heads.apply(_init_weights)
+        # built last for the same reason. the teacher is not a submodule (no state dict / optimizer
+        # entry): built lazily from the student on the first training forward (also after a resume)
+        self.jepa_weight = float(jepa_weight)
+        self.jepa_momentum = float(jepa_momentum)
+        assert jepa_view in ("target", "full"), jepa_view
+        self.jepa_view = jepa_view
+        self.jepa_head = None
+        self.jepa_stats = {}
+        self._teacher: list[nn.ModuleDict] = []
+        if self.jepa_weight:
+            assert native and not class_tokens, "jepa: native, no class tokens"
+            self.jepa_head = nn.Linear(decoder_embed_dim, embed_dim)
+            self.jepa_head.apply(_init_weights)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -481,6 +503,38 @@ class ViTMAE3D(nn.Module):
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         return (weight * bce).sum() / (weight.sum() * target.shape[1]).clamp_min(1e-6)
 
+    _TEACHER_KEYS = ("patch_embed", "pos_embed", "blocks", "norm")
+
+    def teacher(self) -> nn.ModuleDict:
+        if not self._teacher:
+            t = nn.ModuleDict({k: copy.deepcopy(getattr(self, k)) for k in self._TEACHER_KEYS})
+            t.requires_grad_(False)
+            self._teacher.append(t)
+        return self._teacher[0]
+
+    def teacher_encode(self, x: Tensor, coord: Tensor) -> Tensor:
+        # encode_tokens with the teacher's weights (no class tokens)
+        t = self._teacher[0]
+        x = t["pos_embed"](x, coord)
+        for block in t["blocks"]:
+            x = block(x)
+        return t["norm"](x)
+
+    @torch.no_grad()
+    def ema_update(self, progress: float) -> None:
+        # teacher <- m teacher + (1 - m) student, m ramped jepa_momentum -> 1 (cosine)
+        if not self._teacher:
+            return
+        m0 = self.jepa_momentum
+        m = 1.0 - (1.0 - m0) * (math.cos(math.pi * min(max(progress, 0.0), 1.0)) + 1.0) / 2.0
+        t = self._teacher[0]
+        t_params, s_params = [], []
+        for k in self._TEACHER_KEYS:
+            t_params += list(t[k].parameters())
+            s_params += list(getattr(self, k).parameters())
+        torch._foreach_lerp_(t_params, s_params, 1.0 - m)
+        self.jepa_stats["m"] = m
+
     def forward_native(
         self,
         images: list[Float[Tensor, "X Y Z"]],
@@ -564,6 +618,8 @@ class ViTMAE3D(nn.Module):
             part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
             if self.level_head is not None:
                 part["vis_patches"], part["vis_mask"] = vis_patches, mask_patches[:, :num_visible]
+            if self.jepa_head is not None and self.training:
+                part["seq_patches"], part["coord"] = patches, coord
 
         def cat(key: str) -> Tensor:
             # contiguous for one group too, the compiled encoder would recompile on view strides
@@ -578,6 +634,9 @@ class ViTMAE3D(nn.Module):
 
         embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
         feats = self.decode_features(embeds, cat("target_coord"))
+        jepa_loss = None
+        if self.jepa_head is not None and self.training:
+            jepa_loss = self.jepa_aux(parts, feats, num_visible)
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
         # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
@@ -647,14 +706,52 @@ class ViTMAE3D(nn.Module):
             fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
             loss = loss + fino_loss
 
+        if jepa_loss is not None:
+            loss = loss + self.jepa_weight * jepa_loss
+
         if not with_state:
             return loss
         return loss, {"parts": parts, "embeds": embeds}
+
+    def jepa_aux(self, parts: list[dict], feats: Tensor, num_visible: int) -> Tensor:
+        # latent prediction loss on the predicted tokens, weighted by their in-mask fraction
+        teacher = self.teacher()
+        full = self.jepa_view == "full"
+        with torch.no_grad():
+            sps = [part["spacing"] for part in parts if part["spacing"] != (1.0, 1.0, 1.0)]
+            ws = {}
+            if sps:
+                ws = teacher["patch_embed"].native_weights(sps, [part["patch"] for part in parts
+                                                                if part["spacing"] in sps])
+                ws = dict(zip(sps, ws))
+            xs, cs = [], []
+            for part in parts:
+                seq, coord = part.pop("seq_patches"), part.pop("coord")
+                if not full:
+                    seq, coord = seq[:, num_visible:], coord[:, num_visible:]
+                sp = part["spacing"]
+                xs.append(teacher["patch_embed"].native(seq, sp, part["patch"], ws.get(sp)))
+                cs.append(coord)
+            x = xs[0].contiguous() if len(xs) == 1 else torch.cat(xs)
+            c = cs[0].contiguous() if len(cs) == 1 else torch.cat(cs)
+            target = self.teacher_encode(x, c)
+            if full:
+                target = target[:, num_visible:]
+            target = F.layer_norm(target.float(), target.shape[-1:])
+        pred = self.jepa_head(feats).float()
+        w = torch.cat([part["target_mask_patches"].float().mean(-1) for part in parts])
+        err = (pred - target).pow(2).mean(-1)
+        loss = (w * err).sum() / w.sum().clamp_min(1e-6)
+        self.jepa_stats["loss"] = loss.detach()
+        self.jepa_stats["pred_std"] = pred.detach().std(dim=0).mean()
+        return loss
 
     def compile_native(self, **kwargs) -> None:
         # the fixed-shape transformer parts. per-spacing tokenization, embedding and head stay eager
         self.encode_tokens = torch.compile(self.encode_tokens, **kwargs)
         self.decode_features = torch.compile(self.decode_features, **kwargs)
+        if self.jepa_head is not None:
+            self.teacher_encode = torch.compile(self.teacher_encode, **kwargs)
 
     def compile_cudagraphs(self) -> None:
         # training speed, same math: sampling + gather compiled as usual, the encoder / decoder / loss

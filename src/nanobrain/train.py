@@ -469,6 +469,14 @@ def train(
             max_norm=args.clip_grad,
         )
 
+        if need_update and model_without_ddp.jepa_head is not None:
+            if time_schedule:
+                wall = prev_wall_time + time.monotonic() - start_time
+                progress = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+            else:
+                progress = step / total_steps
+            model_without_ddp.ema_update(progress)
+
         # log tensors without syncing, values are only read on log steps
         metric_logger.update(loss=loss_for_log)
         if need_update:
@@ -490,6 +498,8 @@ def train(
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
+            for k, v in model_without_ddp.jepa_stats.items():
+                log_stats[f"jepa_{k}"] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)
