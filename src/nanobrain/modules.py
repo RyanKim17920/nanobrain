@@ -30,9 +30,17 @@ class Attention(nn.Module):
         causal: bool = False,
         qk_norm: bool = False,
         qk_scale_init: float = 1.0,
+        len_scale_ref: int = 0,
     ) -> None:
         super().__init__()
         self.num_heads = num_heads
+        # length-scaled attention (scalable softmax, Nakanishi 2025): logits times
+        # s_h * log(M) / log(len_scale_ref) for M keys, s_h learned per head (init 1). At the
+        # training length the factor is s_h, at the ~7x longer eval sequences the logits sharpen
+        # by log(M) / log(ref), so attention does not flatten with the token count. 0 = off
+        self.len_scale_ref = len_scale_ref
+        if len_scale_ref:
+            self.len_qk_scale = nn.Parameter(torch.ones(num_heads, 1, 1))
         self.head_dim = dim // num_heads
         self.causal = causal
         context_dim = context_dim or dim
@@ -73,6 +81,9 @@ class Attention(nn.Module):
         if self.qk_norm:
             q = self.q_norm(q) * self.qk_scale.to(q.dtype)
             k = self.k_norm(k)
+        if self.len_scale_ref:
+            factor = math.log(M) / math.log(self.len_scale_ref)
+            q = q * (self.len_qk_scale * factor).to(q.dtype)
         x = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         x = x.transpose(1, 2).reshape(B, N, D)
         x = self.proj(x)
@@ -116,6 +127,7 @@ class Block(nn.Module):
         norm_layer: Layer = LayerNorm,
         qk_norm: bool = False,
         qk_scale_init: float = 1.0,
+        len_scale_ref: int = 0,
     ) -> None:
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -127,6 +139,7 @@ class Block(nn.Module):
             context_dim=context_dim,
             qk_norm=qk_norm,
             qk_scale_init=qk_scale_init,
+            len_scale_ref=len_scale_ref,
         )
         self.drop_path1 = DropPath(drop_path) if drop_path > 0 else nn.Identity()
 
