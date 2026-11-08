@@ -34,6 +34,7 @@ from nanobrain.data import (
     native_spacing,
     normalize_values,
     reorient_to_ras,
+    resample_onto,
     resample_to_spacing,
 )
 from nanobrain.model import ViTMAE3D, patches_to_volume
@@ -162,7 +163,14 @@ def main(args: DictConfig):
 
     optimizer = make_optimizer(args, model_without_ddp)
 
-    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
+    # xcon: each image also loads a partner image of the same session (cross-contrast target)
+    xcon = bool(args.model_kwargs.get("xcon_weight", 0.0))
+    assert not xcon or args.native, "xcon needs native"
+    partner = args.get("xcon_partner", "diff") if xcon else None
+    dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist, partner=partner)
+    if partner:
+        frac = sum(bool(ids) for ids in dataset.partner_ids) / len(dataset)
+        logger.info(f"xcon partner policy {partner}: {frac:.1%} of images have a partner")
     logger.info(f"train dataset: {len(dataset)} images")
 
     if args.epochs:
@@ -422,6 +430,8 @@ def train(
                 num_samples=args.num_samples,
                 with_state=False,
                 spacing=batch.get("spacing"),
+                **({"partner": batch["partner"], "partner_mask": batch["partner_mask"]}
+                   if "partner" in batch else {}),
             )
 
         # the cuda graph's output buffer is overwritten by the next replay
@@ -576,6 +586,8 @@ def make_lr_schedule(
 
 
 def make_batch_transform(args: DictConfig):
+    xcon = bool(args.model_kwargs.get("xcon_weight", 0.0))
+
     def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         batch = [
             sample_transform(
@@ -584,12 +596,14 @@ def make_batch_transform(args: DictConfig):
                 grid_size=tuple(args.grid_size),
                 clip_quantiles=tuple(args.clip_quantiles),
                 native=args.native,
+                partner=xcon,
             )
             for sample in batch
         ]
         if args.native:
-            # each image on its own voxel grid
-            return {key: [sample[key] for sample in batch] for key in ("image", "mask", "spacing")}
+            # each image on its own voxel grid (xcon: partner image / mask on that grid too)
+            keys = ("image", "mask", "spacing") + (("partner", "partner_mask") if xcon else ())
+            return {key: [sample[key] for sample in batch] for key in keys}
         images = torch.stack([sample["image"] for sample in batch])
         masks = torch.stack([sample["mask"] for sample in batch])
         return {"image": images, "mask": masks}
@@ -604,6 +618,7 @@ def sample_transform(
     grid_size: tuple[int, int, int] = (192, 240, 192),
     clip_quantiles: tuple[float, float] = (0.005, 0.995),
     native: bool = False,
+    partner: bool = False,
 ) -> dict[str, Tensor]:
     # pretraining preprocessing, on gpu. eval preprocessing is ViTMAE3D.transform_cuda, keep in sync
     # (native training still evaluates on 1 mm inputs)
@@ -615,7 +630,23 @@ def sample_transform(
     if native:
         # no resampling. forward_native fits the grid_size mm box in the image's own voxels
         spacing = native_spacing(affine, target_spacing)
-        return {"image": image, "mask": mask, "affine": affine, "spacing": spacing}
+        out = {"image": image, "mask": mask, "affine": affine, "spacing": spacing}
+        if partner:
+            # xcon: the session partner normalized the same way, resampled onto this voxel grid by
+            # world coordinates; no partner = zero image, empty mask
+            if "partner_values" in sample:
+                p_values = sample["partner_values"].float() * sample["partner_scale"]
+                p_values = normalize_values(p_values, clip_quantiles)
+                p_mask = brle_to_dense(sample["partner_mask_rle"], shape=sample["partner_shape"])
+                p_image = p_values.new_zeros(p_mask.shape).masked_scatter_(p_mask, p_values)
+                p_image, p_mask, p_affine = reorient_to_ras(p_image, p_mask, sample["partner_affine"])
+                out["partner"], out["partner_mask"] = resample_onto(
+                    p_image, p_mask, p_affine, affine, tuple(image.shape)
+                )
+            else:
+                out["partner"] = torch.zeros_like(image)
+                out["partner_mask"] = torch.zeros_like(mask)
+        return out
     image, mask, affine = resample_to_spacing(image, mask, affine, target_spacing)
     image, mask, affine = fit_to_shape(image, mask, affine, grid_size)
     return {"image": image, "mask": mask, "affine": affine}

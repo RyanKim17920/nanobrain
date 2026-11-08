@@ -72,6 +72,10 @@ class ViTMAE3D(nn.Module):
         norm_target: bool = False,
         grad_loss_weight: float = 0.0,
         fg_loss_weight: float = 0.0,
+        # xcon (native only): second head on the decoder features predicting a partner image of
+        # the same session (another contrast, resampled onto this grid) at the target patches,
+        # mse over voxels in both masks (weight; 0 = off, bitwise the base)
+        xcon_weight: float = 0.0,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -165,6 +169,11 @@ class ViTMAE3D(nn.Module):
             self.decoder_head = NativeHead(decoder_embed_dim, patch_size)
         else:
             self.decoder_head = nn.Linear(decoder_embed_dim, patch_dim)
+        self.xcon_weight = float(xcon_weight)
+        self.xcon_head = None
+        if xcon_weight:
+            assert native, "xcon_weight needs native"
+            self.xcon_head = NativeHead(decoder_embed_dim, patch_size)
         self.init_weights()
 
     @classmethod
@@ -191,6 +200,8 @@ class ViTMAE3D(nn.Module):
         nn.init.normal_(self.mask_token, std=0.02)
         # initialize the decoder head to zero to prevent hockey stick
         self.decoder_head.weight.data.mul_(0.0)
+        if self.xcon_head is not None:
+            self.xcon_head.weight.data.mul_(0.0)
         if self.level_head is not None:
             nn.init.zeros_(self.level_head.weight)
             nn.init.zeros_(self.level_head.bias)
@@ -280,11 +291,14 @@ class ViTMAE3D(nn.Module):
         num_samples: int = 1,
         with_state: bool = True,
         spacing: list[tuple[float, float, float]] | None = None,
+        partner: list[Tensor] | None = None,
+        partner_mask: list[Tensor] | None = None,
     ):
         if isinstance(images, list):
             # native resolution batch, images on their own voxel grids
             return self.forward_native(
-                images, mask, spacing, num_visible, num_predict, num_samples, with_state
+                images, mask, spacing, num_visible, num_predict, num_samples, with_state,
+                partner=partner, partner_mask=partner_mask,
             )
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
@@ -475,6 +489,8 @@ class ViTMAE3D(nn.Module):
         num_predict: int,
         num_samples: int = 1,
         with_state: bool = True,
+        partner: list[Tensor] | None = None,
+        partner_mask: list[Tensor] | None = None,
     ):
         # images (float) and masks (bool) on their own voxel grids (sample_transform native), fit
         # here to the grid_size mm box in their voxels. images with the same spacing share one
@@ -498,6 +514,12 @@ class ViTMAE3D(nn.Module):
             embed_ws = self.patch_embed.native_weights(native_sps, sp_patches)
             head_ws = self.decoder_head.native_weights(native_sps, sp_patches)
             embed_ws, head_ws = dict(zip(native_sps, embed_ws)), dict(zip(native_sps, head_ws))
+        # xcon: partner image + mask ride in the same patch gather as channels 2, 3
+        xcon = self.xcon_head is not None and partner is not None
+        channels = 4 if xcon else 2
+        xcon_ws = {}
+        if xcon and native_sps:
+            xcon_ws = dict(zip(native_sps, self.xcon_head.native_weights(native_sps, sp_patches)))
 
         parts = []
         for sp, ids in groups.items():
@@ -505,12 +527,15 @@ class ViTMAE3D(nn.Module):
             # images and masks fit to the box (fit_to_shape) and padded up to whole patches, tiling
             # the box from its low corner, in one buffer
             padded = tuple(num * p for num, p in zip(grid, patch))
-            vols = images[ids[0]].new_zeros((2, len(ids)) + padded)
+            vols = images[ids[0]].new_zeros((channels, len(ids)) + padded)
             for jj, ii in enumerate(ids):
                 src, dst = fit_slices(images[ii].shape, box)
                 vols[0, jj][dst] = images[ii][src]
                 vols[1, jj][dst] = mask[ii][src]
-            vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
+                if xcon:
+                    vols[2, jj][dst] = partner[ii][src]
+                    vols[3, jj][dst] = partner_mask[ii][src]
+            vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (channels, len(ids)))
             cube = (grid, self.mask_cube) if self.mask_cube else None
             scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube).flatten(0, 1)
             parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols})
@@ -537,9 +562,14 @@ class ViTMAE3D(nn.Module):
             b = len(part["ids"])
             part["order"] = order.unflatten(0, (b, num_samples))
             # images and masks gathered together by flat token ids
-            flat_ids = part["order"] + gather_offsets(b, num, device)
+            flat_ids = part["order"] + gather_offsets(b, num, device, channels)
             patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
-            patches, mask_patches = patches.view(2, b * num_samples, seq_length, -1)
+            patches = patches.view(channels, b * num_samples, seq_length, -1)
+            if xcon:
+                part["xcon_target"] = patches[2, :, num_visible:]
+                part["xcon_mask"] = patches[3, :, num_visible:] * patches[1, :, num_visible:]
+                patches = patches[:2]
+            patches, mask_patches = patches
             coord = geoms[sp][3][0][order]
             vis_patches, part["target_patches"] = patches.split([num_visible, num_predict], 1)
             part["target_mask_patches"] = mask_patches[:, num_visible:]
@@ -568,8 +598,16 @@ class ViTMAE3D(nn.Module):
         # patch geometry; the global loss is the weight-masked mean across groups
         losses, wts = [], []
         grad_num, grad_den = [], []
+        xcon_losses, xcon_wts = [], []
         for part, feat in zip(parts, feats):
             sp = part["spacing"]
+            if xcon:
+                # weighted like the main loss: per token voxel weight 1 / P, over both masks
+                xpred = self.xcon_head.native(feat, sp, part["patch"], xcon_ws.get(sp))
+                xw = part.pop("xcon_mask") / xpred.shape[-1]
+                xmse = F.mse_loss(xpred, part.pop("xcon_target"), reduction="none")
+                xcon_losses.append((xw * xmse).flatten())
+                xcon_wts.append(xw.flatten())
             pred = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
             part["pred_patches"] = pred
             px, py, pz = part["patch"]
@@ -607,7 +645,13 @@ class ViTMAE3D(nn.Module):
         # an all 1 mm batch leaves the residuals without a gradient, and ddp needs one every step
         residuals = (self.patch_embed.residual, self.decoder_head.residual)
         residuals += (self.decoder_head.bias_residual,)
+        if xcon:
+            residuals += (self.xcon_head.residual, self.xcon_head.bias_residual)
         loss = loss + 0.0 * sum(r.sum() for r in residuals)
+        if xcon:
+            # batches without any partner voxel give 0
+            xcon_loss = flat_cat(xcon_losses).sum() / flat_cat(xcon_wts).sum().clamp_min(1e-6)
+            loss = loss + self.xcon_weight * xcon_loss
         if self.level_head is not None:
             num, den = 0.0, 0.0
             rows = torch.split(embeds, [len(part["ids"]) * num_samples for part in parts])
@@ -838,9 +882,14 @@ def fit_slices(
 
 
 @lru_cache(maxsize=4096)
-def gather_offsets(batch_size: int, num_patches: int, device: torch.device) -> Tensor:
-    # [2, B, 1, 1] flat row offsets of (image | mask, image) in a [2, B, N, P] patch tensor
-    return torch.arange(2 * batch_size, device=device).view(2, batch_size, 1, 1) * num_patches
+def gather_offsets(
+    batch_size: int, num_patches: int, device: torch.device, channels: int = 2
+) -> Tensor:
+    # [C, B, 1, 1] flat row offsets of (channel, image) in a [C, B, N, P] patch tensor
+    return (
+        torch.arange(channels * batch_size, device=device).view(channels, batch_size, 1, 1)
+        * num_patches
+    )
 
 
 @lru_cache(maxsize=4096)
