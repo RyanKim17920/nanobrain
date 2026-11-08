@@ -589,9 +589,16 @@ class ViTMAE3D(nn.Module):
                 pv = pred.reshape(BM, px, py, pz)
                 tv = tgt.reshape(BM, px, py, pz)
                 mv = mask.reshape(BM, px, py, pz).to(w.dtype)
-                dx = F.mse_loss(pv[:, 1:], tv[:, 1:] - tv[:, :-1], reduction="none")
-                dy = F.mse_loss(pv[:, :, 1:], tv[:, :, 1:] - tv[:, :, :-1], reduction="none")
-                dz = F.mse_loss(pv[:, :, :, 1:], tv[:, :, :, 1:] - tv[:, :, :, :-1], reduction="none")
+                # finite differences of the prediction vs of the target (the graft compared the raw
+                # prediction to the target differences)
+                dx = F.mse_loss(pv[:, 1:] - pv[:, :-1], tv[:, 1:] - tv[:, :-1], reduction="none")
+                dy = F.mse_loss(
+                    pv[:, :, 1:] - pv[:, :, :-1], tv[:, :, 1:] - tv[:, :, :-1], reduction="none"
+                )
+                dz = F.mse_loss(
+                    pv[:, :, :, 1:] - pv[:, :, :, :-1], tv[:, :, :, 1:] - tv[:, :, :, :-1],
+                    reduction="none",
+                )
                 mx = mv[:, 1:] * mv[:, :-1]
                 my = mv[:, :, 1:] * mv[:, :, :-1]
                 mz = mv[:, :, :, 1:] * mv[:, :, :, :-1]
