@@ -66,7 +66,7 @@ def plan_batch(
             voxel_map, _ = mni_lib.sampling_affine(
                 sample["affine"], sample.pop("mni_affine"), mni_align, grid_size, jitter
             )
-            sample["mni_theta"] = mni_lib.grid_theta(voxel_map, sample["shape"], grid_size)
+            sample["mni_theta"], sample["mni_box"] = mni_lib.box_theta(voxel_map, sample["shape"], grid_size)
             sample["mni_sigmas"] = mni_lib.smoothing_sigmas(sample["affine"], target_spacing)
         else:
             orientation = ras_orientation(sample["affine"], sample["shape"])
@@ -156,8 +156,10 @@ def sample_transform(sample: dict, clip_quantiles=(0.005, 0.995), grid_size=None
     image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
     if "mni_theta" in sample:
         image = gaussian_smooth(image, sample["mni_sigmas"])
-        image, mask = mni_lib.resample(image, mask, sample["mni_theta"], grid_size)
-        return image, mask.to(torch.uint8)
+        image_out = image.new_zeros(grid_size)
+        mask_out = image.new_zeros(grid_size, dtype=torch.uint8)
+        mni_lib.resample_box(image, mask, sample["mni_theta"], sample["mni_box"], image_out, mask_out)
+        return image_out, mask_out
     flip_axes, order, _ = sample["orientation"]
     if flip_axes:  # flip([]) copies
         image, mask = image.flip(flip_axes), mask.flip(flip_axes)
@@ -217,9 +219,8 @@ def sample_transform_into(sample: dict, image_out: Tensor, mask_out: Tensor, cli
     image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
     if "mni_theta" in sample:
         image = gaussian_smooth(image, sample["mni_sigmas"])
-        image, mask = mni_lib.resample(image, mask, sample["mni_theta"], image_out.shape)
-        image_out.copy_(image)
-        mask_out.copy_(mask)
+        # image_out / mask_out are zero filled (make_batch_transform)
+        mni_lib.resample_box(image, mask, sample["mni_theta"], sample["mni_box"], image_out, mask_out)
         return
     flip_axes, order, _ = sample["orientation"]
     if flip_axes:  # flip([]) copies
