@@ -166,6 +166,9 @@ natinit:
   # layer-wise lr decay over the pretrained blocks: block i gets block_lr_mult * layer_decay ** (depth - 1 - i)
   layer_decay: 1.0
   pos_scale: 1.0
+  # video tubelet checkpoints (videomae, omnimae): the MRI axis the 2-frame time axis maps to
+  # (z = axial slices: frames <-> axial slices; x | y). ignored for 2D checkpoints
+  time_axis: z
 
 wandb: false
 wandb_entity: null

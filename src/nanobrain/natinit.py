@@ -15,6 +15,16 @@
 #         timm siglip v2 / clip laion2b / ibot / dino ones (openai clip uses quick_gelu: not used).
 #         Checked 11-09 on CPU: every block and the final norm match timm (rope=None for dinov3)
 #         to <=1e-4 relative; mae and dinov2 loads are bitwise those of a039eaf.
+#   videomae: HF VideoMAEForPreTraining (MCG-NJU/videomae-base = K400 MAE pretrain, -base-ssv2 =
+#         SSv2 MAE pretrain; separate q/k/v, q_bias + v_bias and NO k bias: k bias = zero, exact
+#         since a constant k bias shifts every logit of a query equally and cancels in softmax).
+#   omnimae (timm layout, converted from omnivore omnimae_ckpts/vitb_pretrain.torch: "trunk."
+#         stripped, encoder only, patch_embed.proj.1 -> patch_embed.proj).
+#   Video checkpoints carry a 3D tubelet kernel [D, 3, T=2, 16, 16]: inflate_tubelet_kernel maps
+#   the frame plane to an MRI plane and resamples time to the third axis (natinit.time_axis,
+#   default z = the axial slice axis: video frames <-> axial slices, frame rows -> x, cols -> y,
+#   the same in-plane convention as the 2D inflation). Not carried over: the sinusoidal (videomae)
+#   / learned 8x14x14 (omnimae) pos tables, the 384-wide decoders.
 
 import logging
 from pathlib import Path
@@ -27,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 
 def _family(sd: dict) -> str:
+    if "videomae.encoder.layer.0.attention.attention.query.weight" in sd:
+        return "videomae"
     if "vit.encoder.layer.0.attention.attention.query.weight" in sd:
         return "mae"
     if "blocks.0.attn.qkv.weight" in sd:
@@ -47,6 +59,27 @@ def _block_tensors(sd: dict, family: str, ii: int) -> dict[str, torch.Tensor]:
             "attn.k.bias": sd[p + "attention.attention.key.bias"],
             "attn.v.weight": sd[p + "attention.attention.value.weight"],
             "attn.v.bias": sd[p + "attention.attention.value.bias"],
+            "attn.proj.weight": sd[p + "attention.output.dense.weight"],
+            "attn.proj.bias": sd[p + "attention.output.dense.bias"],
+            "norm2.weight": sd[p + "layernorm_after.weight"],
+            "norm2.bias": sd[p + "layernorm_after.bias"],
+            "mlp.fc1.weight": sd[p + "intermediate.dense.weight"],
+            "mlp.fc1.bias": sd[p + "intermediate.dense.bias"],
+            "mlp.fc2.weight": sd[p + "output.dense.weight"],
+            "mlp.fc2.bias": sd[p + "output.dense.bias"],
+        }
+    if family == "videomae":
+        p = f"videomae.encoder.layer.{ii}."
+        qb = sd[p + "attention.attention.q_bias"]
+        return {
+            "norm1.weight": sd[p + "layernorm_before.weight"],
+            "norm1.bias": sd[p + "layernorm_before.bias"],
+            "attn.q.weight": sd[p + "attention.attention.query.weight"],
+            "attn.q.bias": qb,
+            "attn.k.weight": sd[p + "attention.attention.key.weight"],
+            "attn.k.bias": torch.zeros_like(qb),  # videomae has no k bias
+            "attn.v.weight": sd[p + "attention.attention.value.weight"],
+            "attn.v.bias": sd[p + "attention.attention.v_bias"],
             "attn.proj.weight": sd[p + "attention.output.dense.weight"],
             "attn.proj.bias": sd[p + "attention.output.dense.bias"],
             "norm2.weight": sd[p + "layernorm_after.weight"],
@@ -99,6 +132,36 @@ def inflate_patch_kernel(w2: torch.Tensor, p: int) -> torch.Tensor:
     return w.reshape(D, p * p * p).contiguous()
 
 
+def _resample_sum(n_in: int, n_out: int) -> torch.Tensor:
+    # [n_out, n_in] overlap lengths of n_out equal cells with n_in equal cells, in input-cell
+    # units: every column sums to 1, so the summed weight (the response to a constant) is kept
+    edges_in = torch.arange(n_in + 1, dtype=torch.float64)
+    edges_out = torch.arange(n_out + 1, dtype=torch.float64) * n_in / n_out
+    lo = torch.maximum(edges_out[:-1, None], edges_in[None, :-1])
+    hi = torch.minimum(edges_out[1:, None], edges_in[None, 1:])
+    return (hi - lo).clamp(min=0).float()
+
+
+# (time, rows, cols) -> (x, y, z) permutation per natinit.time_axis
+_TIME_AXIS_PERM = {"z": (1, 2, 0), "x": (0, 1, 2), "y": (1, 0, 2)}
+
+
+def inflate_tubelet_kernel(w5: torch.Tensor, p: int, time_axis: str = "z") -> torch.Tensor:
+    """[D, C, T, k, k] video tubelet kernel -> [D, p*p*p] canonical 1 mm kernel (px py pz).
+
+    RGB summed, then each of the 3 axes resampled sum-preservingly to p cells: a 1 mm voxel
+    gathers the (fractional) weights of the pixels / frames it covers (T=2 -> 8: each frame
+    spreads over 4 slices at 1/4 weight; k=16 -> 8: 2x2 pixel sums, as in the 2D inflation).
+    A volume that is constant within the cells of a frame / pixel gives exactly the video
+    response. time_axis z: time -> z (slices), rows -> x, cols -> y; x: time -> x, rows -> y,
+    cols -> z; y: rows -> x, time -> y, cols -> z."""
+    D, _, T, kh, kw = w5.shape
+    w = w5.float().sum(dim=1)  # [D, T, kh, kw]
+    w = torch.einsum("dthw,it,jh,kw->dijk", w, _resample_sum(T, p), _resample_sum(kh, p), _resample_sum(kw, p))
+    w = w.permute(0, *(1 + a for a in _TIME_AXIS_PERM[time_axis]))
+    return w.reshape(D, p * p * p).contiguous()
+
+
 @torch.no_grad()
 def apply_natural_init(model, cfg) -> dict:
     """Copy blocks + final norm (and with cfg.embed the inflated patch embedding) into model."""
@@ -109,11 +172,8 @@ def apply_natural_init(model, cfg) -> dict:
     family = _family(sd)
     report = {"family": family, "path": str(path), "copied": [], "mismatch": [], "skipped": []}
 
-    n_src = 1 + max(
-        int(k.split(".")[3 if family == "mae" else 1])
-        for k in sd
-        if k.startswith("vit.encoder.layer." if family == "mae" else "blocks.")
-    )
+    layer_prefix = {"mae": "vit.encoder.layer.", "videomae": "videomae.encoder.layer."}.get(family, "blocks.")
+    n_src = 1 + max(int(k[len(layer_prefix):].split(".")[0]) for k in sd if k.startswith(layer_prefix))
     if n_src != len(model.blocks):
         report["mismatch"].append(f"depth {n_src} vs ours {len(model.blocks)}")
     for ii, block in enumerate(model.blocks[: min(n_src, len(model.blocks))]):
@@ -133,7 +193,10 @@ def apply_natural_init(model, cfg) -> dict:
         block.load_state_dict(ours)
     report["copied"].append(f"{min(n_src, len(model.blocks))} blocks (q k v proj fc1 fc2 norm1 norm2)")
 
-    nw, nb = ("vit.layernorm.weight", "vit.layernorm.bias") if family == "mae" else ("norm.weight", "norm.bias")
+    nw, nb = {
+        "mae": ("vit.layernorm.weight", "vit.layernorm.bias"),
+        "videomae": ("videomae.layernorm.weight", "videomae.layernorm.bias"),
+    }.get(family, ("norm.weight", "norm.bias"))
     if model.norm.weight.shape == sd[nw].shape:
         model.norm.weight.copy_(sd[nw])
         model.norm.bias.copy_(sd[nb])
@@ -142,18 +205,27 @@ def apply_natural_init(model, cfg) -> dict:
         report["mismatch"].append(f"final norm {tuple(sd[nw].shape)} vs {tuple(model.norm.weight.shape)}")
 
     if cfg.embed:
-        pw = "vit.embeddings.patch_embeddings.projection." if family == "mae" else "patch_embed.proj."
+        pw = {
+            "mae": "vit.embeddings.patch_embeddings.projection.",
+            "videomae": "videomae.embeddings.patch_embeddings.projection.",
+        }.get(family, "patch_embed.proj.")
         w2 = sd[pw + "weight"]
         b2 = sd.get(pw + "bias", torch.zeros(w2.shape[0], dtype=w2.dtype))  # clip: no patch bias
         p = model.patch_embed.patch_size if hasattr(model.patch_embed, "patch_size") else model.patch_size[0]
-        w3 = inflate_patch_kernel(w2, p)
+        if w2.dim() == 5:  # video tubelet (videomae, omnimae)
+            time_axis = cfg.get("time_axis", "z")
+            w3 = inflate_tubelet_kernel(w2, p, time_axis)
+            how = f"tubelet: rgb sum, time {w2.shape[2]} -> {p} along {time_axis}, {w2.shape[3]} -> {p} in-plane"
+        else:
+            w3 = inflate_patch_kernel(w2, p)
+            how = f"rgb sum, pool to {p}x{p}, /{p} along z"
         if w3.shape != model.patch_embed.weight.shape:
             report["mismatch"].append(f"patch embed {tuple(w3.shape)} vs {tuple(model.patch_embed.weight.shape)}")
         else:
             model.patch_embed.weight.copy_(w3)
             model.patch_embed.bias.copy_(b2)
             report["copied"].append(
-                f"patch embed inflated {tuple(w2.shape)} -> {tuple(w3.shape)} (rgb sum, pool to {p}x{p}, /{p} along z)"
+                f"patch embed inflated {tuple(w2.shape)} -> {tuple(w3.shape)} ({how})"
             )
     else:
         report["skipped"].append("patch embed kept random")
@@ -163,6 +235,8 @@ def apply_natural_init(model, cfg) -> dict:
             wt.mul_(cfg.pos_scale)
     report["skipped"].append(f"pos embed random (x{cfg.pos_scale}), decoder / heads random")
     unused = ["cls token", "pos embed" if family == "mae" or "pos_embed" in sd else "RoPE (no pos embed)"]
+    if family == "videomae":
+        unused = ["fixed sinusoidal pos table", "mae decoder (384 wide)", "(no k bias in src: zero)"]
     if family == "mae":
         unused.append("mae decoder")
     unused += [n for n, key in (("registers", "reg_token"), ("norm_pre (ln_pre)", "norm_pre.weight"),
