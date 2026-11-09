@@ -5,8 +5,16 @@
 # I3D-style into the 1 mm canonical NativeEmbed kernel. Position embeddings stay random.
 #
 # Supported checkpoints (local safetensors, compute nodes have no network):
-#   mae:    facebook/vit-mae-base (HF ViTMAEForPreTraining, separate q/k/v)
-#   dinov2: timm/vit_base_patch14_dinov2.lvd142m (fused qkv, LayerScale folded into proj / fc2)
+#   mae:  facebook/vit-mae-base (HF ViTMAEForPreTraining, separate q/k/v)
+#   timm: any timm-layout ViT-B (fused qkv): dinov2 (+reg4), dinov3, siglip, clip, ibot (converted
+#         from the bytedance teacher .pth, "backbone." prefix stripped).
+#         LayerScale (ls1.gamma / gamma_1) folds into proj / fc2; a missing qkv bias (dinov3) is
+#         zero. Not carried over (reported): registers, cls token, pos embed / RoPE (dinov3 is a
+#         RoPE model, its attention was trained with rotary positions; ours get additive random
+#         pos), clip norm_pre (ln_pre before block 0). Activation: ours is exact GELU, as are the
+#         timm siglip v2 / clip laion2b / ibot / dino ones (openai clip uses quick_gelu: not used).
+#         Checked 11-09 on CPU: every block and the final norm match timm (rope=None for dinov3)
+#         to <=1e-4 relative; mae and dinov2 loads are bitwise those of a039eaf.
 
 import logging
 from pathlib import Path
@@ -22,7 +30,7 @@ def _family(sd: dict) -> str:
     if "vit.encoder.layer.0.attention.attention.query.weight" in sd:
         return "mae"
     if "blocks.0.attn.qkv.weight" in sd:
-        return "dinov2"
+        return "timm"
     raise ValueError("natinit: unknown checkpoint layout")
 
 
@@ -50,8 +58,14 @@ def _block_tensors(sd: dict, family: str, ii: int) -> dict[str, torch.Tensor]:
         }
     p = f"blocks.{ii}."
     q, k, v = sd[p + "attn.qkv.weight"].chunk(3, dim=0)
-    qb, kb, vb = sd[p + "attn.qkv.bias"].chunk(3, dim=0)
-    g1, g2 = sd[p + "ls1.gamma"], sd[p + "ls2.gamma"]
+    qkvb = sd.get(p + "attn.qkv.bias")
+    if qkvb is None:  # dinov3: no qkv bias in the checkpoint
+        qkvb = torch.zeros(sd[p + "attn.qkv.weight"].shape[0], dtype=q.dtype)
+    qb, kb, vb = qkvb.chunk(3, dim=0)
+    # LayerScale (dinov2 ls1.gamma, dinov3 gamma_1); absent (siglip, clip, ibot) = 1
+    one = torch.ones(sd[p + "attn.proj.weight"].shape[0], dtype=q.dtype)
+    g1 = sd.get(p + "ls1.gamma", sd.get(p + "gamma_1", one))
+    g2 = sd.get(p + "ls2.gamma", sd.get(p + "gamma_2", one))
     # x + ls1 * proj(a) = x + (g1 W) a + g1 b
     return {
         "norm1.weight": sd[p + "norm1.weight"],
@@ -90,6 +104,8 @@ def apply_natural_init(model, cfg) -> dict:
     """Copy blocks + final norm (and with cfg.embed the inflated patch embedding) into model."""
     path = Path(cfg.path)
     sd = load_file(str(path / "model.safetensors") if path.is_dir() else str(path))
+    if any(k.startswith("backbone.") for k in sd):  # ibot / dino teacher
+        sd = {k[len("backbone."):]: v for k, v in sd.items() if k.startswith("backbone.")}
     family = _family(sd)
     report = {"family": family, "path": str(path), "copied": [], "mismatch": [], "skipped": []}
 
@@ -127,7 +143,8 @@ def apply_natural_init(model, cfg) -> dict:
 
     if cfg.embed:
         pw = "vit.embeddings.patch_embeddings.projection." if family == "mae" else "patch_embed.proj."
-        w2, b2 = sd[pw + "weight"], sd[pw + "bias"]
+        w2 = sd[pw + "weight"]
+        b2 = sd.get(pw + "bias", torch.zeros(w2.shape[0], dtype=w2.dtype))  # clip: no patch bias
         p = model.patch_embed.patch_size if hasattr(model.patch_embed, "patch_size") else model.patch_size[0]
         w3 = inflate_patch_kernel(w2, p)
         if w3.shape != model.patch_embed.weight.shape:
@@ -145,9 +162,14 @@ def apply_natural_init(model, cfg) -> dict:
         for wt in (model.pos_embed.weight_x, model.pos_embed.weight_y, model.pos_embed.weight_z):
             wt.mul_(cfg.pos_scale)
     report["skipped"].append(f"pos embed random (x{cfg.pos_scale}), decoder / heads random")
-    report["skipped"].append(
-        "src unused: cls token, pos embed" + (", mae decoder" if family == "mae" else "")
-    )
+    unused = ["cls token", "pos embed" if family == "mae" or "pos_embed" in sd else "RoPE (no pos embed)"]
+    if family == "mae":
+        unused.append("mae decoder")
+    unused += [n for n, key in (("registers", "reg_token"), ("norm_pre (ln_pre)", "norm_pre.weight"),
+                                ("attn_pool head", "attn_pool.q.weight"), ("head", "head.weight")) if key in sd]
+    if family == "timm" and "blocks.0.attn.qkv.bias" not in sd:
+        unused.append("(no qkv bias in src: zero)")
+    report["skipped"].append("src unused: " + ", ".join(unused))
     logger.info(f"natinit: {report}")
     return report
 
