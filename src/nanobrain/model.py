@@ -85,6 +85,22 @@ class ViTMAE3D(nn.Module):
         jepa_weight: float = 0.0,
         jepa_momentum: float = 0.996,
         jepa_view: str = "target",
+        # pixel_weight scales the pixel stack (mse + grad + level-set loss); 0 = off (the decoder
+        # still runs when jepa needs its features, else it is skipped). 1.0 = the base, bitwise
+        pixel_weight: float = 1.0,
+        # iBOT self-distillation (weight; 0 = off, no params). the student encoder sees the whole
+        # sequence (visible tokens + ibot_mask_token at the predicted positions) behind a cls token;
+        # ibot_head (shared mlp, l2 bottleneck, weight-normed cls / patch prototypes) on the student
+        # cls and predicted-position tokens matches the EMA teacher's centered, sharpened
+        # distributions (teacher sees the whole sequence unmasked): patch loss on the predicted
+        # tokens of the same sequence, cls loss across the image's two sequences. the teacher is the
+        # jepa teacher (momentum jepa_momentum -> 1 cosine). natinit.head loads the pretrained head
+        ibot_weight: float = 0.0,
+        ibot_cls_weight: float = 1.0,
+        ibot_dim: int = 8192,
+        ibot_temp_s: float = 0.1,
+        ibot_temp_t: float = 0.07,
+        ibot_center: float = 0.9,
     ):
         super().__init__()
         self.norm_target = norm_target
@@ -199,6 +215,22 @@ class ViTMAE3D(nn.Module):
             assert native and not class_tokens, "jepa: native, no class tokens"
             self.jepa_head = nn.Linear(decoder_embed_dim, embed_dim)
             self.jepa_head.apply(_init_weights)
+        self.pixel_weight = float(pixel_weight)
+        self.ibot_weight = float(ibot_weight)
+        self.ibot_cls_weight = float(ibot_cls_weight)
+        self.ibot_temp_s, self.ibot_temp_t, self.ibot_center_m = ibot_temp_s, ibot_temp_t, ibot_center
+        self.ibot_head = None
+        self.ibot_stats = {}
+        self._teacher_keys = self._TEACHER_KEYS
+        if self.ibot_weight:
+            assert native and not class_tokens, "ibot: native, no class tokens"
+            assert not self.jepa_weight, "ibot and jepa share the teacher inputs: one at a time"
+            self.ibot_head = IBOTHead(embed_dim, ibot_dim)
+            self.ibot_mask_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+            nn.init.normal_(self.ibot_mask_token, std=0.02)
+            self.register_buffer("ibot_center", torch.zeros(1, ibot_dim))
+            self.register_buffer("ibot_center2", torch.zeros(1, ibot_dim))
+            self._teacher_keys = self._TEACHER_KEYS + ("ibot_head",)
 
     @classmethod
     def from_config(cls, args: dict) -> "ViTMAE3D":
@@ -507,7 +539,7 @@ class ViTMAE3D(nn.Module):
 
     def teacher(self) -> nn.ModuleDict:
         if not self._teacher:
-            t = nn.ModuleDict({k: copy.deepcopy(getattr(self, k)) for k in self._TEACHER_KEYS})
+            t = nn.ModuleDict({k: copy.deepcopy(getattr(self, k)) for k in self._teacher_keys})
             t.requires_grad_(False)
             self._teacher.append(t)
         return self._teacher[0]
@@ -516,6 +548,26 @@ class ViTMAE3D(nn.Module):
         # encode_tokens with the teacher's weights (no class tokens)
         t = self._teacher[0]
         x = t["pos_embed"](x, coord)
+        for block in t["blocks"]:
+            x = block(x)
+        return t["norm"](x)
+
+    @property
+    def uses_teacher(self) -> bool:
+        return self.jepa_head is not None or self.ibot_head is not None
+
+    def ibot_encode(self, x: Tensor, coord: Tensor) -> Tensor:
+        # encode_tokens behind the ibot cls token (no position): [B, 1 + N, D]
+        x = self.pos_embed(x, coord)
+        x = torch.cat([self.ibot_head.cls_token.expand(x.shape[0], -1, -1).to(x.dtype), x], dim=1)
+        for block in self.blocks:
+            x = block(x)
+        return self.norm(x)
+
+    def teacher_encode_cls(self, x: Tensor, coord: Tensor) -> Tensor:
+        t = self._teacher[0]
+        x = t["pos_embed"](x, coord)
+        x = torch.cat([t["ibot_head"].cls_token.expand(x.shape[0], -1, -1).to(x.dtype), x], dim=1)
         for block in t["blocks"]:
             x = block(x)
         return t["norm"](x)
@@ -529,7 +581,7 @@ class ViTMAE3D(nn.Module):
         m = 1.0 - (1.0 - m0) * (math.cos(math.pi * min(max(progress, 0.0), 1.0)) + 1.0) / 2.0
         t = self._teacher[0]
         t_params, s_params = [], []
-        for k in self._TEACHER_KEYS:
+        for k in self._teacher_keys:
             t_params += list(t[k].parameters())
             s_params += list(getattr(self, k).parameters())
         torch._foreach_lerp_(t_params, s_params, 1.0 - m)
@@ -618,7 +670,7 @@ class ViTMAE3D(nn.Module):
             part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
             if self.level_head is not None:
                 part["vis_patches"], part["vis_mask"] = vis_patches, mask_patches[:, :num_visible]
-            if self.jepa_head is not None and self.training:
+            if self.uses_teacher and self.training:
                 part["seq_patches"], part["coord"] = patches, coord
 
         def cat(key: str) -> Tensor:
@@ -632,11 +684,54 @@ class ViTMAE3D(nn.Module):
                 return tensors[0].flatten()
             return torch.cat([t.flatten() for t in tensors])
 
-        embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
-        feats = self.decode_features(embeds, cat("target_coord"))
+        ibot_loss = None
+        if self.ibot_head is not None and self.training:
+            # student: visible tokens + mask tokens at the predicted positions, behind the cls token
+            vis = cat("embeds")
+            x = torch.cat([vis, self.ibot_mask_token.to(vis.dtype).expand(vis.shape[0], num_predict, -1)], 1)
+            out = self.ibot_encode(x, torch.cat([cat("vis_coord"), cat("target_coord")], 1))
+            embeds = out[:, 1 : 1 + num_visible].contiguous()
+            ibot_loss = self.ibot_aux(parts, out[:, 0], out[:, 1 + num_visible :], num_visible, num_samples)
+        else:
+            embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
         jepa_loss = None
-        if self.jepa_head is not None and self.training:
-            jepa_loss = self.jepa_aux(parts, feats, num_visible)
+        if self.pixel_weight or self.jepa_head is not None:
+            feats = self.decode_features(embeds, cat("target_coord"))
+            if self.jepa_head is not None and self.training:
+                jepa_loss = self.jepa_aux(parts, feats, num_visible)
+        if self.pixel_weight:
+            loss = self.pixel_weight * self.pixel_loss(parts, feats, embeds, head_ws, num_samples)
+        else:
+            loss = embeds.new_zeros((), dtype=torch.float32)
+            for part in parts:
+                part.pop("vis_patches", None), part.pop("vis_mask", None)
+        if self.fino_heads is not None and fino_meta is not None:
+            # the global embedding of each sequence: mean of its visible encoder tokens (eval:
+            # mean of all brain-touching tokens); rows are part by part, image-major
+            pooled = embeds[:, self.class_tokens :].mean(dim=1)
+            # fino_meta stays on the cpu: one pinned non blocking copy, no sync with the gpu queue
+            rows = torch.tensor([ii for part in parts for ii in part["ids"]]).repeat_interleave(num_samples)
+            meta = fino_meta.cpu()[rows]
+            if device.type == "cuda":
+                meta = meta.pin_memory().to(device, non_blocking=True)
+            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
+            loss = loss + fino_loss
+
+        if jepa_loss is not None:
+            loss = loss + self.jepa_weight * jepa_loss
+        if ibot_loss is not None:
+            loss = loss + self.ibot_weight * ibot_loss
+
+        if not with_state:
+            return loss
+        return loss, {"parts": parts, "embeds": embeds}
+
+    def pixel_loss(self, parts: list[dict], feats: Tensor, embeds: Tensor, head_ws: dict, num_samples: int) -> Tensor:
+        def flat_cat(tensors: list[Tensor]) -> Tensor:
+            if len(tensors) == 1:
+                return tensors[0].flatten()
+            return torch.cat([t.flatten() for t in tensors])
+
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
         # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
@@ -694,24 +789,7 @@ class ViTMAE3D(nn.Module):
                 )
                 num, den = num + n, den + d
             loss = loss + self.level_weight * num / den.clamp_min(1e-6)
-        if self.fino_heads is not None and fino_meta is not None:
-            # the global embedding of each sequence: mean of its visible encoder tokens (eval:
-            # mean of all brain-touching tokens); rows are part by part, image-major
-            pooled = embeds[:, self.class_tokens :].mean(dim=1)
-            # fino_meta stays on the cpu: one pinned non blocking copy, no sync with the gpu queue
-            rows = torch.tensor([ii for part in parts for ii in part["ids"]]).repeat_interleave(num_samples)
-            meta = fino_meta.cpu()[rows]
-            if device.type == "cuda":
-                meta = meta.pin_memory().to(device, non_blocking=True)
-            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
-            loss = loss + fino_loss
-
-        if jepa_loss is not None:
-            loss = loss + self.jepa_weight * jepa_loss
-
-        if not with_state:
-            return loss
-        return loss, {"parts": parts, "embeds": embeds}
+        return loss
 
     def jepa_aux(self, parts: list[dict], feats: Tensor, num_visible: int) -> Tensor:
         # latent prediction loss on the predicted tokens, weighted by their in-mask fraction
@@ -746,12 +824,55 @@ class ViTMAE3D(nn.Module):
         self.jepa_stats["pred_std"] = pred.detach().std(dim=0).mean()
         return loss
 
+    def ibot_aux(self, parts: list[dict], s_cls: Tensor, s_patch: Tensor, num_visible: int, num_samples: int) -> Tensor:
+        # iBOT: patch self-distillation on the predicted tokens (teacher sees them unmasked) +
+        # cls self-distillation across the two sequences of each image (rows 2i, 2i + 1)
+        assert num_samples == 2, "ibot pairs the two sequences of each image for the cls loss"
+        teacher = self.teacher()
+        with torch.no_grad():
+            sps = [part["spacing"] for part in parts if part["spacing"] != (1.0, 1.0, 1.0)]
+            ws = {}
+            if sps:
+                ws = teacher["patch_embed"].native_weights(sps, [part["patch"] for part in parts
+                                                                if part["spacing"] in sps])
+                ws = dict(zip(sps, ws))
+            xs, cs = [], []
+            for part in parts:
+                seq, coord = part.pop("seq_patches"), part.pop("coord")
+                sp = part["spacing"]
+                xs.append(teacher["patch_embed"].native(seq, sp, part["patch"], ws.get(sp)))
+                cs.append(coord)
+            x = xs[0].contiguous() if len(xs) == 1 else torch.cat(xs)
+            c = cs[0].contiguous() if len(cs) == 1 else torch.cat(cs)
+            t = self.teacher_encode_cls(x, c)
+            t_cls, t_patch = teacher["ibot_head"](t[:, 0], t[:, 1 + num_visible :])
+            t_cls, t_patch = t_cls.float(), t_patch.float()
+            p_cls = F.softmax((t_cls - self.ibot_center) / self.ibot_temp_t, dim=-1)
+            p_patch = F.softmax((t_patch - self.ibot_center2) / self.ibot_temp_t, dim=-1)
+            m = self.ibot_center_m
+            self.ibot_center.mul_(m).add_(t_cls.mean(dim=0, keepdim=True), alpha=1.0 - m)
+            self.ibot_center2.mul_(m).add_(t_patch.mean(dim=(0, 1)).unsqueeze(0), alpha=1.0 - m)
+        s_cls, s_patch = self.ibot_head(s_cls, s_patch)
+        logp_patch = F.log_softmax(s_patch.float() / self.ibot_temp_s, dim=-1)
+        w = torch.cat([part["target_mask_patches"].float().mean(-1) for part in parts])
+        patch = (w * -(p_patch * logp_patch).sum(-1)).sum() / w.sum().clamp_min(1e-6)
+        swap = torch.arange(s_cls.shape[0], device=s_cls.device) ^ 1
+        cls = -(p_cls[swap] * F.log_softmax(s_cls.float() / self.ibot_temp_s, dim=-1)).sum(-1).mean()
+        self.ibot_stats["patch"] = patch.detach()
+        self.ibot_stats["cls"] = cls.detach()
+        # teacher entropy (collapse: -> 0 one prototype, -> log(dim) uniform)
+        self.ibot_stats["t_ent"] = -(p_patch * p_patch.clamp_min(1e-12).log()).sum(-1).mean()
+        return patch + self.ibot_cls_weight * cls
+
     def compile_native(self, **kwargs) -> None:
         # the fixed-shape transformer parts. per-spacing tokenization, embedding and head stay eager
         self.encode_tokens = torch.compile(self.encode_tokens, **kwargs)
         self.decode_features = torch.compile(self.decode_features, **kwargs)
         if self.jepa_head is not None:
             self.teacher_encode = torch.compile(self.teacher_encode, **kwargs)
+        if self.ibot_head is not None:
+            self.ibot_encode = torch.compile(self.ibot_encode, **kwargs)
+            self.teacher_encode_cls = torch.compile(self.teacher_encode_cls, **kwargs)
 
     def compile_cudagraphs(self) -> None:
         # training speed, same math: sampling + gather compiled as usual, the encoder / decoder / loss
@@ -822,6 +943,31 @@ class ViTMAE3D(nn.Module):
                 output["dense_mask"] = in_mask.reshape(patch_grid_size)
             outputs.append(output)
         return outputs
+
+
+class IBOTHead(nn.Module):
+    # iBOT head (shared_head): 3-layer gelu mlp -> l2-normalized 256 bottleneck -> weight-normalized
+    # prototypes with g = 1 (norm_last_layer): last_v = cls prototypes, last2_v = patch prototypes.
+    # also holds the ibot cls token (prepended to student and teacher sequences, no position)
+    def __init__(self, in_dim: int, out_dim: int, hidden: int = 2048, bottleneck: int = 256):
+        super().__init__()
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, in_dim))
+        nn.init.normal_(self.cls_token, std=0.02)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU(),
+            nn.Linear(hidden, bottleneck),
+        )
+        self.mlp.apply(_init_weights)
+        self.last_v = nn.Parameter(torch.empty(out_dim, bottleneck))
+        self.last2_v = nn.Parameter(torch.empty(out_dim, bottleneck))
+        nn.init.normal_(self.last_v, std=0.02)
+        nn.init.normal_(self.last2_v, std=0.02)
+
+    def forward(self, cls: Tensor, patch: Tensor) -> tuple[Tensor, Tensor]:
+        zc = F.normalize(self.mlp(cls), dim=-1)
+        zp = F.normalize(self.mlp(patch), dim=-1)
+        wc, wp = F.normalize(self.last_v, dim=-1), F.normalize(self.last2_v, dim=-1)
+        return F.linear(zc, wc.to(zc.dtype)), F.linear(zp, wp.to(zp.dtype))
 
 
 @register_model

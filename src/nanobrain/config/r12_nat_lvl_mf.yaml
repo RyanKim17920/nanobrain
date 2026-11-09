@@ -35,6 +35,14 @@ model_kwargs:
   jepa_weight: 0.0
   jepa_momentum: 0.996
   jepa_view: target
+  # pixel stack weight (1 = base) and the iBOT self-distillation objective (model.py; 0 = off)
+  pixel_weight: 1.0
+  ibot_weight: 0.0
+  ibot_cls_weight: 1.0
+  ibot_dim: 8192
+  ibot_temp_s: 0.1
+  ibot_temp_t: 0.07
+  ibot_center: 0.9
 batch_size: 32
 accum_iter: 1
 base_lr: 0.002

@@ -7,6 +7,10 @@
 # Supported checkpoints (local safetensors, compute nodes have no network):
 #   mae:    facebook/vit-mae-base (HF ViTMAEForPreTraining, separate q/k/v)
 #   dinov2: timm/vit_base_patch14_dinov2.lvd142m (fused qkv, LayerScale folded into proj / fc2)
+#   ibot:   bytedance/ibot vitb_16_rand_mask teacher backbone, converted by scripts/convert_ibot.py
+#           (same timm layout, no LayerScale). cfg.head (its head.safetensors) also loads the
+#           pretrained iBOT projection head + prototypes, cls token, mask token and loss centers
+#           into model.ibot_head (model_kwargs.ibot_weight > 0), so student and teacher start matched
 
 import logging
 from pathlib import Path
@@ -51,7 +55,9 @@ def _block_tensors(sd: dict, family: str, ii: int) -> dict[str, torch.Tensor]:
     p = f"blocks.{ii}."
     q, k, v = sd[p + "attn.qkv.weight"].chunk(3, dim=0)
     qb, kb, vb = sd[p + "attn.qkv.bias"].chunk(3, dim=0)
-    g1, g2 = sd[p + "ls1.gamma"], sd[p + "ls2.gamma"]
+    # LayerScale (dinov2) folded in; layouts without it (ibot: dino-style timm vit) use 1
+    one = torch.ones_like(sd[p + "attn.proj.bias"])
+    g1, g2 = sd.get(p + "ls1.gamma", one), sd.get(p + "ls2.gamma", one)
     # x + ls1 * proj(a) = x + (g1 W) a + g1 b
     return {
         "norm1.weight": sd[p + "norm1.weight"],
@@ -148,8 +154,30 @@ def apply_natural_init(model, cfg) -> dict:
     report["skipped"].append(
         "src unused: cls token, pos embed" + (", mae decoder" if family == "mae" else "")
     )
+    if cfg.get("head"):
+        report["copied"].append(load_ibot_head(model, cfg.head))
     logger.info(f"natinit: {report}")
     return report
+
+
+@torch.no_grad()
+def load_ibot_head(model, path: str) -> str:
+    # pretrained iBOT head (shared mlp; last_layer = cls prototypes, last_layer2 = patch prototypes,
+    # weight-normalized with g = 1), its cls token, the student's mask token and the loss centers
+    assert getattr(model, "ibot_head", None) is not None, "natinit.head needs model_kwargs.ibot_weight > 0"
+    sd = load_file(str(path))
+    h = model.ibot_head
+    for ii in (0, 2, 4):
+        h.mlp[ii].weight.copy_(sd[f"mlp.{ii}.weight"])
+        h.mlp[ii].bias.copy_(sd[f"mlp.{ii}.bias"])
+    assert h.last_v.shape == sd["last_layer.weight_v"].shape, (h.last_v.shape, sd["last_layer.weight_v"].shape)
+    h.last_v.copy_(sd["last_layer.weight_v"])
+    h.last2_v.copy_(sd["last_layer2.weight_v"])
+    h.cls_token.copy_(sd["cls_token"].reshape(h.cls_token.shape))
+    model.ibot_mask_token.copy_(sd["masked_embed"].reshape(model.ibot_mask_token.shape))
+    model.ibot_center.copy_(sd["center"].reshape(model.ibot_center.shape))
+    model.ibot_center2.copy_(sd["center2"].reshape(model.ibot_center2.shape))
+    return f"ibot head {path} (mlp, 2x{h.last_v.shape[0]} prototypes, cls, mask token, centers)"
 
 
 def is_natinit_param(name: str) -> bool:

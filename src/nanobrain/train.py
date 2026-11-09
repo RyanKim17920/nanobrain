@@ -469,7 +469,7 @@ def train(
             max_norm=args.clip_grad,
         )
 
-        if need_update and model_without_ddp.jepa_head is not None:
+        if need_update and model_without_ddp.uses_teacher:
             if time_schedule:
                 wall = prev_wall_time + time.monotonic() - start_time
                 progress = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
@@ -500,6 +500,8 @@ def train(
                     log_stats[f"fino_{k}"] = float(v)
             for k, v in model_without_ddp.jepa_stats.items():
                 log_stats[f"jepa_{k}"] = float(v)
+            for k, v in model_without_ddp.ibot_stats.items():
+                log_stats[f"ibot_{k}"] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)

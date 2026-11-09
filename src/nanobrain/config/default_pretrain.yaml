@@ -166,6 +166,8 @@ natinit:
   # layer-wise lr decay over the pretrained blocks: block i gets block_lr_mult * layer_decay ** (depth - 1 - i)
   layer_decay: 1.0
   pos_scale: 1.0
+  # ibot only: head.safetensors of scripts/convert_ibot.py (pretrained iBOT head + centers); null = off
+  head: null
 
 wandb: false
 wandb_entity: null
