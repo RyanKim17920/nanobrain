@@ -136,6 +136,7 @@ def main(args: DictConfig):
     # model
     model = ViTMAE3D.from_config(args)
     model.decoder_prune_last = args.decoder_prune_last
+    model.level_batched = bool(args.get("level_batched", False))
     if args.get("natinit") and args.natinit.enabled:
         # natural-image pretrained blocks (+ inflated patch embedding). a resumed checkpoint
         # (misc.load_model below) overwrites this, as it should
@@ -155,8 +156,10 @@ def main(args: DictConfig):
         model = DDP(model, broadcast_buffers=False)
 
     if args.compile and args.native:
-        # the image shapes vary, so only the fixed-shape transformer parts compile
-        model_without_ddp.compile_native()
+        # the image shapes vary, so only the fixed-shape transformer parts compile. cudagraphs:
+        # those parts (fixed shapes) replay as cuda graphs, fwd and bwd
+        assert not (args.cudagraphs and args.distributed), "cudagraphs is single gpu only"
+        model_without_ddp.compile_native(**({"mode": "reduce-overhead"} if args.cudagraphs else {}))
     elif args.compile and args.cudagraphs:
         assert not args.distributed, "cudagraphs is single gpu only"
         model_without_ddp.compile_cudagraphs()

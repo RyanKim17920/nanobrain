@@ -70,10 +70,13 @@ amp: true
 amp_dtype: bfloat16
 compile: true
 gc_freeze: true
-cudagraphs: false
+# ms-speed: the compiled encoder / decoder (fixed shapes) replay as cuda graphs, fwd and bwd
+cudagraphs: true
 fast_startup: true
 high_priority_stream: true
 decoder_prune_last: true
+# ms-speed: forward_native's level-set loss in one head pass / one bce over all spacing groups
+level_batched: true
 flash_attention_impl: FA3
 ckpt: null
 resume: false

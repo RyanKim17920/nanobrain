@@ -158,6 +158,8 @@ class ViTMAE3D(nn.Module):
             self.register_buffer("level_thresholds", torch.tensor(levels), persistent=False)
         # training speed, set by train.py (not a model kwarg): see decode_features
         self.decoder_prune_last = False
+        # training speed, set by train.py (not a model kwarg): forward_native's level loss in one pass
+        self.level_batched = False
         self.decoder_pos_embed = SeparablePosEmbed3D(patch_grid_size, decoder_embed_dim)
         self.mask_token = nn.Parameter(torch.empty(1, 1, decoder_embed_dim))
 
@@ -706,7 +708,28 @@ class ViTMAE3D(nn.Module):
         residuals = (self.patch_embed.residual, self.decoder_head.residual)
         residuals += (self.decoder_head.bias_residual,)
         loss = loss + 0.0 * sum(r.sum() for r in residuals)
-        if self.level_head is not None:
+        if self.level_head is not None and self.level_batched:
+            # level_terms with one head pass and one bce over all parts (speed, same sums): the
+            # per-part targets are [rows, V, levels * sub^3] for every patch shape
+            with torch.no_grad():
+                tw = [
+                    level_targets(
+                        part.pop("vis_patches"), part.pop("vis_mask"), self.level_thresholds,
+                        *(
+                            adaptive_pool_matrix(n, self.patch_size[0] // self.level_pool, device)
+                            for n in part["patch"]
+                        ),
+                    )
+                    for part in parts
+                ]
+                target = torch.cat([t for t, _ in tw]) if len(tw) > 1 else tw[0][0]
+                weight = torch.cat([w for _, w in tw]) if len(tw) > 1 else tw[0][1]
+            logits = self.level_head(embeds[:, self.class_tokens :]).float()
+            bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+            num = (weight * bce).sum()
+            den = weight.sum()  # weight is repeated over the levels: level_terms' weight.sum() * L
+            loss = loss + self.level_weight * num / den.clamp_min(1e-6)
+        elif self.level_head is not None:
             num, den = 0.0, 0.0
             rows = torch.split(embeds, [len(part["ids"]) * num_samples for part in parts])
             for part, tokens in zip(parts, rows):
@@ -826,6 +849,27 @@ def vit_mae_3d(checkpoint: str, random_weights: bool = False) -> ViTMAE3D:
     if not random_weights:
         model.load_state_dict(ckpt["model"])
     return model
+
+
+def level_targets(
+    patches: Tensor, mask: Tensor, thresholds: Tensor, ax: Tensor, ay: Tensor, az: Tensor
+) -> tuple[Tensor, Tensor]:
+    # ViTMAE3D.level_terms' (target, weight) without the head: [rows, V, L * sub^3] each (weight
+    # repeated over the L levels), adaptive_avg_pool3d as separable bin-averaging matrices
+    # (adaptive_pool_matrix, [sub, patch voxels] per axis)
+    (sub, px), py, pz = ax.shape, ay.shape[1], az.shape[1]
+    rows, V = patches.shape[:2]
+    x = patches.float().reshape(rows * V, px, py, pz)
+    m = mask.float().reshape(rows * V, px, py, pz)
+    L = thresholds.numel()
+    above = (x[:, None] > thresholds.view(1, -1, 1, 1, 1)).float() * m[:, None]
+    both = torch.cat([m[:, None], above], dim=1)  # [RV, 1 + L, px, py, pz]
+    pooled = torch.einsum("ncxyz,ix,jy,kz->ncijk", both, ax, ay, az)
+    weight = pooled[:, :1]
+    target = pooled[:, 1:] / weight.clamp_min(1e-6)
+    target = target.reshape(rows, V, L * sub**3)
+    weight = weight.expand(-1, L, -1, -1, -1).reshape(rows, V, L * sub**3)
+    return target, weight
 
 
 def patchify3d(x: Tensor, patch_size: int | tuple[int, int, int] = 8) -> Tensor:
@@ -955,6 +999,16 @@ def fit_slices(
         src.append(slice(max(0, -before), max(0, -before) + num))
         dst.append(slice(max(0, before), max(0, before) + num))
     return tuple(src), tuple(dst)
+
+
+@lru_cache(maxsize=4096)
+def adaptive_pool_matrix(size: int, out: int, device: torch.device) -> Tensor:
+    # [out, size] rows averaging adaptive_avg_pool's bins [floor(i size / out), ceil((i+1) size / out))
+    a = torch.zeros(out, size, dtype=torch.float32)
+    for i in range(out):
+        lo, hi = (i * size) // out, -((-(i + 1) * size) // out)
+        a[i, lo:hi] = 1.0 / (hi - lo)
+    return a.to(device)
 
 
 @lru_cache(maxsize=4096)
