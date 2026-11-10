@@ -88,6 +88,8 @@ class InfiniteSampler(Sampler[int]):
         # from sample index switch_at on, endless shuffled passes over late_indices only (anneal mix)
         self.late_indices = late_indices
         self.switch_at = switch_at if late_indices is not None else None
+        # optional callback run once when iteration starts (train.py: restore a resumed run's rng streams)
+        self.on_iter = None
         # optional per-image sampling weights (subject tempering): passes of num_samples draws
         # with replacement instead of permutations (None = uniform permutations, the default)
         self.weights = None
@@ -100,6 +102,9 @@ class InfiniteSampler(Sampler[int]):
         ).tolist()
 
     def __iter__(self):
+        if self.on_iter is not None:
+            on_iter, self.on_iter = self.on_iter, None
+            on_iter()
         generator = torch.Generator().manual_seed(self.seed)
         index = 0
         while self.switch_at is None or index < self.switch_at:

@@ -8,6 +8,7 @@
 
 import datetime
 import itertools
+import json
 import logging
 import os
 import queue
@@ -327,6 +328,43 @@ def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=
         checkpoint_path = output_dir / f"checkpoint-{step:07d}.pth"
         logger.info(f"saving checkpoint {checkpoint_path}")
         save_on_master(to_save, checkpoint_path)
+
+
+def save_rng_state(output_dir, step: int) -> None:
+    """The python / numpy / torch (cpu + cuda) RNG streams at `step`, one json per rank, written atomically next
+    to checkpoint-last.pth: a resumed run continues the random streams instead of replaying them from the seed."""
+    py_state = random.getstate()
+    np_state = np.random.get_state()
+    state = {
+        "step": step,
+        "python": [py_state[0], list(py_state[1]), py_state[2]],
+        "numpy": [np_state[0], np_state[1].tolist(), *np_state[2:]],
+        "torch": torch.get_rng_state().tolist(),
+        "cuda": torch.cuda.get_rng_state().tolist() if torch.cuda.is_available() else None,
+    }
+    path = Path(output_dir) / f"rng_state_rank{get_rank()}.json"
+    tmp_path = path.parent / f".tmp-{path.name}"
+    tmp_path.write_text(json.dumps(state))
+    tmp_path.replace(path)
+
+
+def load_rng_state(output_dir, step: int) -> bool:
+    """Restore save_rng_state's streams when they were saved at `step` (the resumed checkpoint's step)."""
+    path = Path(output_dir) / f"rng_state_rank{get_rank()}.json"
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    if state.get("step") != step:
+        return False
+    py_state = state["python"]
+    random.setstate((py_state[0], tuple(py_state[1]), py_state[2]))
+    np_state = state["numpy"]
+    np.random.set_state((np_state[0], np.array(np_state[1], dtype=np.uint32), *np_state[2:]))
+    torch.set_rng_state(torch.tensor(state["torch"], dtype=torch.uint8))
+    if state.get("cuda") is not None and torch.cuda.is_available():
+        torch.cuda.set_rng_state(torch.tensor(state["cuda"], dtype=torch.uint8))
+    return True
 
 
 def load_model(args, model_without_ddp, optimizer, loss_scaler) -> tuple[int, float]:
