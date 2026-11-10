@@ -142,6 +142,9 @@ def main(args: DictConfig):
         from nanobrain.natinit import apply_natural_init
 
         apply_natural_init(model, args.natinit)
+    if model.dino is not None:
+        # the EMA teacher starts from the same (pretrained) weights as the student
+        model.dino_sync_teacher()
     model.to(device)
     logger.info(f"model:\n{model}")
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -407,6 +410,9 @@ def train(
         )
 
     optimizer.zero_grad()
+    dino_head_warmup = 0
+    if model_without_ddp.dino is not None:
+        dino_head_warmup = int(model_without_ddp.dino_cfg["head_warmup_steps"])
 
     if args.high_priority_stream and device.type == "cuda":
         # model work on a high priority stream: the prep threads' kernels (priority 0 side streams)
@@ -433,6 +439,12 @@ def train(
             lr = float(lr_schedule[step])
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
+            if dino_head_warmup and step < dino_head_warmup:
+                # dino head-only warmup: the pretrained backbone (blocks, final norm, patch embed)
+                # is frozen while the fresh heads learn
+                for group in optimizer.param_groups:
+                    if group.get("backbone"):
+                        group["lr"] = 0.0
 
         # run volume processing on gpu, not cpu workers, ~25x faster (prep threads: already done)
         if batch_transform is not None:
@@ -478,6 +490,14 @@ def train(
             max_norm=args.clip_grad,
         )
 
+        if need_update and model_without_ddp.dino is not None:
+            if time_schedule:
+                wall = prev_wall_time + time.monotonic() - start_time
+                progress = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+            else:
+                progress = step / total_steps
+            model_without_ddp.dino_ema_update(progress)
+
         # log tensors without syncing, values are only read on log steps
         metric_logger.update(loss=loss_for_log)
         if need_update:
@@ -499,6 +519,8 @@ def train(
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
+            for k, v in model_without_ddp.dino_stats.items():
+                log_stats[f"dino_{k}"] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)
@@ -540,6 +562,9 @@ def train(
                 )
 
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
+        if done and model_without_ddp.dino is not None and model_without_ddp.dino_cfg["eval_teacher"]:
+            model_without_ddp.dino_teacher_to_student()
+            logger.info("dino: the evaluated encoder is the EMA teacher's")
         if is_save_step or is_last:
             misc.save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time)
 
@@ -568,7 +593,8 @@ def make_optimizer(args: DictConfig, model: nn.Module):
     muon_names = [
         n
         for n, p in model.named_parameters()
-        if is_muon_param(n, p, args.muon_encoder_only, args.muon_decoder_only, args.muon_all_matrices)
+        if p.requires_grad
+        and is_muon_param(n, p, args.muon_encoder_only, args.muon_decoder_only, args.muon_all_matrices)
     ]
     logger.info(f"muon params: {len(muon_names)} matrices")
     # natinit.block_lr_mult: lr multiplier of the pretrained encoder blocks + final norm.
@@ -587,17 +613,27 @@ def make_optimizer(args: DictConfig, model: nn.Module):
             return block_mult * layer_decay ** (depth - 1 - int(name.split(".")[1]))
         return block_mult
 
-    adamw_groups = misc.get_param_groups(model, skip_names=set(muon_names), lr_mult_fn=lr_mult_fn)
+    tag_fn = None
+    if getattr(model, "dino", None) is not None:
+        # the pretrained parts, frozen during the dino head warmup
+        def tag_fn(name):
+            return is_natinit_param(name) or name.startswith("patch_embed.")
+
+    adamw_groups = misc.get_param_groups(
+        model, skip_names=set(muon_names), lr_mult_fn=lr_mult_fn, tag_fn=tag_fn
+    )
     params = dict(model.named_parameters())
     muon_groups = []
-    for mult in sorted({lr_mult_fn(n) for n in muon_names}):
-        muon_groups.append(
-            {
-                "params": [params[n] for n in muon_names if lr_mult_fn(n) == mult],
-                "lr_multiplier": args.muon_lr_mult * mult,
-                "wd_multiplier": 1.0,
-            }
-        )
+    for mult, tag in sorted({(lr_mult_fn(n), bool(tag_fn and tag_fn(n))) for n in muon_names}):
+        group = {
+            "params": [params[n] for n in muon_names
+                       if lr_mult_fn(n) == mult and bool(tag_fn and tag_fn(n)) == tag],
+            "lr_multiplier": args.muon_lr_mult * mult,
+            "wd_multiplier": 1.0,
+        }
+        if tag_fn is not None:
+            group["backbone"] = tag
+        muon_groups.append(group)
     if block_mult != 1.0 or layer_decay != 1.0:
         logger.info(
             f"natinit block_lr_mult {block_mult} layer_decay {layer_decay}: muon groups "

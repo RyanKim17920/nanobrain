@@ -1,3 +1,4 @@
+import copy
 import math
 from functools import lru_cache
 
@@ -11,6 +12,7 @@ from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
+from . import dino3d
 from .fino import FinoHeads
 from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
 from .data import (
@@ -85,6 +87,11 @@ class ViTMAE3D(nn.Module):
         rtd_weight: float = 0.0,
         rtd_ratio: float = 0.15,
         rtd_quantiles: int = 32,
+        # pixel_weight scales the pixel stack (mse + grad + level-set loss); 0 = off, the decoder
+        # is skipped. 1.0 = the base, bitwise
+        pixel_weight: float = 1.0,
+        # DINOv2 objective in 3D (nanobrain.dino3d; None / enabled false = off, no params)
+        dino: dict | None = None,
     ):
         super().__init__()
         self.rtd_weight = float(rtd_weight)
@@ -197,6 +204,51 @@ class ViTMAE3D(nn.Module):
             self.rtd_head = nn.Linear(embed_dim, 1)
             nn.init.zeros_(self.rtd_head.weight)
             nn.init.zeros_(self.rtd_head.bias)
+        self.pixel_weight = float(pixel_weight)
+        # built last (after every other init), so the base parameters are as with dino off
+        self.dino_cfg = dino3d.dino_config(dict(dino) if dino is not None else None)
+        self.dino = None
+        self.dino_stats = {}
+        if self.dino_cfg is not None:
+            assert native and not class_tokens, "dino: native, no class tokens"
+            self.dino = dino3d.Dino3D(embed_dim, self.dino_cfg)
+            # the EMA teacher, a registered (checkpointed) frozen copy; train.py re-syncs it after
+            # natinit so it starts from the same pretrained weights as the student
+            self.dino_teacher = nn.ModuleDict(
+                {k: copy.deepcopy(getattr(self, k)) for k in self.DINO_TEACHER_KEYS}
+            )
+            self.dino_teacher.requires_grad_(False)
+
+    DINO_TEACHER_KEYS = ("patch_embed", "pos_embed", "blocks", "norm", "dino")
+    DINO_ENCODER_KEYS = ("patch_embed", "pos_embed", "blocks", "norm")
+
+    @torch.no_grad()
+    def dino_sync_teacher(self) -> None:
+        for k in self.DINO_TEACHER_KEYS:
+            self.dino_teacher[k].load_state_dict(getattr(self, k).state_dict())
+
+    @torch.no_grad()
+    def dino_ema_update(self, progress: float) -> None:
+        m = dino3d.momentum_at(self.dino_cfg["momentum"], progress)
+        t_params, s_params = [], []
+        for k in self.DINO_TEACHER_KEYS:
+            t_params += list(self.dino_teacher[k].parameters())
+            s_params += list(getattr(self, k).parameters())
+        torch._foreach_lerp_(t_params, s_params, 1.0 - m)
+        self.dino_stats["m"] = m
+
+    @torch.no_grad()
+    def dino_teacher_to_student(self) -> None:
+        # the evaluated encoder = the EMA teacher's (DINOv2 evaluates the teacher)
+        for k in self.DINO_ENCODER_KEYS:
+            getattr(self, k).load_state_dict(self.dino_teacher[k].state_dict())
+
+    def teacher_encode(self, x: Tensor, coord: Tensor) -> Tensor:
+        t = self.dino_teacher
+        x = t["pos_embed"](x, coord)
+        for block in t["blocks"]:
+            x = block(x)
+        return t["norm"](x)
 
     @torch.no_grad()
     def rtd_replace(
@@ -623,12 +675,23 @@ class ViTMAE3D(nn.Module):
             sp, patch, vols = part["spacing"], part["patch"], part.pop("vols")
             del part["scores"]
             b = len(part["ids"])
+            dino_on = self.dino is not None and self.training
+            if dino_on:
+                order = dino3d.pool_order(order, b, num_samples, num_visible)
             part["order"] = order.unflatten(0, (b, num_samples))
             # images and masks gathered together by flat token ids
             flat_ids = part["order"] + gather_offsets(b, num, device)
             patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
             patches, mask_patches = patches.view(2, b * num_samples, seq_length, -1)
             coord = geoms[sp][3][0][order]
+            if dino_on:
+                # the teacher's clean (pre-rtd) token pool = sequence 0 of each image
+                part["t_patches"] = patches.view(b, num_samples, seq_length, -1)[:, 0]
+                part["t_coord"] = coord.view(b, num_samples, seq_length, 3)[:, 0]
+                if self.dino_cfg["n_local"]:
+                    lp, lc = dino3d.local_crops(vols, b, num, geoms[sp][3][0], self.dino_cfg, self.min_mask_frac)
+                    part["loc_embeds"] = self.patch_embed.native(lp, sp, patch, embed_ws.get(sp))
+                    part["loc_coord"] = lc
             vis_patches, part["target_patches"] = patches.split([num_visible, num_predict], 1)
             part["target_mask_patches"] = mask_patches[:, num_visible:]
             vis_mask = mask_patches[:, :num_visible]
@@ -657,7 +720,118 @@ class ViTMAE3D(nn.Module):
                 return tensors[0].flatten()
             return torch.cat([t.flatten() for t in tensors])
 
-        embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
+        dino_loss = None
+        if self.dino is not None and self.training:
+            embeds, dino_loss = self.dino_forward(parts, cat, num_visible, num_samples)
+        else:
+            embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
+        if self.pixel_weight:
+            loss = self.pixel_weight * self.native_pixel_loss(parts, embeds, cat, head_ws, num_samples)
+        else:
+            loss = embeds.new_zeros((), dtype=torch.float32)
+            for part in parts:
+                part.pop("vis_patches", None), part.pop("vis_mask", None)
+        if dino_loss is not None:
+            loss = loss + dino_loss
+        if self.fino_heads is not None and fino_meta is not None:
+            # the global embedding of each sequence: mean of its visible encoder tokens (eval:
+            # mean of all brain-touching tokens); rows are part by part, image-major
+            pooled = embeds[:, self.class_tokens :].mean(dim=1)
+            # fino_meta stays on the cpu: one pinned non blocking copy, no sync with the gpu queue
+            rows = torch.tensor([ii for part in parts for ii in part["ids"]]).repeat_interleave(num_samples)
+            meta = fino_meta.cpu()[rows]
+            if device.type == "cuda":
+                meta = meta.pin_memory().to(device, non_blocking=True)
+            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
+            loss = loss + fino_loss
+        if self.rtd_head is not None and self.training and "rtd_label" in parts[0]:
+            labels = cat("rtd_label").float()
+            logits = self.rtd_head(embeds[:, self.class_tokens :]).squeeze(-1).float()
+            rtd_loss = F.binary_cross_entropy_with_logits(logits, labels)
+            loss = loss + self.rtd_weight * rtd_loss
+            with torch.no_grad():
+                pos = labels > 0.5
+                acc_pos = ((logits > 0) & pos).sum() / pos.sum().clamp_min(1)
+                acc_neg = ((logits <= 0) & ~pos).sum() / (~pos).sum().clamp_min(1)
+            self.rtd_stats = {"rtd_loss": rtd_loss.detach(), "rtd_tpr": acc_pos, "rtd_tnr": acc_neg}
+            self.fino_stats = {**self.fino_stats, **self.rtd_stats}
+
+        if not with_state:
+            return loss
+        return loss, {"parts": parts, "embeds": embeds}
+
+    def dino_forward(self, parts: list[dict], cat, num_visible: int, num_samples: int) -> tuple[Tensor, Tensor]:
+        # student: global sequences (visible tokens + ibot_num mask tokens at predicted positions)
+        # and local crops; teacher: each image's clean token pool. returns (visible-token encoder
+        # outputs for the pixel / aux heads, weighted dino + ibot + koleo loss)
+        cfg, d = self.dino_cfg, self.dino
+        k = cfg["ibot_num"]
+        vis = cat("embeds")
+        rows, dim = vis.shape[0], vis.shape[2]
+        x, c = vis, cat("vis_coord")
+        if k:
+            x = torch.cat([vis, d.mask_token.to(vis.dtype).expand(rows, k, -1)], dim=1)
+            c = torch.cat([c, cat("target_coord")[:, :k]], dim=1)
+        out = self.encode_tokens(x.contiguous(), c.contiguous())
+        embeds = out[:, :num_visible]
+        s_views = [embeds.mean(dim=1)]
+        n_img = rows // num_samples
+        t_rows = [torch.arange(n_img, device=vis.device).repeat_interleave(num_samples)]
+        if cfg["n_local"]:
+            loc = self.encode_tokens(cat("loc_embeds"), cat("loc_coord"))
+            s_views.append(loc.mean(dim=1))
+            t_rows.append(torch.arange(n_img, device=vis.device).repeat_interleave(cfg["n_local"]))
+        t = self.dino_teacher
+        with torch.no_grad():
+            sps = [part["spacing"] for part in parts if part["spacing"] != (1.0, 1.0, 1.0)]
+            ws = {}
+            if sps:
+                ws = t["patch_embed"].native_weights(sps, [part["patch"] for part in parts if part["spacing"] in sps])
+                ws = dict(zip(sps, ws))
+            tx = [t["patch_embed"].native(part.pop("t_patches"), part["spacing"], part["patch"], ws.get(part["spacing"]))
+                  for part in parts]
+            tx = tx[0].contiguous() if len(tx) == 1 else torch.cat(tx)
+            t_out = self.teacher_encode(tx, cat("t_coord"))
+            t_cls = t["dino"].dino_head(t_out.mean(dim=1)).float()
+            p_cls = dino3d.sinkhorn_knopp(t_cls, cfg["temp_t"], cfg["sk_iters"])
+            if k:
+                seq = torch.arange(rows, device=vis.device) % num_samples
+                idx = torch.where(seq == 0, num_visible, 0)[:, None] + torch.arange(k, device=vis.device)
+                t_tok = t_out[t_rows[0]].gather(1, idx[..., None].expand(-1, -1, dim))
+                t_ib = t["dino"].ibot_head(t_tok.flatten(0, 1)).float()
+                p_ib = dino3d.sinkhorn_knopp(t_ib, cfg["temp_t"], cfg["sk_iters"])
+        s_cls = d.dino_head(torch.cat(s_views))
+        dino_l = dino3d.cross_entropy(p_cls[torch.cat(t_rows)], s_cls, cfg["temp_s"])
+        loss = cfg["dino_weight"] * dino_l
+        st = {"dino": dino_l.detach()}
+        if k:
+            ibot_l = dino3d.cross_entropy(p_ib, d.ibot_head(out[:, num_visible:].flatten(0, 1)), cfg["temp_s"])
+            loss = loss + cfg["ibot_weight"] * ibot_l
+            st["ibot"] = ibot_l.detach()
+        if cfg["koleo_weight"]:
+            g = s_views[0]
+            kl = sum(dino3d.koleo(g[s::num_samples]) for s in range(num_samples)) / num_samples
+            loss = loss + cfg["koleo_weight"] * kl
+            st["koleo"] = kl.detach()
+        with torch.no_grad():
+            # collapse monitors: raw teacher entropies (per sample / of the batch mean), prototype
+            # usage, the per-dimension std of the l2-normalized pooled embeddings x sqrt(dim)
+            # (~1 spread out, -> 0 collapsed)
+            st["t_ent"], st["t_marg"] = dino3d.entropy_stats(t_cls, cfg["temp_t"])
+            st["t_used"] = (torch.bincount(t_cls.argmax(-1), minlength=t_cls.shape[1]) > 0).sum()
+            st["s_std"] = F.normalize(s_views[0].float(), dim=-1).std(dim=0).mean() * dim**0.5
+            st["t_std"] = F.normalize(t_out.mean(dim=1).float(), dim=-1).std(dim=0).mean() * dim**0.5
+            if k:
+                st["ib_ent"], st["ib_marg"] = dino3d.entropy_stats(t_ib, cfg["temp_t"])
+        self.dino_stats = {**self.dino_stats, **st}
+        return embeds, loss
+
+    def native_pixel_loss(self, parts: list[dict], embeds: Tensor, cat, head_ws: dict, num_samples: int) -> Tensor:
+        def flat_cat(tensors: list[Tensor]) -> Tensor:
+            if len(tensors) == 1:
+                return tensors[0].flatten()
+            return torch.cat([t.flatten() for t in tensors])
+
         feats = self.decode_features(embeds, cat("target_coord"))
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
@@ -716,35 +890,15 @@ class ViTMAE3D(nn.Module):
                 )
                 num, den = num + n, den + d
             loss = loss + self.level_weight * num / den.clamp_min(1e-6)
-        if self.fino_heads is not None and fino_meta is not None:
-            # the global embedding of each sequence: mean of its visible encoder tokens (eval:
-            # mean of all brain-touching tokens); rows are part by part, image-major
-            pooled = embeds[:, self.class_tokens :].mean(dim=1)
-            # fino_meta stays on the cpu: one pinned non blocking copy, no sync with the gpu queue
-            rows = torch.tensor([ii for part in parts for ii in part["ids"]]).repeat_interleave(num_samples)
-            meta = fino_meta.cpu()[rows]
-            if device.type == "cuda":
-                meta = meta.pin_memory().to(device, non_blocking=True)
-            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
-            loss = loss + fino_loss
-        if self.rtd_head is not None and self.training and "rtd_label" in parts[0]:
-            labels = cat("rtd_label").float()
-            logits = self.rtd_head(embeds[:, self.class_tokens :]).squeeze(-1).float()
-            rtd_loss = F.binary_cross_entropy_with_logits(logits, labels)
-            loss = loss + self.rtd_weight * rtd_loss
-            with torch.no_grad():
-                pos = labels > 0.5
-                acc_pos = ((logits > 0) & pos).sum() / pos.sum().clamp_min(1)
-                acc_neg = ((logits <= 0) & ~pos).sum() / (~pos).sum().clamp_min(1)
-            self.rtd_stats = {"rtd_loss": rtd_loss.detach(), "rtd_tpr": acc_pos, "rtd_tnr": acc_neg}
-            self.fino_stats = {**self.fino_stats, **self.rtd_stats}
-
-        if not with_state:
-            return loss
-        return loss, {"parts": parts, "embeds": embeds}
+        self.dino_stats["pix"] = loss.detach()
+        return loss
 
     def compile_native(self, **kwargs) -> None:
         # the fixed-shape transformer parts. per-spacing tokenization, embedding and head stay eager
+        if self.dino is not None:
+            # fixed shapes per call site (global, local, teacher pool): no dynamic recompiles
+            kwargs = {"dynamic": False, **kwargs}
+            self.teacher_encode = torch.compile(self.teacher_encode, **kwargs)
         self.encode_tokens = torch.compile(self.encode_tokens, **kwargs)
         self.decode_features = torch.compile(self.decode_features, **kwargs)
 
