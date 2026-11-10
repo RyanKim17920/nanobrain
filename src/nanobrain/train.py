@@ -71,6 +71,10 @@ def main(args: DictConfig):
         out_cfg_path = output_dir / "config.yaml"
         if out_cfg_path.exists():
             prev_cfg = OmegaConf.load(out_cfg_path)
+            # a key added after this run started (requeued onto newer code) takes its current value
+            for key in ("checkpoint_minutes",):
+                if key in args and key not in prev_cfg:
+                    prev_cfg[key] = args[key]
             assert args == prev_cfg, "current config doesn't match previous config"
         else:
             OmegaConf.save(args, out_cfg_path)
@@ -240,6 +244,11 @@ def main(args: DictConfig):
         late_indices=late_indices,
         switch_at=switch_at,
     )
+    if start_step > 0:
+        # the saved rng streams come back when the sampler starts (after the loader's base seed draw, before
+        # the first batch): the main-process streams continue exactly (bit-exact with num_workers 0); loader
+        # worker streams restart from the base seed, so with workers a resumed run matches up to noise
+        sampler.on_iter = functools.partial(restore_rng_state, output_dir, start_step)
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
@@ -397,6 +406,13 @@ def train(
             f"{train_t0:.0f} s"
         )
 
+    # a resumed process's startup (imports, model build, loader warmup, its first step's compile) is not training
+    # time: the clock continues from the checkpoint's wall time once that first step is done. checkpoint_minutes
+    # saves pause the clock too, so the budget counts only training steps whether or not the run was preempted
+    resumed = start_step > 0
+    checkpoint_seconds = float(args.get("checkpoint_minutes") or 0) * 60
+    last_checkpoint = time.monotonic()
+
     optimizer.zero_grad()
 
     if args.high_priority_stream and device.type == "cuda":
@@ -414,6 +430,8 @@ def train(
         start_step=start_batch,
     )
     for batch_idx, batch in enumerate(batches, start=start_batch):
+        if resumed and batch_idx == start_batch:
+            start_time = time.monotonic()
         need_update = (batch_idx + 1) % args.accum_iter == 0
         log_step = (batch_idx + 1) % print_freq_batches == 0
         if time_schedule:
@@ -503,6 +521,8 @@ def train(
             # compile is done: later gen 2 collections skip the startup objects
             gc.collect()
             gc.freeze()
+        if resumed and step == start_step + 1:
+            start_time = time.monotonic()
         wall_time = prev_wall_time + time.monotonic() - start_time
         if train_t0 is None:
             train_t0 = wall_time
@@ -531,8 +551,20 @@ def train(
                 )
 
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
-        if is_save_step or is_last:
+        is_timed_save = (
+            not (is_save_step or is_last)
+            and checkpoint_seconds > 0
+            and time.monotonic() - last_checkpoint >= checkpoint_seconds
+        )
+        if is_save_step or is_last or is_timed_save:
+            if is_timed_save and device.type == "cuda":
+                torch.cuda.synchronize(device)  # the step's queued gpu work stays on the clock
+            save_start = time.monotonic()
             misc.save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time)
+            misc.save_rng_state(output_dir, step)
+            last_checkpoint = time.monotonic()
+            if is_timed_save:
+                start_time += last_checkpoint - save_start
 
         if is_last:
             break
@@ -604,6 +636,11 @@ def make_optimizer(args: DictConfig, model: nn.Module):
             Muon(muon_groups, momentum=args.muon_momentum, fused=args.muon_fused),
         ]
     )
+
+
+def restore_rng_state(output_dir: Path, step: int) -> None:
+    if misc.load_rng_state(output_dir, step):
+        logger.info(f"restored the rng streams of step {step}")
 
 
 def ignore_sigterm(worker_id: int):
