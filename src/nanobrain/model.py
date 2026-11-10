@@ -12,7 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
 from .fino import FinoHeads
-from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
+from .modules import ROPE_MODES, Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D, rope_embed
 from .data import (
     crop_to_mask,
     fit_to_shape,
@@ -76,8 +76,14 @@ class ViTMAE3D(nn.Module):
         # fino3d config block (nanobrain.fino), training only heads on the global embedding;
         # None = off (no params, same init)
         fino3d: dict | None = None,
+        # encoder rotary positions (modules.rope_embed): None (additive tables, the base), "inplane"
+        # (dinov3's 2D rope on x / y + the additive z table) or "3d" (axial rope over x y z, no
+        # additive pos embed). decoder positions stay additive
+        rope: str | None = None,
     ):
         super().__init__()
+        assert rope is None or rope in ROPE_MODES, rope
+        self.rope = rope
         self.norm_target = norm_target
         self.grad_loss_weight = float(grad_loss_weight)
         self.fg_loss_weight = float(fg_loss_weight)
@@ -105,7 +111,8 @@ class ViTMAE3D(nn.Module):
             self.patch_embed = NativeEmbed(patch_size, embed_dim)
         else:
             self.patch_embed = nn.Linear(patch_dim, embed_dim)
-        self.pos_embed = SeparablePosEmbed3D(patch_grid_size, embed_dim)
+        pos_axes = {None: (0, 1, 2), "inplane": (2,), "3d": ()}[rope]
+        self.pos_embed = SeparablePosEmbed3D(patch_grid_size, embed_dim, axes=pos_axes)
         if class_tokens:
             self.cls_token = nn.Parameter(torch.empty(1, class_tokens, embed_dim))
         else:
@@ -229,13 +236,18 @@ class ViTMAE3D(nn.Module):
     ) -> Float[Tensor, "B R+N D"]:
         # forward_encoder after the patch embedding
         B = x.shape[0]
-        x = self.pos_embed(x, coord)
+        rope = None
+        if self.rope is not None:
+            head_dim = self.embed_dim // self.blocks[0].attn.num_heads
+            rope = rope_embed(coord, self.patch_grid_size, self.rope, head_dim)
+        if self.rope != "3d":
+            x = self.pos_embed(x, coord)
 
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
 
         for block in self.blocks:
-            x = block(x)
+            x = block(x) if rope is None else block(x, rope=rope)
         x = self.norm(x)
         return x
 

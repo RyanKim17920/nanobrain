@@ -60,6 +60,7 @@ class Attention(nn.Module):
         self,
         x: Float[Tensor, "B N D"],
         context: Float[Tensor, "B M D"] | None = None,
+        rope: Tensor | None = None,
     ) -> Float[Tensor, "B N D"]:
         if context is None:
             context = x
@@ -73,6 +74,8 @@ class Attention(nn.Module):
         if self.qk_norm:
             q = self.q_norm(q) * self.qk_scale.to(q.dtype)
             k = self.k_norm(k)
+        if rope is not None:
+            q, k = apply_rope(q, rope), apply_rope(k, rope)
         x = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         x = x.transpose(1, 2).reshape(B, N, D)
         x = self.proj(x)
@@ -142,9 +145,10 @@ class Block(nn.Module):
         self,
         x: Float[Tensor, "B N D"],
         context: Float[Tensor, "B M D"] | None = None,
+        rope: Tensor | None = None,
     ) -> Float[Tensor, "B N D"]:
         # should the context also be normalized? capi doesn't, so I guess not
-        x = x + self.drop_path1(self.attn(self.norm1(x), context=context))
+        x = x + self.drop_path1(self.attn(self.norm1(x), context=context, rope=rope))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
 
@@ -153,6 +157,56 @@ class Block(nn.Module):
         h = self.norm1(x)
         x = x[:, -num_rows:] + self.drop_path1(self.attn(h[:, -num_rows:], context=h))
         return x + self.drop_path2(self.mlp(self.norm2(x)))
+
+
+# Rotary position embedding (model_kwargs.rope, encoder only). DINOv3's RoPE (timm
+# RotaryEmbeddingDinoV3 with dinov3 B/16's settings: temperature 100, rotate_half, 'separate'
+# normalisation, no train-time coord augmentation): head_dim 64 = 32 rotated pairs (j, j + 32);
+# 16 periods 100 ** (2 f / 32), f = 0..15; pair j < 16 rotates with the row axis (dinov3 h) at
+# period f = j, pair 16 + f with the column axis (dinov3 w). coordinates: 0.5 centred token
+# indices / axis size, mapped to [-1, 1] ((c + 0.5) / G * 2 - 1, c = our token coord in patch
+# units, G = the 1 mm box's patch grid; native tokens use their actual fractional centres).
+#   inplane: rows = our x, columns = our y (as natinit's kernel inflation: kernel rows -> x), so a
+#            dinov3 block sees an axial slice exactly as a 2D image; z keeps the additive table only
+#   3d:      the same 32 pairs and periods, frequencies f % 3 == 2 (f = 2 5 8 11 14) of both halves
+#            move to z: x 11 pairs, y 11 pairs, z 10 pairs; no additive pos embed
+# prefix (cls) tokens are not rotated, as dinov3's registers / cls.
+ROPE_MODES = ("inplane", "3d")
+
+
+def rope_axes(mode: str, head_dim: int = 64) -> tuple[Tensor, Tensor]:
+    # per rotated pair (head_dim // 2): the axis (0 x, 1 y, 2 z) and the period
+    half = head_dim // 4
+    f = torch.arange(half)
+    periods = 100.0 ** (2.0 * f.float() / (head_dim // 2))
+    axis = torch.cat([torch.zeros(half, dtype=torch.int64), torch.ones(half, dtype=torch.int64)])
+    if mode == "3d":
+        axis = torch.where(torch.cat([f, f]) % 3 == 2, 2, axis)
+    else:
+        assert mode == "inplane", mode
+    return axis, torch.cat([periods, periods])
+
+
+def rope_embed(coord: Tensor, grid: tuple[int, int, int], mode: str, head_dim: int = 64) -> Tensor:
+    # coord [B, N, 3] in patch units -> [B, 1, N, 2 * head_dim] (sin, cos), float32
+    axis, periods = rope_axes(mode, head_dim)
+    axis, periods = axis.to(coord.device), periods.to(coord.device)
+    size = torch.tensor(grid, dtype=torch.float32, device=coord.device)
+    cn = (coord.float() + 0.5) / size * 2 - 1
+    angles = 2 * math.pi * cn[:, :, axis] / periods
+    angles = angles.tile(2)
+    return torch.cat([angles.sin(), angles.cos()], dim=-1)[:, None]
+
+
+def apply_rope(x: Tensor, rope: Tensor) -> Tensor:
+    # x [B, h, R + N, hd]; rope [B, 1, N, 2 hd] rotates the last N tokens (timm apply_rot_embed_cat,
+    # half layout); the R prefix tokens stay as they are
+    sin, cos = rope.chunk(2, dim=-1)
+    n = rope.shape[2]
+    pre, x_ = x[:, :, : x.shape[2] - n], x[:, :, x.shape[2] - n :]
+    x1, x2 = x_.chunk(2, dim=-1)
+    rot = x_ * cos + torch.cat([-x2, x1], dim=-1) * sin
+    return torch.cat([pre, rot.type_as(x)], dim=2)
 
 
 # Position embedding
@@ -164,8 +218,11 @@ class SeparablePosEmbed3D(nn.Module):
         grid_size: tuple[int, int, int],
         embed_dim: int,
         unit: float = 1.0,
+        axes: tuple[int, ...] = (0, 1, 2),
     ) -> None:
         super().__init__()
+        # axes: the tables added (rope inplane: z only); the others stay as unused parameters
+        self.axes = tuple(axes)
         self.embed_dim = embed_dim
         self.grid_size = grid_size
         self.unit = unit
@@ -191,6 +248,8 @@ class SeparablePosEmbed3D(nn.Module):
             # between rows, clamped to the table. integer values give exactly the rows
             coord = coord / self.unit
             for axis, weight in enumerate((self.weight_x, self.weight_y, self.weight_z)):
+                if axis not in self.axes:
+                    continue
                 pos = coord[:, :, axis].clamp(0, weight.shape[0] - 1)
                 lo = pos.floor().clamp(max=weight.shape[0] - 2)
                 frac = (pos - lo)[..., None]
@@ -198,9 +257,12 @@ class SeparablePosEmbed3D(nn.Module):
                 x = x + (weight[lo] * (1 - frac) + weight[lo + 1] * frac)
             return x
         pos_ids = torch.floor(coord / self.unit).to(torch.int64)
-        x = x + self.weight_x[pos_ids[:, :, 0]]
-        x = x + self.weight_y[pos_ids[:, :, 1]]
-        x = x + self.weight_z[pos_ids[:, :, 2]]
+        if 0 in self.axes:
+            x = x + self.weight_x[pos_ids[:, :, 0]]
+        if 1 in self.axes:
+            x = x + self.weight_y[pos_ids[:, :, 1]]
+        if 2 in self.axes:
+            x = x + self.weight_z[pos_ids[:, :, 2]]
         return x
 
     def extra_repr(self):
