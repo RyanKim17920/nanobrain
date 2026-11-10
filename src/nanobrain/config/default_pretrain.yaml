@@ -107,6 +107,10 @@ resume: false
 auto_resume: true
 checkpoint_period: 2500
 checkpoint_steps: null
+# also overwrite checkpoint-last.pth every checkpoint_minutes of wall time (0 = off), so a preempted job
+# that is killed without a save (no SIGTERM reaches train.py) resumes from at most this far back. the
+# wall clock (time_limit, the time schedule) is paused while it saves: the training budget is unchanged
+checkpoint_minutes: 5
 
 # Logging.
 print_freq: 100
