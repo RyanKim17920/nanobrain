@@ -166,6 +166,9 @@ natinit:
   # layer-wise lr decay over the pretrained blocks: block i gets block_lr_mult * layer_decay ** (depth - 1 - i)
   layer_decay: 1.0
   pos_scale: 1.0
+  # [q, k] target spectral norm of each pretrained block's Wq / Wk (rescaled at load); null = off.
+  # dinov2 per-block medians: [1.76, 2.04]
+  qk_spec: null
 
 wandb: false
 wandb_entity: null

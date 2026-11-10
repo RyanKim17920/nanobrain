@@ -130,6 +130,17 @@ def apply_natural_init(model, cfg) -> dict:
         extra = sorted(set(ours) - set(src))
         if extra:
             report["skipped"].append(f"blocks.{ii} kept random: {extra}")
+        qk_spec = cfg.get("qk_spec")
+        if qk_spec is not None:
+            # rescale q (and k) so the block's spectral norm is the target: q.k logits shrink by
+            # the product of the two factors (dinov3: rope-trained q/k ~3x dinov2's, blew up at peak lr)
+            for nm, tgt in (("q", qk_spec[0]), ("k", qk_spec[1])):
+                w = ours[f"attn.{nm}.weight"]
+                f = float(tgt) / torch.linalg.matrix_norm(w.float(), 2).item()
+                w.mul_(f)
+                if f"attn.{nm}.bias" in ours:
+                    ours[f"attn.{nm}.bias"].mul_(f)
+                report.setdefault("qk_scale", []).append(f"{ii}{nm}:{f:.3f}")
         block.load_state_dict(ours)
     report["copied"].append(f"{min(n_src, len(model.blocks))} blocks (q k v proj fc1 fc2 norm1 norm2)")
 
