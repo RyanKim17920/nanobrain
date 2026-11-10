@@ -4,7 +4,9 @@ import functools
 import gc
 import json
 import logging
+import math
 import os
+import random
 import signal
 import threading
 import time
@@ -15,6 +17,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from matplotlib import pyplot as plt
 from omegaconf import DictConfig, OmegaConf
@@ -463,6 +466,7 @@ def train(
                 num_samples=args.num_samples,
                 with_state=False,
                 spacing=batch.get("spacing"),
+                **({"target_images": batch["target"]} if "target" in batch else {}),
                 **fino_kwargs,
             )
 
@@ -645,7 +649,32 @@ def make_lr_schedule(
     return np.concatenate([warmup, stable, decay])
 
 
+def aug_config(args: DictConfig) -> dict | None:
+    # training-time intensity / flip augmentation (native path; the aug block, enabled false = off,
+    # the base run bitwise: no extra random draws, no extra kernels)
+    cfg = args.get("aug")
+    if not cfg or not cfg.get("enabled", False):
+        return None
+    assert args.native, "aug: native path only"
+    aug = {
+        "gamma": float(cfg.get("gamma", 0.3)),
+        "gamma_p": float(cfg.get("gamma_p", 0.5)),
+        "bias": float(cfg.get("bias", 0.2)),
+        "bias_p": float(cfg.get("bias_p", 0.5)),
+        "bias_grid": int(cfg.get("bias_grid", 4)),
+        "scale": float(cfg.get("scale", 0.1)),
+        "shift": float(cfg.get("shift", 0.1)),
+        "scale_p": float(cfg.get("scale_p", 0.3)),
+        "flip_p": float(cfg.get("flip_p", 0.0)),
+        "clean_target": bool(cfg.get("clean_target", False)),
+    }
+    logger.info(f"aug: {aug}")
+    return aug
+
+
 def make_batch_transform(args: DictConfig):
+    aug = aug_config(args)
+
     def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         raw = batch
         batch = [
@@ -655,12 +684,16 @@ def make_batch_transform(args: DictConfig):
                 grid_size=tuple(args.grid_size),
                 clip_quantiles=tuple(args.clip_quantiles),
                 native=args.native,
+                aug=aug,
             )
             for sample in batch
         ]
         if args.native:
             # each image on its own voxel grid
             out = {key: [sample[key] for sample in batch] for key in ("image", "mask", "spacing")}
+            if aug is not None and aug["clean_target"]:
+                # the un-augmented image (same flip): the MAE reconstruction target
+                out["target"] = [sample["target"] for sample in batch]
             if "fino" in raw[0]:
                 out["fino"] = torch.from_numpy(np.stack([sample["fino"] for sample in raw]))
             return out
@@ -678,6 +711,7 @@ def sample_transform(
     grid_size: tuple[int, int, int] = (192, 240, 192),
     clip_quantiles: tuple[float, float] = (0.005, 0.995),
     native: bool = False,
+    aug: dict | None = None,
 ) -> dict[str, Tensor]:
     # pretraining preprocessing, on gpu. eval preprocessing is ViTMAE3D.transform_cuda, keep in sync
     # (native training still evaluates on 1 mm inputs)
@@ -689,10 +723,57 @@ def sample_transform(
     if native:
         # no resampling. forward_native fits the grid_size mm box in the image's own voxels
         spacing = native_spacing(affine, target_spacing)
-        return {"image": image, "mask": mask, "affine": affine, "spacing": spacing}
+        out = {"image": image, "mask": mask, "affine": affine, "spacing": spacing}
+        if aug is not None:
+            out.update(augment(image, mask, aug))
+        return out
     image, mask, affine = resample_to_spacing(image, mask, affine, target_spacing)
     image, mask, affine = fit_to_shape(image, mask, affine, grid_size)
     return {"image": image, "mask": mask, "affine": affine}
+
+
+def augment(image: Tensor, mask: Tensor, aug: dict) -> dict[str, Tensor]:
+    # image: z-scored inside the brain mask (clipped first), 0 outside; RAS oriented. scalar draws
+    # are python random (no host sync); every reduction stays on the gpu. returns the augmented
+    # image (and mask when flipped) plus the clean target when aug["clean_target"]
+    if aug["flip_p"] and random.random() < aug["flip_p"]:
+        # RAS axis 0 is left-right; geometric, so the clean target is flipped too
+        image, mask = image.flip(0), mask.flip(0)
+    clean = image
+    do_gamma = aug["gamma"] > 0 and random.random() < aug["gamma_p"]
+    do_bias = aug["bias"] > 0 and random.random() < aug["bias_p"]
+    do_scale = (aug["scale"] > 0 or aug["shift"] > 0) and random.random() < aug["scale_p"]
+    if do_gamma or do_bias or do_scale:
+        m = mask.to(image.dtype)
+        x = image
+        if do_gamma or do_bias:
+            # to [0, 1] over the brain (the clip range after clipping), gamma, smooth multiplicative
+            # field, then z-scored again inside the mask (the eval's input statistics)
+            lo = torch.where(mask, image, float("inf")).amin()
+            hi = torch.where(mask, image, float("-inf")).amax()
+            x = ((image - lo) / (hi - lo).clamp_min(1e-6)).clamp(0.0, 1.0)
+            if do_gamma:
+                x = x.pow(math.exp(random.uniform(-aug["gamma"], aug["gamma"])))
+            if do_bias:
+                # low-res uniform noise, trilinear upsampled, scaled to max |f| = 1: factor
+                # exp(a f), a ~ U(0, bias) (bias 0.2: within ~[0.82, 1.22])
+                g = aug["bias_grid"]
+                coarse = torch.rand(1, 1, g, g, g, device=image.device) * 2.0 - 1.0
+                field = F.interpolate(coarse, size=tuple(image.shape), mode="trilinear", align_corners=True)[0, 0]
+                field = field / field.abs().amax().clamp_min(1e-6)
+                x = x * (random.uniform(0.0, aug["bias"]) * field).exp()
+            n = m.sum().clamp_min(1.0)
+            mean = (x * m).sum() / n
+            std = (((x - mean) * m).square().sum() / n).sqrt().clamp_min(1e-6)
+            x = (x - mean) / std
+        if do_scale:
+            # small global scale / shift of the standardized intensities
+            x = x * (1.0 + random.uniform(-aug["scale"], aug["scale"])) + random.uniform(-aug["shift"], aug["shift"])
+        image = x * m
+    out = {"image": image, "mask": mask}
+    if aug["clean_target"]:
+        out["target"] = clean
+    return out
 
 
 def count_batch_flops(args: DictConfig, model: nn.Module, device: torch.device) -> float:

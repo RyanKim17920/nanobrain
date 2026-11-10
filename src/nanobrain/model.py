@@ -365,13 +365,15 @@ class ViTMAE3D(nn.Module):
         spacing: list[tuple[float, float, float]] | None = None,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        target_images: list[Tensor] | None = None,
     ):
         if isinstance(images, list):
             # native resolution batch, images on their own voxel grids
             return self.forward_native(
                 images, mask, spacing, num_visible, num_predict, num_samples, with_state,
-                fino_meta=fino_meta, fino_gamma=fino_gamma,
+                fino_meta=fino_meta, fino_gamma=fino_gamma, target_images=target_images,
             )
+        assert target_images is None, "target_images: native path only"
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
             return self.patch_loss(*seqs)
@@ -563,7 +565,10 @@ class ViTMAE3D(nn.Module):
         with_state: bool = True,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        target_images: list[Tensor] | None = None,
     ):
+        # target_images (aug.clean_target): per image reconstruction targets on the image's grid
+        # (the clean volume of an augmented input); None = the input itself, bitwise as before.
         # images (float) and masks (bool) on their own voxel grids (sample_transform native), fit
         # here to the grid_size mm box in their voxels. images with the same spacing share one
         # token grid, sequence sampling and embedding / head weight. each predicted token counts
@@ -593,12 +598,16 @@ class ViTMAE3D(nn.Module):
             # images and masks fit to the box (fit_to_shape) and padded up to whole patches, tiling
             # the box from its low corner, in one buffer
             padded = tuple(num * p for num, p in zip(grid, patch))
-            vols = images[ids[0]].new_zeros((2, len(ids)) + padded)
+            nch = 2 if target_images is None else 3
+            vols = images[ids[0]].new_zeros((nch, len(ids)) + padded)
             for jj, ii in enumerate(ids):
                 src, dst = fit_slices(images[ii].shape, box)
                 vols[0, jj][dst] = images[ii][src]
                 vols[1, jj][dst] = mask[ii][src]
-            vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
+                if nch == 3:
+                    # channel 2: the clean reconstruction target, same crop
+                    vols[2, jj][dst] = target_images[ii][src]
+            vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (nch, len(ids)))
             cube = (grid, self.mask_cube) if self.mask_cube else None
             scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube).flatten(0, 1)
             parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols})
@@ -625,11 +634,14 @@ class ViTMAE3D(nn.Module):
             b = len(part["ids"])
             part["order"] = order.unflatten(0, (b, num_samples))
             # images and masks gathered together by flat token ids
-            flat_ids = part["order"] + gather_offsets(b, num, device)
+            flat_ids = part["order"] + gather_offsets(b, num, device, len(vols))
             patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
-            patches, mask_patches = patches.view(2, b * num_samples, seq_length, -1)
+            patches, mask_patches, *clean = patches.view(len(vols), b * num_samples, seq_length, -1)
             coord = geoms[sp][3][0][order]
             vis_patches, part["target_patches"] = patches.split([num_visible, num_predict], 1)
+            if clean:
+                # same token order (mask / crop) as the input; the target only
+                part["target_patches"] = clean[0][:, num_visible:]
             part["target_mask_patches"] = mask_patches[:, num_visible:]
             vis_mask = mask_patches[:, :num_visible]
             if self.rtd_head is not None and self.training:
@@ -958,9 +970,9 @@ def fit_slices(
 
 
 @lru_cache(maxsize=4096)
-def gather_offsets(batch_size: int, num_patches: int, device: torch.device) -> Tensor:
-    # [2, B, 1, 1] flat row offsets of (image | mask, image) in a [2, B, N, P] patch tensor
-    return torch.arange(2 * batch_size, device=device).view(2, batch_size, 1, 1) * num_patches
+def gather_offsets(batch_size: int, num_patches: int, device: torch.device, channels: int = 2) -> Tensor:
+    # [C, B, 1, 1] flat row offsets of (channel, image) in a [C, B, N, P] patch tensor
+    return torch.arange(channels * batch_size, device=device).view(channels, batch_size, 1, 1) * num_patches
 
 
 @lru_cache(maxsize=4096)

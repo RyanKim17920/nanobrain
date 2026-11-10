@@ -167,6 +167,25 @@ natinit:
   layer_decay: 1.0
   pos_scale: 1.0
 
+# training-time augmentation (train.augment, native path, in the gpu batch transform). applied per
+# image after clip + z-score: random gamma on the [0, 1] rescaled brain (log gamma ~ U(-gamma, gamma)),
+# smooth multiplicative bias field (bias_grid^3 uniform noise upsampled, factor exp(U(0, bias) f),
+# |f| <= 1), both then z-scored again inside the mask; a small scale / shift of the standardized
+# intensities; left-right flip (RAS axis 0, flip_p). clean_target: reconstruct the un-augmented
+# volume (same flip / mask / crop) instead of the augmented one. enabled false = the base run, bitwise
+aug:
+  enabled: false
+  gamma: 0.3
+  gamma_p: 0.5
+  bias: 0.2
+  bias_p: 0.5
+  bias_grid: 4
+  scale: 0.1
+  shift: 0.1
+  scale_p: 0.3
+  flip_p: 0.0
+  clean_target: false
+
 wandb: false
 wandb_entity: null
 wandb_project: nanobrain
