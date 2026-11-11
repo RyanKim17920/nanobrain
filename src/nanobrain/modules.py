@@ -60,6 +60,7 @@ class Attention(nn.Module):
         self,
         x: Float[Tensor, "B N D"],
         context: Float[Tensor, "B M D"] | None = None,
+        vgate: Float[Tensor, "B M"] | None = None,
     ) -> Float[Tensor, "B N D"]:
         if context is None:
             context = x
@@ -70,6 +71,10 @@ class Attention(nn.Module):
         q = self.q(x).reshape(B, N, h, D // h).transpose(1, 2)
         k = self.k(context).reshape(B, M, h, D // h).transpose(1, 2)
         v = self.v(context).reshape(B, M, h, D // h).transpose(1, 2)
+        if vgate is not None:
+            # per-key value gate (rtd suspicion gating): a gated key still takes attention mass but
+            # contributes a shrunk value. None = the plain attention
+            v = v * vgate[:, None, :, None].to(v.dtype)
         if self.qk_norm:
             q = self.q_norm(q) * self.qk_scale.to(q.dtype)
             k = self.k_norm(k)
@@ -142,16 +147,19 @@ class Block(nn.Module):
         self,
         x: Float[Tensor, "B N D"],
         context: Float[Tensor, "B M D"] | None = None,
+        vgate: Float[Tensor, "B M"] | None = None,
     ) -> Float[Tensor, "B N D"]:
         # should the context also be normalized? capi doesn't, so I guess not
-        x = x + self.drop_path1(self.attn(self.norm1(x), context=context))
+        x = x + self.drop_path1(self.attn(self.norm1(x), context=context, vgate=vgate))
         x = x + self.drop_path2(self.mlp(self.norm2(x)))
         return x
 
-    def forward_last_rows(self, x: Float[Tensor, "B N D"], num_rows: int) -> Float[Tensor, "B M D"]:
+    def forward_last_rows(
+        self, x: Float[Tensor, "B N D"], num_rows: int, vgate: Float[Tensor, "B N"] | None = None
+    ) -> Float[Tensor, "B M D"]:
         # forward(x)[:, -num_rows:]: queries and mlp for those rows only, keys / values from all
         h = self.norm1(x)
-        x = x[:, -num_rows:] + self.drop_path1(self.attn(h[:, -num_rows:], context=h))
+        x = x[:, -num_rows:] + self.drop_path1(self.attn(h[:, -num_rows:], context=h, vgate=vgate))
         return x + self.drop_path2(self.mlp(self.norm2(x)))
 
 

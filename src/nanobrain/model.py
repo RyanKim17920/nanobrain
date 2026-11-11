@@ -61,6 +61,8 @@ class ViTMAE3D(nn.Module):
         self_recon_weight: float = 0.0,
         # sequences only use patches with at least this brain fraction (unless a scan has too few)
         min_mask_frac: float = 0.25,
+        # low band of the coarse-to-fine target curriculum, block mean size in mm (0 = off)
+        target_lp_mm: float = 0.0,
         # linear head on the visible encoder tokens: BCE to the in-mask fraction of each level_pool^3
         # sub-block of their own patch above each level threshold (weight; 0 = off)
         level_weight: float = 0.0,
@@ -85,8 +87,34 @@ class ViTMAE3D(nn.Module):
         rtd_weight: float = 0.0,
         rtd_ratio: float = 0.15,
         rtd_quantiles: int = 32,
+        # per-token orientation detection (PatchRot / RotNet, patch level, 3D): an orient_ratio
+        # share of each sequence's visible patches is rotated 180 degrees about one of the three
+        # voxel axes (a voxel permutation that keeps any anisotropic patch shape: no interpolation);
+        # a zero-init 4-way linear head on the visible encoder tokens names the rotation (CE over
+        # all visible tokens, weight orient_weight; 0 = off). MAE targets stay clean. training only
+        orient_weight: float = 0.0,
+        orient_ratio: float = 0.15,
+        # within-image token-shuffle detection (ELECTRA / CIM RevDet with in-distribution donors):
+        # in native training a shuffle_ratio share of each sequence's visible patches is replaced
+        # by ANOTHER visible patch of the same sequence (same scan, contrast, site, bias field;
+        # only its anatomical position is wrong), and a zero-init linear head on the visible
+        # encoder tokens detects the displaced ones (BCE, weight shuffle_weight; 0 = off). the MAE
+        # targets stay the clean masked patches. runs before rtd; a token rtd then replaces
+        # counts as rtd only. training only
+        shuffle_weight: float = 0.0,
+        shuffle_ratio: float = 0.15,
+        # rtd suspicion gating (architecture, training only): every MAE decoder attention scales
+        # the value of visible token j by g_j = min(1, 2 sigmoid(-rtd_gate_scale * rtd_logit_j)), so
+        # tokens the encoder flags as foreign are muted for reconstruction and the MAE loss reaches
+        # the detection features. g = 1 at the zero-init head (identity at step 0); 0 = off
+        rtd_gate_scale: float = 0.0,
     ):
         super().__init__()
+        self.orient_weight = float(orient_weight)
+        self.orient_ratio = float(orient_ratio)
+        self.shuffle_weight = float(shuffle_weight)
+        self.shuffle_ratio = float(shuffle_ratio)
+        self.rtd_gate_scale = float(rtd_gate_scale)
         self.rtd_weight = float(rtd_weight)
         self.rtd_ratio = float(rtd_ratio)
         self.rtd_quantiles = int(rtd_quantiles)
@@ -149,6 +177,10 @@ class ViTMAE3D(nn.Module):
         self.self_recon_weight = self_recon_weight
         self.self_recon_head = nn.Linear(embed_dim, patch_dim) if self_recon_weight else None
         self.min_mask_frac = min_mask_frac
+        # coarse-to-fine target curriculum (native path): block size in mm of the low band (0 =
+        # off); target_band (0..1) is set by the training loop from the wall-clock progress
+        self.target_lp_mm = float(target_lp_mm)
+        self.target_band = 1.0
         self.level_weight = level_weight
         self.level_pool = level_pool
         self.level_head = None
@@ -197,6 +229,66 @@ class ViTMAE3D(nn.Module):
             self.rtd_head = nn.Linear(embed_dim, 1)
             nn.init.zeros_(self.rtd_head.weight)
             nn.init.zeros_(self.rtd_head.bias)
+        self.orient_head = None
+        if self.orient_weight > 0.0:
+            assert native, "orient: native training only"
+            self.orient_head = nn.Linear(embed_dim, 4)
+            nn.init.zeros_(self.orient_head.weight)
+            nn.init.zeros_(self.orient_head.bias)
+        # built after rtd, so every other parameter is initialized as with shuffle detection off
+        self.shuffle_head = None
+        self.shuffle_stats = {}
+        if self.shuffle_weight > 0.0:
+            assert native, "shuffle detection: native training only"
+            self.shuffle_head = nn.Linear(embed_dim, 1)
+            nn.init.zeros_(self.shuffle_head.weight)
+            nn.init.zeros_(self.shuffle_head.bias)
+
+    @torch.no_grad()
+    def orient_transform(
+        self, vis_patches: Tensor, vis_mask: Tensor, patch: tuple[int, int, int]
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Rotate an orient_ratio share of the visible patches by 180 degrees about x, y or z
+        (classes 1 / 2 / 3; 0 = untouched). Returns (patches, mask, labels [rows, V] long)."""
+        rows, nv, _ = vis_patches.shape
+        px, py, pz = patch
+        dev = vis_patches.device
+        hit = torch.rand(rows, nv, device=dev) < self.orient_ratio
+        labels = torch.where(hit, torch.randint(1, 4, (rows, nv), device=dev), 0)
+        x = vis_patches.view(rows, nv, px, py, pz)
+        m = vis_mask.view(rows, nv, px, py, pz)
+        # rotation by 180 degrees about an axis flips the two other axes
+        flips = {1: (3, 4), 2: (2, 4), 3: (2, 3)}
+        out_x, out_m = x, m
+        for c, dims in flips.items():
+            sel = (labels == c)[..., None, None, None]
+            out_x = torch.where(sel, x.flip(dims), out_x)
+            out_m = torch.where(sel, m.flip(dims), out_m)
+        return out_x.reshape_as(vis_patches), out_m.reshape_as(vis_mask), labels
+
+    @torch.no_grad()
+    def shuffle_replace(self, vis_patches: Tensor, vis_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Replace a shuffle_ratio share of every row's visible patches by another visible patch
+        of the same row (a random within-row permutation gives the donors). Host and donor must
+        both be mostly brain (>= half their voxels in the mask), so the cue is anatomical
+        inconsistency, not background. Returns (patches, mask, replaced [rows, V] bool)."""
+        rows, num_vis = vis_patches.shape[:2]
+        device = vis_patches.device
+        perm = torch.rand(rows, num_vis, device=device).argsort(dim=1)
+        brain = vis_mask.float().mean(-1) >= 0.5
+        donor_brain = brain.gather(1, perm)
+        not_self = perm != torch.arange(num_vis, device=device)[None]
+        replaced = (torch.rand(rows, num_vis, device=device) < self.shuffle_ratio) & brain
+        replaced = replaced & donor_brain & not_self
+        idx = perm[..., None].expand_as(vis_patches)
+        d_patches = vis_patches.gather(1, idx)
+        d_mask = vis_mask.gather(1, perm[..., None].expand_as(vis_mask))
+        sel = replaced[..., None]
+        return (
+            torch.where(sel, d_patches, vis_patches),
+            torch.where(sel, d_mask, vis_mask),
+            replaced,
+        )
 
     @torch.no_grad()
     def rtd_replace(
@@ -321,8 +413,10 @@ class ViTMAE3D(nn.Module):
         self,
         embeds: Float[Tensor, "B R+N D"],
         target_coord: Float[Tensor, "B M 3"],
+        vis_gate: Float[Tensor, "B N"] | None = None,
     ) -> Float[Tensor, "B M D"]:
-        # forward_decoder before the head
+        # forward_decoder before the head. vis_gate (rtd suspicion gating, training only): a per
+        # visible token value gate in every decoder attention; class and mask tokens stay at 1
         B = embeds.shape[0]
         M = target_coord.shape[1]
         assert target_coord.shape == (B, M, 3)
@@ -333,6 +427,8 @@ class ViTMAE3D(nn.Module):
             # visible order is a random shuffle, so a prefix is a uniform subset
             keep = int((embeds.shape[1] - self.class_tokens) * self.decoder_keep)
             embeds = embeds[:, : self.class_tokens + keep]
+            if vis_gate is not None:
+                vis_gate = vis_gate[:, :keep]
         embeds = self.decoder_proj(embeds)
 
         mask_tokens = self.mask_token.expand(B, M, -1)
@@ -341,15 +437,20 @@ class ViTMAE3D(nn.Module):
             mask_tokens = mask_tokens + pooled
 
         x = torch.cat([embeds, mask_tokens], dim=1)
+        gate = None
+        if vis_gate is not None:
+            ones_c = vis_gate.new_ones(B, self.class_tokens)
+            ones_m = vis_gate.new_ones(B, M)
+            gate = torch.cat([ones_c, vis_gate, ones_m], dim=1)
 
         if self.decoder_prune_last and len(self.decoder_blocks):
             # the head reads only the mask tokens, so the last block computes just their rows
             for block in self.decoder_blocks[:-1]:
-                x = block(x)
-            x = self.decoder_blocks[-1].forward_last_rows(x, M)
+                x = block(x, vgate=gate)
+            x = self.decoder_blocks[-1].forward_last_rows(x, M, vgate=gate)
         else:
             for block in self.decoder_blocks:
-                x = block(x)
+                x = block(x, vgate=gate)
             x = x[:, -M:]
         x = self.decoder_norm(x)
         return x
@@ -632,6 +733,10 @@ class ViTMAE3D(nn.Module):
             vis_patches, part["target_patches"] = patches.split([num_visible, num_predict], 1)
             part["target_mask_patches"] = mask_patches[:, num_visible:]
             vis_mask = mask_patches[:, :num_visible]
+            if self.shuffle_head is not None and self.training:
+                # displaced visible tokens first (donors are clean same-scan patches); rtd below
+                # may then overwrite some of them with a foreign patch, which clears the label
+                vis_patches, vis_mask, part["shuffled"] = self.shuffle_replace(vis_patches, vis_mask)
             if self.rtd_head is not None and self.training:
                 if b >= 2:
                     vis_patches, vis_mask, part["rtd_label"] = self.rtd_replace(
@@ -641,6 +746,12 @@ class ViTMAE3D(nn.Module):
                     part["rtd_label"] = torch.zeros(
                         vis_patches.shape[:2], dtype=torch.bool, device=device
                     )
+                if "shuffled" in part:
+                    part["shuffled"] = part["shuffled"] & ~part["rtd_label"]
+            if self.orient_head is not None and self.training:
+                vis_patches, vis_mask, part["orient_label"] = self.orient_transform(
+                    vis_patches, vis_mask, patch
+                )
             part["vis_coord"], part["target_coord"] = coord.split([num_visible, num_predict], 1)
             part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
             if self.level_head is not None:
@@ -658,7 +769,14 @@ class ViTMAE3D(nn.Module):
             return torch.cat([t.flatten() for t in tensors])
 
         embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
-        feats = self.decode_features(embeds, cat("target_coord"))
+        rtd_on = self.rtd_head is not None and self.training and "rtd_label" in parts[0]
+        rtd_logits, vis_gate = None, None
+        if rtd_on:
+            rtd_logits = self.rtd_head(embeds[:, self.class_tokens :]).squeeze(-1).float()
+            if self.rtd_gate_scale > 0.0:
+                vis_gate = (2.0 * torch.sigmoid(-self.rtd_gate_scale * rtd_logits)).clamp(max=1.0)
+                vis_gate = vis_gate.to(embeds.dtype)
+        feats = self.decode_features(embeds, cat("target_coord"), vis_gate)
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
         # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
@@ -672,6 +790,11 @@ class ViTMAE3D(nn.Module):
             part["pred_patches"] = pred
             px, py, pz = part["patch"]
             tgt = part["target_patches"]
+            if self.target_lp_mm > 0.0 and self.target_band < 1.0:
+                # coarse-to-fine target bandwidth curriculum: blend the target toward its
+                # target_lp_mm block-mean (low band) projection; band 0 = low band only, 1 = full
+                low = lowpass_patches(tgt, (px, py, pz), sp, self.target_lp_mm)
+                tgt = low + self.target_band * (tgt - low)
             if self.norm_target:
                 tgt = (tgt - tgt.mean(dim=-1, keepdim=True)) / (tgt.var(dim=-1, keepdim=True) + 1e-6) ** 0.5
             mse = F.mse_loss(pred, tgt, reduction="none")
@@ -727,9 +850,9 @@ class ViTMAE3D(nn.Module):
                 meta = meta.pin_memory().to(device, non_blocking=True)
             fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
             loss = loss + fino_loss
-        if self.rtd_head is not None and self.training and "rtd_label" in parts[0]:
+        if rtd_on:
             labels = cat("rtd_label").float()
-            logits = self.rtd_head(embeds[:, self.class_tokens :]).squeeze(-1).float()
+            logits = rtd_logits
             rtd_loss = F.binary_cross_entropy_with_logits(logits, labels)
             loss = loss + self.rtd_weight * rtd_loss
             with torch.no_grad():
@@ -737,7 +860,44 @@ class ViTMAE3D(nn.Module):
                 acc_pos = ((logits > 0) & pos).sum() / pos.sum().clamp_min(1)
                 acc_neg = ((logits <= 0) & ~pos).sum() / (~pos).sum().clamp_min(1)
             self.rtd_stats = {"rtd_loss": rtd_loss.detach(), "rtd_tpr": acc_pos, "rtd_tnr": acc_neg}
+            if vis_gate is not None:
+                with torch.no_grad():
+                    g = vis_gate.float()
+                    self.rtd_stats["rtd_gate_pos"] = (g * pos).sum() / pos.sum().clamp_min(1)
+                    self.rtd_stats["rtd_gate_neg"] = (g * ~pos).sum() / (~pos).sum().clamp_min(1)
             self.fino_stats = {**self.fino_stats, **self.rtd_stats}
+        if self.orient_head is not None and self.training and "orient_label" in parts[0]:
+            labels = cat("orient_label").flatten()
+            logits = self.orient_head(embeds[:, self.class_tokens :]).float().flatten(0, 1)
+            orient_loss = F.cross_entropy(logits, labels)
+            loss = loss + self.orient_weight * orient_loss
+            with torch.no_grad():
+                pred = logits.argmax(-1)
+                rot = labels > 0
+                acc_rot = ((pred == labels) & rot).sum() / rot.sum().clamp_min(1)
+                acc_id = ((pred == 0) & ~rot).sum() / (~rot).sum().clamp_min(1)
+            self.fino_stats = {
+                **self.fino_stats, "orient_loss": orient_loss.detach(),
+                "orient_acc_rot": acc_rot, "orient_acc_id": acc_id,
+            }
+        if self.shuffle_head is not None and self.training:
+            # displaced-token detection on the visible encoder tokens (rows part by part, as embeds)
+            labels = torch.cat([part.pop("shuffled") for part in parts]).float()
+            logits = self.shuffle_head(embeds[:, self.class_tokens :]).float().squeeze(-1)
+            # balanced BCE: positives (~ratio) and negatives weigh equally, so the head cannot
+            # win by predicting "clean" everywhere
+            pos = labels.sum().clamp_min(1.0)
+            neg = (1.0 - labels).sum().clamp_min(1.0)
+            weight = labels / pos + (1.0 - labels) / neg
+            bce = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+            loss = loss + self.shuffle_weight * 0.5 * (weight * bce).sum()
+            with torch.no_grad():
+                pred = logits > 0
+                self.shuffle_stats = {
+                    "shuf_frac": labels.mean().detach(),
+                    "shuf_recall": ((pred & (labels > 0)).sum() / pos).detach(),
+                    "shuf_fpr": ((pred & (labels == 0)).sum() / neg).detach(),
+                }
 
         if not with_state:
             return loss
@@ -942,6 +1102,26 @@ def sequence_scores(
         cell_scores = torch.gather(cell_scores, 1, cell_ids).reshape(batch_size, num_samples, num_patches)
         scores = cell_scores + 1e-6 * scores
     return torch.where(mask_frac[:, None, :] >= min_mask_frac, scores, 2.0)
+
+
+def lowpass_patches(
+    tgt: Tensor, patch: tuple[int, int, int], spacing: tuple[float, ...], block_mm: float
+) -> Tensor:
+    """Project every [.., px*py*pz] voxel patch onto its low band: the mean of each block of
+    ~block_mm (per axis round(block_mm / spacing), at least 1 voxel; edge blocks partial), held
+    over the block's voxels. A box-filter + decimation + hold, i.e. the coarse approximation of a
+    Haar pyramid; the high band (tgt - low) carries most of the per-voxel thermal noise."""
+    px, py, pz = patch
+    ks = tuple(max(1, int(round(block_mm / float(s)))) for s in spacing)
+    ks = tuple(min(k, p) for k, p in zip(ks, (px, py, pz)))
+    if ks == (1, 1, 1):
+        return tgt
+    lead = tgt.shape[:-1]
+    vol = tgt.reshape(-1, 1, px, py, pz).float()
+    low = F.avg_pool3d(vol, kernel_size=ks, stride=ks, ceil_mode=True)
+    for dim, k, p in zip((2, 3, 4), ks, (px, py, pz)):
+        low = low.repeat_interleave(k, dim=dim).narrow(dim, 0, p)
+    return low.reshape(*lead, px * py * pz).to(tgt.dtype)
 
 
 def fit_slices(

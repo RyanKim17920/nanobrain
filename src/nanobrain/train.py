@@ -249,6 +249,21 @@ def main(args: DictConfig):
             f"subject tempered sampling: alpha {args.subject_temper}, "
             f"effective images {n_eff:.0f} of {len(dataset)}"
         )
+    if args.get("subject_cap"):
+        # saturating subject-mass cap; replaces the power-law tempering when both are set
+        from nanobrain.data import effective_subjects, subject_cap_weights
+
+        before = sampler.weights if sampler.weights is not None else torch.ones(len(dataset), dtype=torch.float64)
+        eff_before = effective_subjects(dataset.paths, before)
+        sampler.weights = subject_cap_weights(
+            dataset.paths, float(args.subject_cap), bool(args.get("subject_cap_soft", True))
+        )
+        n_eff = sampler.weights.sum() ** 2 / sampler.weights.pow(2).sum()
+        logger.info(
+            f"subject cap sampling: cap {args.subject_cap} soft {args.get('subject_cap_soft', True)}, "
+            f"effective subjects {eff_before:.0f} -> {effective_subjects(dataset.paths, sampler.weights):.0f}, "
+            f"effective images {n_eff:.0f} of {len(dataset)}"
+        )
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
@@ -442,6 +457,17 @@ def train(
 
         if args.cudagraphs:
             torch.compiler.cudagraph_mark_step_begin()
+        if getattr(model_without_ddp, "target_lp_mm", 0.0) > 0.0:
+            # coarse-to-fine target bandwidth: low band only until half of target_lp_frac of the
+            # wall-clock progress, then a linear ramp to the full band at target_lp_frac
+            if time_schedule:
+                wall = prev_wall_time + time.monotonic() - start_time
+                prog = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+            else:
+                prog = step / total_steps
+            lp_frac = float(args.get("target_lp_frac", 0.5))
+            band = (prog - 0.5 * lp_frac) / max(0.5 * lp_frac, 1e-6)
+            model_without_ddp.target_band = float(min(1.0, max(0.0, band)))
         fino_kwargs = {}
         if "fino" in batch:
             # FINO's gamma ramp over training progress (the time schedule's clock when time keyed)
@@ -495,10 +521,14 @@ def train(
                 "tflop_per_sec": metric_logger.meters["tflop/s"].value,
                 "watts": metric_logger.meters["watts"].value,
             }
+            if getattr(model_without_ddp, "target_lp_mm", 0.0) > 0.0:
+                log_stats["target_band"] = model_without_ddp.target_band
             if fino_kwargs:
                 log_stats["fino_gamma"] = fino_kwargs["fino_gamma"]
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
+            for k, v in getattr(model_without_ddp, "shuffle_stats", {}).items():
+                log_stats[k] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)

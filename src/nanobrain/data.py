@@ -66,6 +66,40 @@ def subject_temper_weights(paths: list[str], alpha: float) -> torch.Tensor:
     return n.pow(-alpha)
 
 
+def subject_counts(paths: list[str]) -> tuple[list[str], torch.Tensor]:
+    """Subject key of every path (as in subject_temper_weights) and n_subject per image."""
+    keys = []
+    for path in paths:
+        parts = path.split("/")
+        cut = next((ii for ii, part in enumerate(parts) if part.startswith("sub")), 2)
+        keys.append("/".join(parts[: cut + 1]))
+    counts: dict[str, int] = {}
+    for key in keys:
+        counts[key] = counts.get(key, 0) + 1
+    return keys, torch.tensor([counts[key] for key in keys], dtype=torch.float64)
+
+
+def subject_cap_weights(paths: list[str], cap: float, soft: bool = True) -> torch.Tensor:
+    """Per-image weights that cap each subject's total draw mass near `cap` images: soft
+    (cap * tanh(n / cap) / n, a smooth knee) or hard (min(1, cap / n)). Subjects with n << cap
+    keep their full mass n (unlike the n^-alpha power law, which shrinks every subject); only the
+    heavily repeated tail (multi-shell DWI, longitudinal) is flattened."""
+    _, n = subject_counts(paths)
+    if soft:
+        return cap * torch.tanh(n / cap) / n
+    return (cap / n).clamp(max=1.0)
+
+
+def effective_subjects(paths: list[str], weights: torch.Tensor) -> float:
+    """1 / sum_s p_s^2 of the subject draw distribution under per-image weights."""
+    keys, _ = subject_counts(paths)
+    prob = (weights / weights.sum()).tolist()
+    mass: dict[str, float] = {}
+    for key, pr in zip(keys, prob):
+        mass[key] = mass.get(key, 0.0) + pr
+    return 1.0 / sum(v * v for v in mass.values())
+
+
 class InfiniteSampler(Sampler[int]):
     """Endless shuffled passes over the dataset, starting from sample index `start`. With ddp
     each rank takes every world_size-th sample of the same stream."""
