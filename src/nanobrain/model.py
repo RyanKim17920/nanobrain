@@ -1436,13 +1436,12 @@ def sequence_scores(
     return torch.where(mask_frac[:, None, :] >= min_mask_frac, scores, 2.0)
 
 
-@torch.compile(dynamic=True)
 @torch.no_grad()
 def edge_targets(
     patches: Tensor, mask: Tensor, levels: Tensor, patch: tuple, spacing: tuple, rows: int, nv: int, sub: int
 ) -> tuple[Tensor, Tensor]:
-    # ViTMAE3D.edgelvl_terms' targets (compiled: ~20 fused elementwise / pooling ops on every visible
-    # voxel). gradient magnitude by central differences per mm where both neighbours are in the mask;
+    # ViTMAE3D.edgelvl_terms' targets (eager: torch.compile recompiles per spacing group and stalled a
+    # smoke at <100 steps). gradient magnitude by central differences per mm where both neighbours are in the mask;
     # thresholds levels x the row's in-brain median (a fixed 1/16 voxel subsample); level_pool blocks
     px, py, pz = patch
     x = patches.float().reshape(-1, 1, px, py, pz)
