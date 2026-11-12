@@ -131,6 +131,19 @@ class ViTMAE3D(nn.Module):
         # zero-init Linear(D, 4) over {clean, bias, blur, noise}, CE. MAE targets stay clean
         corrupt_weight: float = 0.0,
         corrupt_ratio: float = 0.1,
+        # extended corruption kinds (corrupt head and unified head): + 4 = gamma / contrast change
+        # (patch-range gamma, |log g| in [0.2, 0.5]) and 5 = 2x downsample-upsample (masked 2-voxel
+        # block mean held over the block; axes under 4 voxels untouched)
+        corrupt_extended: bool = False,
+        # unified corruption: ONE shared budget and ONE multi-class token head replacing the rtd and
+        # corrupt heads (both must be off). a unified_ratio share of the visible (>= 50% brain)
+        # tokens is corrupted, the class uniform among {cross-subject swap (rtd_replace), bias,
+        # blur, noise (+ gamma, downsample if corrupt_extended) (+ within-scan shuffle if
+        # unified_shuffle)}; a token whose class is ineligible (no brain partner / donor) stays
+        # clean. zero-init Linear(D, 1 + classes), CE weight unified_weight. MAE targets stay clean
+        unified_weight: float = 0.0,
+        unified_ratio: float = 0.25,
+        unified_shuffle: bool = False,
         # edge level-set: the level head construction on the gradient magnitude (central
         # differences per mm on the patch's own voxel grid), thresholds k x the row's in-brain
         # median gradient, level_pool sub-blocks, BCE weighted by brain fraction
@@ -146,6 +159,10 @@ class ViTMAE3D(nn.Module):
         self.hemiswap_ratio = float(hemiswap_ratio)
         self.corrupt_weight = float(corrupt_weight)
         self.corrupt_ratio = float(corrupt_ratio)
+        self.corrupt_kinds = 5 if corrupt_extended else 3
+        self.unified_weight = float(unified_weight)
+        self.unified_ratio = float(unified_ratio)
+        self.unified_shuffle = bool(unified_shuffle)
         self.edgelvl_weight = float(edgelvl_weight)
         self.aux_stats = {}
         self.orient_weight = float(orient_weight)
@@ -309,7 +326,16 @@ class ViTMAE3D(nn.Module):
         self.corrupt_head = None
         if self.corrupt_weight > 0.0:
             assert native, "corrupt: native training only"
-            self.corrupt_head = zero_linear(4)
+            self.corrupt_head = zero_linear(1 + self.corrupt_kinds)
+        self.unified_head = None
+        if self.unified_weight > 0.0:
+            assert native, "unified corruption: native training only"
+            assert self.rtd_weight == 0.0 and self.corrupt_weight == 0.0, (
+                "unified corruption replaces the rtd and corrupt heads: set rtd_weight = corrupt_weight = 0"
+            )
+            # classes: 0 clean, 1 swap, 2 .. 1 + corrupt_kinds corruptions, (last) shuffle
+            self.unified_classes = 2 + self.corrupt_kinds + int(self.unified_shuffle)
+            self.unified_head = zero_linear(self.unified_classes)
         self.edgelvl_head = None
         if self.edgelvl_weight > 0.0:
             assert native, "edgelvl: native training only"
@@ -381,23 +407,47 @@ class ViTMAE3D(nn.Module):
         """Corrupt a corrupt_ratio share of the visible (>= 50% brain) tokens with 1 = a smooth
         multiplicative bias ramp (x[0.7, 1.3] across the patch, applied above the row's in-brain
         minimum), 2 = a sigma 1 voxel gaussian blur (normalized inside the mask), 3 = Rician-like
-        noise at 10% of the patch's in-brain std. Returns (patches, labels [rows, V] long)."""
+        noise at 10% of the patch's in-brain std (+ 4 = gamma, 5 = 2x downsample-upsample with
+        corrupt_extended). Returns (patches, labels [rows, V] long)."""
         rows, nv, P = vis_patches.shape
-        px, py, pz = patch
         dev = vis_patches.device
-        m_all = vis_mask.float()
-        ok = m_all.mean(-1) >= 0.5
+        ok = vis_mask.float().mean(-1) >= 0.5
         if exclude is not None:
             ok = ok & ~exclude
+        # a fixed k candidates per row (static shapes, no host sync): the corruptions run on k / nv of
+        # the tokens; each candidate is hit with probability corrupt_ratio * nv / k (= ratio overall)
+        cand, hit = self.corrupt_candidates(ok, self.corrupt_ratio)
+        kind = torch.where(hit, torch.randint(1, 1 + self.corrupt_kinds, hit.shape, device=dev), 0)
+        patches = self.corrupt_apply(vis_patches, vis_mask, patch, cand, kind)
+        labels = torch.zeros(rows, nv, dtype=torch.long, device=dev).scatter(1, cand, kind)
+        return patches, labels
+
+    @torch.no_grad()
+    def corrupt_candidates(self, ok: Tensor, ratio: float) -> tuple[Tensor, Tensor]:
+        """k = ceil(2 ratio nv) random candidate tokens per row and which of them are hit (each
+        with probability ratio * nv / k, and only where ok): (cand [rows, k] long, hit bool)."""
+        rows, nv = ok.shape
+        dev = ok.device
+        k = min(nv, max(1, math.ceil(2 * ratio * nv)))
+        cand = torch.rand(rows, nv, device=dev).topk(k, dim=1, largest=False).indices
+        hit = (torch.rand(rows, k, device=dev) < ratio * nv / k) & ok.gather(1, cand)
+        return cand, hit
+
+    @torch.no_grad()
+    def corrupt_apply(
+        self, vis_patches: Tensor, vis_mask: Tensor, patch: tuple[int, int, int], cand: Tensor, kind: Tensor
+    ) -> Tensor:
+        """Apply corruption kind[r, j] (0 = none, 1 bias, 2 blur, 3 noise, 4 gamma, 5 downsample)
+        to the candidate tokens cand [rows, k] of vis_patches. Returns the patches."""
+        rows, nv, P = vis_patches.shape
+        k = cand.shape[1]
+        px, py, pz = patch
+        dev = vis_patches.device
+        hit = kind > 0
+        m_all = vis_mask.float()
         # row minimum over the in-brain visible voxels (the magnitude floor of the z-scored scan)
         lo = torch.where(m_all > 0, vis_patches.float(), math.inf).amin(dim=(1, 2), keepdim=True)
         lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
-        # a fixed k candidates per row (static shapes, no host sync): the corruptions run on k / nv of
-        # the tokens; each candidate is hit with probability corrupt_ratio * nv / k (= ratio overall)
-        k = min(nv, max(1, math.ceil(2 * self.corrupt_ratio * nv)))
-        cand = torch.rand(rows, nv, device=dev).topk(k, dim=1, largest=False).indices
-        hit = (torch.rand(rows, k, device=dev) < self.corrupt_ratio * nv / k) & ok.gather(1, cand)
-        kind = torch.where(hit, torch.randint(1, 4, (rows, k), device=dev), 0)
         idx = cand[..., None].expand(rows, k, P)
         x = vis_patches.gather(1, idx).float()
         m = vis_mask.gather(1, idx).float()
@@ -429,13 +479,63 @@ class ViTMAE3D(nn.Module):
         # (3) Rician-like noise on the magnitude above the row minimum
         s = 0.1 * std
         x_noise = ((x - lo + torch.randn_like(x) * s) ** 2 + (torch.randn_like(x) * s) ** 2).sqrt() + lo
+        variants = [(1, x_bias), (2, x_blur), (3, x_noise)]
+        if self.corrupt_kinds >= 5:
+            # (4) gamma / contrast change on the patch's in-brain range: g = exp(+-U[0.2, 0.5])
+            big = torch.where(m > 0, x, -math.inf).amax(-1, keepdim=True)
+            small = torch.where(m > 0, x, math.inf).amin(-1, keepdim=True)
+            span = (big - small).clamp_min(1e-6)
+            span = torch.where(torch.isfinite(span), span, torch.ones_like(span))
+            small = torch.where(torch.isfinite(small), small, torch.zeros_like(small))
+            sign = torch.where(torch.rand(rows, k, 1, device=dev) < 0.5, -1.0, 1.0)
+            g = torch.exp(sign * (0.2 + 0.3 * torch.rand(rows, k, 1, device=dev)))
+            x_gamma = small + span * ((x - small) / span).clamp(0, 1) ** g
+            # (5) 2x downsample-upsample: masked 2-voxel block mean held over its block (axes of
+            # fewer than 4 voxels keep full resolution)
+            ks = tuple(2 if p >= 4 else 1 for p in (px, py, pz))
+            vx = torch.cat([(x * m).reshape(-1, 1, px, py, pz), m.reshape(-1, 1, px, py, pz)], 1)
+            low = F.avg_pool3d(vx, kernel_size=ks, stride=ks, ceil_mode=True)
+            for dim, kk, p in zip((2, 3, 4), ks, (px, py, pz)):
+                low = low.repeat_interleave(kk, dim=dim).narrow(dim, 0, p)
+            low = low.reshape(rows, k, 2, P)
+            x_down = low[:, :, 0] / low[:, :, 1].clamp_min(1e-3)
+            variants += [(4, x_gamma), (5, x_down)]
         out = x
-        for c, xc in ((1, x_bias), (2, x_blur), (3, x_noise)):
+        for c, xc in variants:
             out = torch.where((kind == c)[..., None], xc, out)
         out = (out * m).to(vis_patches.dtype)
-        patches = vis_patches.scatter(1, idx, torch.where(hit[..., None], out, vis_patches.gather(1, idx)))
-        labels = torch.zeros(rows, nv, dtype=torch.long, device=dev).scatter(1, cand, kind)
-        return patches, labels
+        return vis_patches.scatter(1, idx, torch.where(hit[..., None], out, vis_patches.gather(1, idx)))
+
+    @torch.no_grad()
+    def unified_transform(
+        self, vis_patches: Tensor, vis_mask: Tensor, patch: tuple[int, int, int], order: Tensor,
+        vols: Tensor, b: int, num: int, num_samples: int, num_visible: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Unified corruption: a unified_ratio share of the visible (>= 50% brain) tokens, class
+        uniform among swap / corruptions / (shuffle). Each token carries one label; a class that
+        is ineligible for its token (no brain partner / donor, a single-image group) leaves it
+        clean. Shuffle donors are taken from the clean patches first, then the cross-subject swap,
+        then the corruptions. Returns (patches, mask, labels [rows, V] long)."""
+        rows, nv, _ = vis_patches.shape
+        dev = vis_patches.device
+        ok = vis_mask.float().mean(-1) >= 0.5
+        cand, hit = self.corrupt_candidates(ok, self.unified_ratio)
+        cls = torch.where(hit, torch.randint(1, self.unified_classes, hit.shape, device=dev), 0)
+        labels = torch.zeros(rows, nv, dtype=torch.long, device=dev).scatter(1, cand, cls)
+        if self.unified_shuffle:
+            shuf = self.unified_classes - 1
+            vis_patches, vis_mask, done = self.shuffle_replace(vis_patches, vis_mask, select=labels == shuf)
+            labels = torch.where((labels == shuf) & ~done, 0, labels)
+        if b >= 2:
+            vis_patches, vis_mask, done = self.rtd_replace(
+                vis_patches, vis_mask, order, vols, b, num, num_samples, num_visible, select=labels == 1
+            )
+            labels = torch.where((labels == 1) & ~done, 0, labels)
+        else:
+            labels = torch.where(labels == 1, 0, labels)
+        kind = torch.where((cls >= 2) & (cls < 2 + self.corrupt_kinds), cls - 1, 0)
+        vis_patches = self.corrupt_apply(vis_patches, vis_mask, patch, cand, kind)
+        return vis_patches, vis_mask, labels
 
     def edgelvl_terms(
         self, tokens: Tensor, patches: Tensor, mask: Tensor, patch, spacing
@@ -476,18 +576,23 @@ class ViTMAE3D(nn.Module):
         return out_x.reshape_as(vis_patches), out_m.reshape_as(vis_mask), labels
 
     @torch.no_grad()
-    def shuffle_replace(self, vis_patches: Tensor, vis_mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def shuffle_replace(
+        self, vis_patches: Tensor, vis_mask: Tensor, select: Tensor | None = None
+    ) -> tuple[Tensor, Tensor, Tensor]:
         """Replace a shuffle_ratio share of every row's visible patches by another visible patch
         of the same row (a random within-row permutation gives the donors). Host and donor must
         both be mostly brain (>= half their voxels in the mask), so the cue is anatomical
-        inconsistency, not background. Returns (patches, mask, replaced [rows, V] bool)."""
+        inconsistency, not background. select [rows, V] bool (unified corruption) replaces the
+        shuffle_ratio draw. Returns (patches, mask, replaced [rows, V] bool)."""
         rows, num_vis = vis_patches.shape[:2]
         device = vis_patches.device
         perm = torch.rand(rows, num_vis, device=device).argsort(dim=1)
         brain = vis_mask.float().mean(-1) >= 0.5
         donor_brain = brain.gather(1, perm)
         not_self = perm != torch.arange(num_vis, device=device)[None]
-        replaced = (torch.rand(rows, num_vis, device=device) < self.shuffle_ratio) & brain
+        if select is None:
+            select = torch.rand(rows, num_vis, device=device) < self.shuffle_ratio
+        replaced = select & brain
         replaced = replaced & donor_brain & not_self
         idx = perm[..., None].expand_as(vis_patches)
         d_patches = vis_patches.gather(1, idx)
@@ -502,11 +607,12 @@ class ViTMAE3D(nn.Module):
     @torch.no_grad()
     def rtd_replace(
         self, vis_patches: Tensor, vis_mask: Tensor, order: Tensor, vols: Tensor, b: int, num: int,
-        num_samples: int, num_visible: int,
+        num_samples: int, num_visible: int, select: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Swap a rtd_ratio share of the visible patches of every row for the patch at the same
         token coordinate of the next image of the group (rolled by one), quantile matched to the
-        host row's in-brain voxels. Returns (patches, mask, replaced [rows, num_visible] bool)."""
+        host row's in-brain voxels. select [rows, V] bool (unified corruption) replaces the
+        rtd_ratio draw. Returns (patches, mask, replaced [rows, num_visible] bool)."""
         rows = b * num_samples
         vis_order = order[:, :num_visible]  # [rows, V], token ids of the host
         partner_img = (torch.arange(b, device=order.device) + 1) % b
@@ -516,7 +622,9 @@ class ViTMAE3D(nn.Module):
         p_mask = vols[1].flatten(0, 1).index_select(0, flat.flatten()).view_as(vis_patches)
         # the partner patch must be brain tissue too (half its voxels in its brain mask)
         ok = p_mask.float().mean(-1) >= 0.5
-        replaced = (torch.rand(vis_order.shape, device=order.device) < self.rtd_ratio) & ok
+        if select is None:
+            select = torch.rand(vis_order.shape, device=order.device) < self.rtd_ratio
+        replaced = select & ok
         # per-row in-brain quantiles of the host's visible patches and of the partner image's
         # visible patches in its own row (row of image j+1, same sample index)
         nq = self.rtd_quantiles + 1
@@ -967,6 +1075,10 @@ class ViTMAE3D(nn.Module):
                     )
                 if "shuffled" in part:
                     part["shuffled"] = part["shuffled"] & ~part["rtd_label"]
+            if self.unified_head is not None and self.training:
+                vis_patches, vis_mask, part["unified_label"] = self.unified_transform(
+                    vis_patches, vis_mask, patch, order, vols, b, num, num_samples, num_visible
+                )
             # ms-aux: brain frame, hemisphere swap, corruption (each token carries one label)
             if self.training and (self.brainpos_head is not None or self.hemiswap_head is not None):
                 vis_order = order[:, :num_visible]
@@ -985,6 +1097,8 @@ class ViTMAE3D(nn.Module):
                     )
             if self.corrupt_head is not None and self.training:
                 excl = part.get("rtd_label")
+                if "unified_label" in part:
+                    excl = part["unified_label"] > 0
                 if "hemi_label" in part:
                     excl = part["hemi_label"] if excl is None else excl | part["hemi_label"]
                 vis_patches, part["corrupt_label"] = self.corrupt_transform(vis_patches, vis_mask, patch, excl)
@@ -1140,7 +1254,10 @@ class ViTMAE3D(nn.Module):
                     "shuf_fpr": ((pred & (labels == 0)).sum() / neg).detach(),
                 }
 
-        aux_on = (self.brainpos_head, self.scanmatch_proj, self.hemiswap_head, self.corrupt_head, self.edgelvl_head)
+        aux_on = (
+            self.brainpos_head, self.scanmatch_proj, self.hemiswap_head, self.corrupt_head, self.edgelvl_head,
+            self.unified_head,
+        )
         if self.training and any(h is not None for h in aux_on):
             loss = loss + self.aux_losses(parts, embeds, num_samples, subject_ids, device)
         for part in parts:
@@ -1220,6 +1337,28 @@ class ViTMAE3D(nn.Module):
                 stats["cr_loss"] = cr_loss.detach()
                 stats["cr_acc_corrupt"] = ((pred == labels) & bad).sum() / bad.sum().clamp_min(1)
                 stats["cr_acc_clean"] = ((pred == 0) & ~bad).sum() / (~bad).sum().clamp_min(1)
+                if self.corrupt_kinds > 3:
+                    for c, name in enumerate(["bias", "blur", "noise", "gamma", "down"], start=1):
+                        sel = labels == c
+                        stats[f"cr_rec_{name}"] = ((pred == c) & sel).sum() / sel.sum().clamp_min(1)
+        if self.unified_head is not None and "unified_label" in parts[0]:
+            labels = cat("unified_label").flatten()
+            logits = self.unified_head(tokens).float().flatten(0, 1)
+            uc_loss = F.cross_entropy(logits, labels)
+            loss = loss + self.unified_weight * uc_loss
+            with torch.no_grad():
+                pred = logits.argmax(-1)
+                bad = labels > 0
+                stats["uc_loss"] = uc_loss.detach()
+                stats["uc_frac"] = bad.float().mean()
+                stats["uc_acc_corrupt"] = ((pred == labels) & bad).sum() / bad.sum().clamp_min(1)
+                stats["uc_acc_clean"] = ((pred == 0) & ~bad).sum() / (~bad).sum().clamp_min(1)
+                names = ["swap", "bias", "blur", "noise", "gamma", "down"][: 1 + self.corrupt_kinds]
+                if self.unified_shuffle:
+                    names.append("shuf")
+                for c, name in enumerate(names, start=1):
+                    sel = labels == c
+                    stats[f"uc_rec_{name}"] = ((pred == c) & sel).sum() / sel.sum().clamp_min(1)
         if self.edgelvl_head is not None and "vis_patches" in parts[0]:
             num, den, err = 0.0, 0.0, 0.0
             rows = torch.split(tokens, [len(part["ids"]) * num_samples for part in parts])
