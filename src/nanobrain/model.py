@@ -385,28 +385,35 @@ class ViTMAE3D(nn.Module):
         rows, nv, P = vis_patches.shape
         px, py, pz = patch
         dev = vis_patches.device
-        x = vis_patches.float()
-        m = vis_mask.float()
-        ok = m.mean(-1) >= 0.5
+        m_all = vis_mask.float()
+        ok = m_all.mean(-1) >= 0.5
         if exclude is not None:
             ok = ok & ~exclude
-        hit = (torch.rand(rows, nv, device=dev) < self.corrupt_ratio) & ok
-        labels = torch.where(hit, torch.randint(1, 4, (rows, nv), device=dev), 0)
-        lo = torch.where(m > 0, x, math.inf).amin(dim=(1, 2), keepdim=True)
+        # row minimum over the in-brain visible voxels (the magnitude floor of the z-scored scan)
+        lo = torch.where(m_all > 0, vis_patches.float(), math.inf).amin(dim=(1, 2), keepdim=True)
         lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
+        # a fixed k candidates per row (static shapes, no host sync): the corruptions run on k / nv of
+        # the tokens; each candidate is hit with probability corrupt_ratio * nv / k (= ratio overall)
+        k = min(nv, max(1, math.ceil(2 * self.corrupt_ratio * nv)))
+        cand = torch.rand(rows, nv, device=dev).topk(k, dim=1, largest=False).indices
+        hit = (torch.rand(rows, k, device=dev) < self.corrupt_ratio * nv / k) & ok.gather(1, cand)
+        kind = torch.where(hit, torch.randint(1, 4, (rows, k), device=dev), 0)
+        idx = cand[..., None].expand(rows, k, P)
+        x = vis_patches.gather(1, idx).float()
+        m = vis_mask.gather(1, idx).float()
         cnt = m.sum(-1, keepdim=True).clamp_min(1.0)
         mean = (x * m).sum(-1, keepdim=True) / cnt
         std = (((x - mean) ** 2 * m).sum(-1, keepdim=True) / cnt).sqrt()
         # (1) bias ramp along a random direction: |u . r| <= 1 with r in [-1, 1]^3
         axes = [((torch.arange(p, device=dev) + 0.5) / p * 2 - 1) for p in (px, py, pz)]
         r = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(-1, 3)
-        u = torch.randn(rows, nv, 3, device=dev)
+        u = torch.randn(rows, k, 3, device=dev)
         u = u / u.abs().sum(-1, keepdim=True).clamp_min(1e-6)
-        amp = 0.2 + 0.1 * torch.rand(rows, nv, 1, device=dev)
+        amp = 0.2 + 0.1 * torch.rand(rows, k, 1, device=dev)
         x_bias = (x - lo) * (1 + amp * (u @ r.T)) + lo
         # (2) separable gaussian blur, sigma 1 voxel, normalized convolution inside the mask
-        k = torch.exp(-torch.arange(-2, 3, device=dev, dtype=torch.float32) ** 2 / 2)
-        k = k / k.sum()
+        kern = torch.exp(-torch.arange(-2, 3, device=dev, dtype=torch.float32) ** 2 / 2)
+        kern = kern / kern.sum()
         vol = torch.cat([(x * m).reshape(-1, 1, px, py, pz), m.reshape(-1, 1, px, py, pz)], 1)
         vol = vol.reshape(-1, 1, px, py, pz)
         for axis, size in zip((2, 3, 4), (px, py, pz)):
@@ -416,19 +423,19 @@ class ViTMAE3D(nn.Module):
             shape[axis] = 5
             pad = [0, 0, 0, 0, 0, 0]
             pad[2 * (4 - axis)] = pad[2 * (4 - axis) + 1] = 2
-            vol = F.conv3d(F.pad(vol, pad, mode="replicate"), k.view(shape))
+            vol = F.conv3d(F.pad(vol, pad, mode="replicate"), kern.view(shape))
         vol = vol.reshape(-1, 2, P)
-        x_blur = (vol[:, 0] / vol[:, 1].clamp_min(1e-3)).reshape(rows, nv, P)
+        x_blur = (vol[:, 0] / vol[:, 1].clamp_min(1e-3)).reshape(rows, k, P)
         # (3) Rician-like noise on the magnitude above the row minimum
         s = 0.1 * std
-        n1 = torch.randn_like(x) * s
-        n2 = torch.randn_like(x) * s
-        x_noise = ((x - lo + n1) ** 2 + n2**2).sqrt() + lo
+        x_noise = ((x - lo + torch.randn_like(x) * s) ** 2 + (torch.randn_like(x) * s) ** 2).sqrt() + lo
         out = x
         for c, xc in ((1, x_bias), (2, x_blur), (3, x_noise)):
-            out = torch.where((labels == c)[..., None], xc, out)
-        out = out * m
-        return out.to(vis_patches.dtype), labels
+            out = torch.where((kind == c)[..., None], xc, out)
+        out = (out * m).to(vis_patches.dtype)
+        patches = vis_patches.scatter(1, idx, torch.where(hit[..., None], out, vis_patches.gather(1, idx)))
+        labels = torch.zeros(rows, nv, dtype=torch.long, device=dev).scatter(1, cand, kind)
+        return patches, labels
 
     def edgelvl_terms(
         self, tokens: Tensor, patches: Tensor, mask: Tensor, patch, spacing
@@ -436,33 +443,11 @@ class ViTMAE3D(nn.Module):
         """Edge level-set head: level_terms on the gradient magnitude (central differences per
         mm, only where both neighbours are in the mask), thresholds edgelvl_thresholds x the
         row's in-brain median gradient. Returns (weighted bce sum, normalizer, weighted abs err)."""
-        px, py, pz = patch
         rows, nv = patches.shape[:2]
-        with torch.no_grad():
-            x = patches.float().reshape(-1, 1, px, py, pz)
-            m = mask.float().reshape(-1, 1, px, py, pz)
-            g2 = torch.zeros_like(x)
-            for axis, size, sp in zip((2, 3, 4), (px, py, pz), spacing):
-                if size < 3:
-                    continue
-                d = (x.narrow(axis, 2, size - 2) - x.narrow(axis, 0, size - 2)) / (2.0 * float(sp))
-                both = m.narrow(axis, 2, size - 2) * m.narrow(axis, 0, size - 2)
-                pad = [0, 0, 0, 0, 0, 0]
-                pad[2 * (4 - axis)] = pad[2 * (4 - axis) + 1] = 1
-                g2 = g2 + F.pad((d * both) ** 2, pad)
-            g = g2.sqrt() * m
-            # per-row in-brain median gradient
-            flat = torch.where(m > 0, g, math.inf).reshape(rows, -1)
-            cnt = (m > 0).reshape(rows, -1).sum(1)
-            srt = flat.sort(dim=1).values
-            med = srt.gather(1, (cnt // 2).clamp(max=flat.shape[1] - 1)[:, None]).squeeze(1)
-            med = torch.where(torch.isfinite(med) & (med > 0), med, torch.ones_like(med))
-            thr = med[:, None] * self.edgelvl_thresholds[None]  # [rows, L]
-            thr = thr.repeat_interleave(nv, 0).view(-1, thr.shape[1], 1, 1, 1)
-            above = (g > thr).float() * m
-            sub = self.patch_size[0] // self.level_pool
-            weight = F.adaptive_avg_pool3d(m, sub)
-            target = F.adaptive_avg_pool3d(above, sub) / weight.clamp_min(1e-6)
+        sub = self.patch_size[0] // self.level_pool
+        weight, target = edge_targets(
+            patches, mask, self.edgelvl_thresholds, tuple(patch), tuple(float(v) for v in spacing), rows, nv, sub
+        )
         logits = self.edgelvl_head(tokens).float().reshape(target.shape)
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         err = (weight * (torch.sigmoid(logits.detach()) - target).abs()).sum()
@@ -1449,6 +1434,49 @@ def sequence_scores(
         cell_scores = torch.gather(cell_scores, 1, cell_ids).reshape(batch_size, num_samples, num_patches)
         scores = cell_scores + 1e-6 * scores
     return torch.where(mask_frac[:, None, :] >= min_mask_frac, scores, 2.0)
+
+
+@torch.compile(dynamic=True)
+@torch.no_grad()
+def edge_targets(
+    patches: Tensor, mask: Tensor, levels: Tensor, patch: tuple, spacing: tuple, rows: int, nv: int, sub: int
+) -> tuple[Tensor, Tensor]:
+    # ViTMAE3D.edgelvl_terms' targets (compiled: ~20 fused elementwise / pooling ops on every visible
+    # voxel). gradient magnitude by central differences per mm where both neighbours are in the mask;
+    # thresholds levels x the row's in-brain median (a fixed 1/16 voxel subsample); level_pool blocks
+    px, py, pz = patch
+    x = patches.float().reshape(-1, 1, px, py, pz)
+    m = mask.float().reshape(-1, 1, px, py, pz)
+    g2 = torch.zeros_like(x)
+    for axis, size, sp in zip((2, 3, 4), (px, py, pz), spacing):
+        if size < 3:
+            continue
+        d = (x.narrow(axis, 2, size - 2) - x.narrow(axis, 0, size - 2)) / (2.0 * sp)
+        both = m.narrow(axis, 2, size - 2) * m.narrow(axis, 0, size - 2)
+        pad = [0, 0, 0, 0, 0, 0]
+        pad[2 * (4 - axis)] = pad[2 * (4 - axis) + 1] = 1
+        g2 = g2 + F.pad((d * both) ** 2, pad)
+    g = g2.sqrt() * m
+    flat = torch.where(m > 0, g, math.inf).reshape(rows, -1)[:, ::16]
+    cnt = torch.isfinite(flat).sum(1)
+    srt = flat.sort(dim=1).values
+    med = srt.gather(1, (cnt // 2).clamp(max=flat.shape[1] - 1)[:, None]).squeeze(1)
+    med = torch.where(torch.isfinite(med) & (med > 0), med, torch.ones_like(med))
+    thr = med[:, None] * levels[None]
+    thr = thr.repeat_interleave(nv, 0).view(-1, levels.shape[0], 1, 1, 1)
+    above = (g > thr).float() * m
+    weight = block_mean(m, sub)
+    target = block_mean(above, sub) / weight.clamp_min(1e-6)
+    return weight, target
+
+
+def block_mean(x: Tensor, sub: int) -> Tensor:
+    # adaptive_avg_pool3d(x, sub); a reshape mean when every axis divides (the 1 mm patches; the
+    # adaptive pool kernel is ~1 ms per call at training size)
+    n, c, px, py, pz = x.shape
+    if px % sub or py % sub or pz % sub:
+        return F.adaptive_avg_pool3d(x, sub)
+    return x.reshape(n, c, sub, px // sub, sub, py // sub, sub, pz // sub).mean(dim=(3, 5, 7))
 
 
 def lowpass_patches(
