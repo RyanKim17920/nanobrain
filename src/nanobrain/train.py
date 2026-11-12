@@ -541,6 +541,8 @@ def train(
                 log_stats[k] = float(v)
             for k, v in getattr(model_without_ddp, "aux_stats", {}).items():
                 log_stats[k] = float(v)
+            for k, v in getattr(model_without_ddp, "level_mirror_stats", {}).items():
+                log_stats[f"mirror_{k}"] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
                     print(json.dumps(log_stats), file=f)

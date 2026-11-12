@@ -149,6 +149,35 @@ class ViTMAE3D(nn.Module):
         # median gradient, level_pool sub-blocks, BCE weighted by brain fraction
         edgelvl_weight: float = 0.0,
         edgelvl_thresholds: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0),
+        # ---- ms-syn (ported from r24_syn, Labless run_sub_463a0d7b5e; all off by default) ----
+        # level_mirror (r18_mir_dec, native path; () = off): extra level channels on a separate
+        # zero-init head: in-mask fraction of each 2 mm sub-block above each threshold AND above
+        # margin + the max within +-2-4 mm of its x(L-R)-mirrored 2 mm cell
+        level_mirror: tuple[float, ...] = (),
+        level_mirror_margin: float = 0.5,
+        # training only: share of images given 1 to blob_max synthetic focal hyperintensities,
+        # radius log-uniform in blob_radius mm, + blob_contrast z, soft edge blob_edge mm
+        blob_prob: float = 0.0,
+        blob_max: int = 3,
+        blob_radius: tuple[float, float] = (2.0, 9.0),
+        blob_contrast: tuple[float, float] = (1.0, 3.0),
+        blob_edge: float = 1.5,
+        # training only: share of images given one lobulated mass, radius log-uniform in tumor_radius
+        # mm: a bright rim on a mildly darker core (share tumor_ring) or a diffuse bright mass, +
+        # tumor_contrast z, 10-90% edge width tumor_edge mm; a tumor_nodule share are solid bright
+        # 3-10 mm nodules instead. rims and nodules +2..+5 z, every image clipped to its own in-mask
+        # range. pasted into the clean volumes before patchify and before any token corruption
+        tumor_prob: float = 0.0,
+        tumor_radius: tuple[float, float] = (8.0, 30.0),
+        tumor_ring: float = 0.5,
+        tumor_contrast: tuple[float, float] = (0.8, 2.5),
+        tumor_edge: tuple[float, float] = (3.0, 8.0),
+        tumor_nodule: float = 0.25,
+        # zero-init linear head on the visible encoder tokens: BCE to the inserted lesion (blobs,
+        # tumours) fraction of each level_pool^3 sub-block, in-mask weighted (weight; 0 = off).
+        # tokens a corruption replaced or altered (rtd / unified / hemiswap / corrupt / orient /
+        # shuffle) are out of this loss and of the mirror level loss
+        lesion_mask_weight: float = 0.0,
     ):
         super().__init__()
         self.brainpos_weight = float(brainpos_weight)
@@ -342,6 +371,44 @@ class ViTMAE3D(nn.Module):
             edges = [float(t) for t in edgelvl_thresholds]
             self.edgelvl_head = zero_linear(len(edges) * (patch_size // level_pool) ** 3)
             self.register_buffer("edgelvl_thresholds", torch.tensor(edges), persistent=False)
+
+        # ms-syn heads (r24_syn): created under fork_rng and zero-initialized, so every other weight
+        # and the rng stream after the constructor are as with them off
+        self.level_mirror = tuple(float(t) for t in level_mirror)
+        self.level_mirror_margin = float(level_mirror_margin)
+        self.level_mirror_head = None
+        self.level_mirror_stats = {}
+        if self.level_mirror:
+            assert level_weight and native, "level_mirror: needs the level head, native path"
+            assert patch_size == 8 and level_pool == 2, "level_mirror: 2 mm cells of 8 mm tokens"
+            # background (0) is in the mirror window at the mask edge: thresholds >= margin keep it inert
+            assert min(self.level_mirror) >= self.level_mirror_margin, "level_mirror: thresholds >= margin"
+            with torch.random.fork_rng(devices=[]):
+                self.level_mirror_head = nn.Linear(embed_dim, len(self.level_mirror) * 64)
+            nn.init.zeros_(self.level_mirror_head.weight)
+            nn.init.zeros_(self.level_mirror_head.bias)
+            self.register_buffer("level_mirror_thresholds", torch.tensor(self.level_mirror), persistent=False)
+        assert not blob_prob or native, "blob_prob: native path only"
+        self.blob_prob = float(blob_prob)
+        self.blob_max = int(blob_max)
+        self.blob_radius = tuple(float(v) for v in blob_radius)
+        self.blob_contrast = tuple(float(v) for v in blob_contrast)
+        self.blob_edge = float(blob_edge)
+        assert not tumor_prob or native, "tumor_prob: native path only"
+        self.tumor_prob = float(tumor_prob)
+        self.tumor_radius = tuple(float(v) for v in tumor_radius)
+        self.tumor_ring = float(tumor_ring)
+        self.tumor_contrast = tuple(float(v) for v in tumor_contrast)
+        self.tumor_edge = tuple(float(v) for v in tumor_edge)
+        self.tumor_nodule = float(tumor_nodule)
+        self.lesion_mask_weight = float(lesion_mask_weight)
+        self.lesion_head = None
+        if self.lesion_mask_weight:
+            assert native and (blob_prob or tumor_prob), "lesion_mask_weight: native path, blobs or tumours on"
+            with torch.random.fork_rng(devices=[]):
+                self.lesion_head = nn.Linear(embed_dim, (patch_size // level_pool) ** 3)
+            nn.init.zeros_(self.lesion_head.weight)
+            nn.init.zeros_(self.lesion_head.bias)
 
     @torch.no_grad()
     def brain_frame(
@@ -978,6 +1045,85 @@ class ViTMAE3D(nn.Module):
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         return (weight * bce).sum() / (weight.sum() * target.shape[1]).clamp_min(1e-6)
 
+    @staticmethod
+    def _to_cells8(t: Tensor, patch) -> Tensor:
+        # native token voxels [R, px*py*pz] -> [R, 1, 8, 8, 8] (nearest; identity at 1 mm), so 2 mm
+        # sub-blocks are 2^3 voxel blocks
+        if tuple(patch) != (8, 8, 8):
+            # F.interpolate's nearest (src = floor(dst * in / out)) as one gather: upsample_nearest3d
+            # with ~1e5 batch rows is ~30x slower
+            t = t.reshape(-1, math.prod(patch)).index_select(1, cells8_index(tuple(patch), t.device))
+        return t.reshape(-1, 1, 8, 8, 8)
+
+    def mirror_ref(self, vols: Tensor, patch, box, grid, sp) -> Tensor:
+        # per token [b, N, 64]: the max within +-1 cell (2 mm cells) of each sub-block's x-mirrored cell
+        # (mirror about the box centre, the fit_to_shape centre); 1e4 where that cell is out of the
+        # mask, out of the box, or within 4 mm of the midline. at 1 mm = r18's mirror_map
+        img, msk = vols[0], vols[1]
+        b, N = img.shape[:2]
+        gx, gy, gz = grid
+
+        def cellvol(t: Tensor) -> Tensor:
+            c = self._to_cells8(t, patch).view(b, N, 4, 2, 4, 2, 4, 2).amax((3, 5, 7))
+            c = c.view(b, gx, gy, gz, 4, 4, 4).permute(0, 1, 4, 2, 5, 3, 6)
+            return c.reshape(b, gx * 4, gy * 4, gz * 4)
+
+        cells = cellvol(img)
+        valid = cellvol(msk.to(img.dtype)) > 0
+        hmax = F.max_pool3d(cells.float()[:, None], 3, 1, 1)[:, 0]
+        # x mirror index per cell, in voxels of this spacing: cell width px / 4
+        Cx, w = gx * 4, patch[0] / 4
+        centre = (torch.arange(Cx, device=img.device, dtype=torch.float64) + 0.5) * w
+        j = torch.floor((box[0] - centre) / w).long()
+        ok = (j >= 0) & (j < Cx) & ((centre - box[0] / 2).abs() * sp[0] >= 4.0)
+        j = j.clamp(0, Cx - 1)
+        mvalid = valid.index_select(1, j) & ok.view(1, -1, 1, 1)
+        ref = torch.where(mvalid, hmax.index_select(1, j), 1e4)
+        ref = ref.view(b, gx, 4, gy, 4, gz, 4).permute(0, 1, 3, 5, 2, 4, 6)
+        return ref.reshape(b, N, 64)
+
+    def mirror_terms(self, tokens: Tensor, patches: Tensor, mask: Tensor, patch, ref: Tensor, clean: Tensor | None):
+        # mirror level channels: (weighted bce sum, valid weight sum, level weight sum, weighted positives [M]).
+        # clean [rows, V] bool: tokens a corruption altered are out of the loss (ms-syn; None = all in)
+        x = self._to_cells8(patches.float(), patch)
+        m = self._to_cells8(mask.float(), patch)
+        weight = F.avg_pool3d(m, 2)
+        mh = ref.float().view(-1, 1, 4, 4, 4)
+        thr = torch.maximum(self.level_mirror_thresholds.view(1, -1, 1, 1, 1), mh + self.level_mirror_margin)
+        thr = thr.repeat_interleave(2, 2).repeat_interleave(2, 3).repeat_interleave(2, 4)
+        target = F.avg_pool3d((x > thr).float() * m, 2) / weight.clamp_min(1e-6)
+        m_weight = weight * (mh < 1e3).float()
+        if clean is not None:
+            m_weight = m_weight * clean.reshape(-1, 1, 1, 1, 1).float()
+        logits = self.level_mirror_head(tokens).float().reshape(target.shape)
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        return (m_weight * bce).sum(), m_weight.sum(), weight.sum(), (m_weight * target).sum((0, 2, 3, 4))
+
+    def lesion_targets(self, lesion: Tensor | None, mask: Tensor, patch) -> tuple[Tensor, Tensor]:
+        # level_terms' sub-blocks of the visible tokens: in-mask fraction, lesion fraction of it
+        px, py, pz = patch
+        m = mask.float().reshape(-1, 1, px, py, pz)
+        sub = self.patch_size[0] // self.level_pool
+        weight = F.adaptive_avg_pool3d(m, sub).flatten(1)
+        if lesion is None:
+            return weight, torch.zeros_like(weight)
+        target = F.adaptive_avg_pool3d(lesion.float().reshape(m.shape) * m, sub).flatten(1)
+        return weight, target / weight.clamp_min(1e-6)
+
+    @staticmethod
+    def altered_tokens(part: dict) -> Tensor | None:
+        # [rows, V] bool: visible tokens a corruption replaced or altered (ms-syn: out of the lesion and
+        # mirror level losses, as r24 excludes rtd-replaced tokens); None when nothing corrupts
+        out = None
+        for key, fn in (
+            ("rtd_label", lambda t: t), ("unified_label", lambda t: t > 0), ("hemi_label", lambda t: t),
+            ("corrupt_label", lambda t: t > 0), ("orient_label", lambda t: t > 0), ("shuffled", lambda t: t),
+        ):
+            if key in part:
+                hit = fn(part[key]).bool()
+                out = hit if out is None else out | hit
+        return out
+
     def forward_native(
         self,
         images: list[Float[Tensor, "X Y Z"]],
@@ -1014,6 +1160,12 @@ class ViTMAE3D(nn.Module):
             head_ws = self.decoder_head.native_weights(native_sps, sp_patches)
             embed_ws, head_ws = dict(zip(native_sps, embed_ws)), dict(zip(native_sps, head_ws))
 
+        tumors = {}
+        if self.training and self.tumor_prob > 0:
+            tumors = plan_tumors(
+                images, mask, groups, geoms, self.tumor_prob, self.tumor_radius, self.tumor_ring,
+                self.tumor_contrast, self.tumor_edge, self.tumor_nodule,
+            )
         parts = []
         for sp, ids in groups.items():
             patch, box, grid, _ = geoms[sp]
@@ -1025,6 +1177,18 @@ class ViTMAE3D(nn.Module):
                 src, dst = fit_slices(images[ii].shape, box)
                 vols[0, jj][dst] = images[ii][src]
                 vols[1, jj][dst] = mask[ii][src]
+            # ms-syn: blobs / tumours into the clean volumes before patchify (so before every token
+            # corruption): they enter the inputs and every target, shared by an image's sequences
+            lesion = None
+            if self.training and self.blob_prob > 0:
+                lesion = insert_blobs(
+                    vols[0], vols[1], patch, sp, self.blob_prob, self.blob_max, self.blob_radius,
+                    self.blob_contrast, self.blob_edge, with_mask=self.lesion_head is not None,
+                )
+            if sp in tumors:
+                tumor = paste_tumors(vols[0], vols[1], tumors[sp], with_mask=self.lesion_head is not None)
+                if tumor is not None:
+                    lesion = tumor if lesion is None else torch.maximum(lesion, tumor)
             raw = vols if (self.hemiswap_head is not None and self.training) else None
             vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
             cube = (grid, self.mask_cube) if self.mask_cube else None
@@ -1033,6 +1197,8 @@ class ViTMAE3D(nn.Module):
             parts[-1]["scores"] = scores
             if raw is not None:
                 parts[-1]["raw"] = raw
+            if self.lesion_head is not None and self.training:
+                parts[-1]["lesion"] = None if lesion is None else patchify3d(lesion, patch)
 
         # one argsort for all groups, rows padded with 3.0 (after every score). sorts this long are
         # stable, so these are the per group argsorts
@@ -1112,6 +1278,25 @@ class ViTMAE3D(nn.Module):
             part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
             if self.level_head is not None or (self.edgelvl_head is not None and self.training):
                 part["vis_patches"], part["vis_mask"] = vis_patches, vis_mask
+            if self.lesion_head is not None or self.level_mirror_head is not None:
+                # ms-syn: visible token ids into the [b * num] token grid; tokens a corruption altered
+                # show the donor / a transform, not the host: out of the lesion and mirror losses
+                vis_ids = (part["order"][..., :num_visible] + (torch.arange(b, device=device) * num).view(-1, 1, 1))
+                vis_ids = vis_ids.flatten()
+                altered = self.altered_tokens(part) if self.training else None
+                part["syn_clean"] = None if altered is None else ~altered
+                if "lesion" in part:
+                    if part["lesion"] is not None:
+                        part["lesion"] = part["lesion"].flatten(0, 1).index_select(0, vis_ids)
+                    lm = vis_mask
+                    if altered is not None:
+                        lm = vis_mask * ~altered[..., None]
+                    part["lesion_mask"] = lm
+                if self.level_mirror_head is not None:
+                    # mirror references of the visible tokens [b * S * num_visible, 64], from the
+                    # clean (lesion-pasted, uncorrupted) volumes
+                    ref = self.mirror_ref(vols, patch, geoms[sp][1], geoms[sp][2], sp)
+                    part["mirror_ref"] = ref.flatten(0, 1).index_select(0, vis_ids)
 
         def cat(key: str) -> Tensor:
             # contiguous for one group too, the compiled encoder would recompile on view strides
@@ -1196,6 +1381,38 @@ class ViTMAE3D(nn.Module):
                 )
                 num, den = num + n, den + d
             loss = loss + self.level_weight * num / den.clamp_min(1e-6)
+            if self.level_mirror_head is not None:
+                mterms = [
+                    self.mirror_terms(
+                        tokens[:, self.class_tokens :], part["vis_patches"], part["vis_mask"], part["patch"],
+                        part.pop("mirror_ref"), part["syn_clean"],
+                    )
+                    for part, tokens in zip(parts, rows)
+                ]
+                # summed over groups: (weighted bce, valid weight, level weight, weighted positives [M])
+                mb, mw, lw, mp = [sum(t[k] for t in mterms) for k in range(4)]
+                T = len(self.level_thresholds)
+                # same per-channel weight as the level channels (r18: / (valid weight * T))
+                loss = loss + self.level_weight * mb / (mw * T).clamp_min(1e-6)
+                M = len(self.level_mirror)
+                self.level_mirror_stats = {
+                    "bce": (mb / (mw * M).clamp_min(1e-6)).detach(),
+                    "valid": (mw / lw.clamp_min(1e-6)).detach(),
+                    **{f"pos{t:g}": v for t, v in zip(self.level_mirror, (mp / mw.clamp_min(1e-6)).detach())},
+                }
+        if self.lesion_head is not None and self.training:
+            pairs = [self.lesion_targets(part.pop("lesion"), part.pop("lesion_mask"), part["patch"]) for part in parts]
+            weight, target = [torch.cat(v) for v in zip(*pairs)]
+            logits = self.lesion_head(embeds[:, self.class_tokens :]).float().reshape(target.shape)
+            bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+            lw = weight.sum().clamp_min(1e-6)
+            les_loss = (weight * bce).sum() / lw
+            loss = loss + self.lesion_mask_weight * les_loss
+            self.level_mirror_stats = {
+                **self.level_mirror_stats, "les_bce": les_loss.detach(), "les_pos": ((weight * target).sum() / lw).detach(),
+            }
+        for part in parts:
+            part.pop("syn_clean", None)
         if self.fino_heads is not None and fino_meta is not None:
             # the global embedding of each sequence: mean of its visible encoder tokens (eval:
             # mean of all brain-touching tokens); rows are part by part, image-major
@@ -1461,6 +1678,195 @@ def vit_mae_3d(checkpoint: str, random_weights: bool = False) -> ViTMAE3D:
     return model
 
 
+def insert_blobs(
+    images: Tensor,
+    mask: Tensor,
+    patch: tuple[int, int, int],
+    sp: tuple[float, float, float],
+    prob: float,
+    num: int,
+    radius: tuple[float, float],
+    contrast: tuple[float, float],
+    edge: float,
+    box_mm: float = 40.0,
+    with_mask: bool = False,
+) -> Tensor | None:
+    # in place on a spacing group's padded volumes [B, X, Y, Z] (voxels of sp mm): per image (share
+    # prob) 1 to num soft edged ellipsoids with a perturbed boundary, sized in mm, each in a box_mm
+    # box and centred in a patch >= 90% in the mask. with_mask: returns the soft blob mask [B, X, Y, Z]
+    B, X, Y, Z = images.shape
+    dev = images.device
+    dims = torch.tensor([X, Y, Z], device=dev)
+    pt = torch.tensor(patch, device=dev)
+    mm = torch.tensor(sp, device=dev, dtype=torch.float32)
+    gx, gy, gz = X // patch[0], Y // patch[1], Z // patch[2]
+    ok = mask.view(B, gx, patch[0], gy, patch[1], gz, patch[2]).float().mean((2, 4, 6)).view(B, 1, -1) >= 0.9
+    # uniform over the qualifying patches (any patch when none qualify)
+    idx = (torch.rand(B, num, ok.shape[2], device=dev) + ok.float()).argmax(-1)
+    cell = torch.stack([idx // (gy * gz), idx // gz % gy, idx % gz], -1)
+    centre = (cell * pt).float() + torch.rand(B, num, 3, device=dev) * pt
+    box = [min(d, math.ceil(box_mm / s)) for d, s in zip((X, Y, Z), sp)]
+    bt = torch.tensor(box, device=dev)
+    lo = torch.minimum((centre.long() - bt // 2).clamp_min(0), dims - bt)
+    r = torch.exp(torch.rand(B, num, 1, device=dev) * math.log(radius[1] / radius[0]) + math.log(radius[0]))
+    axes = r * torch.exp(torch.rand(B, num, 3, device=dev) * 0.4 - 0.2)
+    knots = 0.1 * torch.randn(B * num, 1, 4, 4, 4, device=dev)
+    pert = F.interpolate(knots, size=box, mode="trilinear", align_corners=True).view(B, num, -1)
+    grid = torch.meshgrid(*[torch.arange(n, device=dev) for n in box], indexing="ij")
+    pos = lo[:, :, None] + torch.stack(grid, -1).view(1, 1, -1, 3)
+    d = ((pos - centre[:, :, None]) * mm / axes[:, :, None]).norm(dim=-1) * (1 + pert)
+    on = (torch.rand(B, 1, device=dev) < prob) & (
+        torch.arange(num, device=dev) < torch.randint(1, num + 1, (B, 1), device=dev)
+    )
+    amp = (torch.rand(B, num, 1, device=dev) * (contrast[1] - contrast[0]) + contrast[0]) * on[..., None]
+    flat = (pos[..., 0] * Y + pos[..., 1]) * Z + pos[..., 2]
+    flat = (flat + torch.arange(B, device=dev).view(-1, 1, 1) * (X * Y * Z)).view(-1)
+    soft = torch.sigmoid((1 - d) * r / edge)
+    inside = mask.reshape(-1)[flat].float()
+    val = (amp * soft).view(-1) * inside
+    images.view(-1).index_add_(0, flat, val.to(images.dtype))
+    if not with_mask:
+        return None
+    out = torch.zeros_like(images)
+    out.view(-1).scatter_reduce_(0, flat, ((soft * on[..., None]).view(-1) * inside).to(out.dtype), "amax")
+    return out
+
+
+def paste_tumors(images: Tensor, mask: Tensor, plan: tuple, with_mask: bool = False) -> Tensor | None:
+    # in place on a spacing group's padded volumes [B, X, Y, Z], in the mask only, clipped to each
+    # image's own in-mask range (a saturating enhancement). returns the soft lesion mask if asked
+    flat, val, soft, lim = plan
+    inside = mask.reshape(-1)[flat] > 0
+    old = images.view(-1)[flat]
+    new = torch.minimum(torch.maximum(old + val, lim[:, 0]), lim[:, 1]).to(old.dtype)
+    images.view(-1).index_copy_(0, flat, torch.where(inside, new, old))
+    if not with_mask:
+        return None
+    out = torch.zeros_like(images)
+    out.view(-1).index_copy_(0, flat, (soft * inside).to(out.dtype))
+    return out
+
+
+def plan_tumors(
+    images: list[Tensor],
+    masks: list[Tensor],
+    groups: dict[tuple, list[int]],
+    geoms: dict[tuple, tuple],
+    prob: float,
+    radius: tuple[float, float],
+    ring: float,
+    contrast: tuple[float, float],
+    edge: tuple[float, float],
+    nodule: float,
+) -> dict[tuple, tuple[Tensor, Tensor, Tensor, Tensor]]:
+    # one lobulated mass sized in mm in a prob share of the batch, centred >= 6 mm inside the mask: a
+    # solid bright 3-10 mm nodule (share nodule), else a bright 3-8 mm rim of uneven thickness on a
+    # mildly darker core (share ring) or a diffuse bright mass. all spacing groups in one pass over
+    # the masses' own boxes; per spacing: flat voxel indices into its padded [B, X, Y, Z] volumes, the
+    # value to add, the soft lesion mask and the image's in-mask (min, max) there
+    dev = masks[0].device
+    k = min(len(masks), int(prob * len(masks) + torch.rand(()).item()))
+    if k == 0:
+        return {}
+    chosen = set(torch.randperm(len(masks))[:k].tolist())
+    geo, owners, counts = [], [], {}
+    for sp, ids in groups.items():
+        patch, box, grid, _ = geoms[sp]
+        dims = [num * p for num, p in zip(grid, patch)]
+        for jj, ii in enumerate(ids):
+            if ii not in chosen:
+                continue
+            src, dst = fit_slices(masks[ii].shape, box)
+            span = [d.stop - d.start for d in dst]
+            geo.append([*sp, *dims, *(d.start for d in dst), *span, *(d.start - c.start for c, d in zip(src, dst)),
+                        *masks[ii].shape, jj * math.prod(dims)])
+            owners.append(ii)
+            counts[sp] = counts.get(sp, 0) + 1
+    # per mass draws and box sizes on the cpu stream (known sizes, no gpu sync)
+    geo = torch.tensor(geo, dtype=torch.float64)
+    spc, dims, dst0, span, shift, shape = geo[:, :18].split(3, 1)
+    u = torch.rand(k, 10, dtype=torch.float64)
+    is_nodule = u[:, 9] < nodule
+    is_ring = ~is_nodule & (u[:, 4] < ring)
+    hot = is_nodule | is_ring
+    r = torch.where(is_nodule, 3.0 * (10.0 / 3.0) ** u[:, 0], radius[0] * (radius[1] / radius[0]) ** u[:, 0])
+    axes = r[:, None] * torch.exp(u[:, 1:4] * 0.4 - 0.2)
+    # ring and nodule edges 2 mm wide (10-90%), diffuse edges at most r wide
+    width = torch.where(hot, 2.0, torch.minimum(edge[0] + u[:, 5] * (edge[1] - edge[0]), r))
+    rim = torch.minimum(3.0 + 5.0 * u[:, 6], 0.6 * r)
+    amp = torch.where(hot, 2.0 + 3.0 * u[:, 7], contrast[0] + u[:, 7] * (contrast[1] - contrast[0]))
+    # box per axis: its semi-axis at the largest boundary bump (d = 1 / 0.75), + the edge
+    num = torch.minimum(dims, torch.ceil(2 * (axes / 0.75 + width[:, None]) / spc)).long()
+    size = num.prod(1)
+    start = size.cumsum(0) - size
+    total = int(size.sum())
+    ints = torch.cat([
+        dims, dst0, span, shift, shape, (6.0 / spc).round().clamp_min(1), num, start[:, None], geo[:, 18:],
+    ], 1).long().to(dev)
+    dims, dst0, span, shift, shape, probe, num = ints[:, :21].split(3, 1)
+    start, base = ints[:, 21], ints[:, 22]
+    # columns: mm per voxel, 1 / semi-axes, 1 / bump scale, r, 1 / logistic scale, rim, ring, contrasts, knot row
+    cols = torch.cat([
+        spc, 1 / axes, 1 / (1.6 * r[:, None]), r[:, None], 4.4 / width[:, None], rim[:, None], is_ring[:, None],
+        amp[:, None], 0.2 + 0.6 * u[:, 8:9], 5.0 * torch.arange(k)[:, None],
+    ], 1).float().to(dev)
+
+    # centre: of 64 voxels in the image, the first with itself and its 6 mm axis neighbours in the mask
+    cand = torch.minimum((torch.rand(k, 64, 3, device=dev) * span[:, None]).long(), span[:, None] - 1) + dst0[:, None]
+    star = torch.tensor(
+        [[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]], device=dev
+    )
+    pts = (cand - shift[:, None])[:, :, None] + star * probe[:, None, None]
+    pts = torch.minimum(pts.clamp_min(0), shape[:, None, None] - 1)
+    pts = (pts[..., 0] * shape[:, 1, None, None] + pts[..., 1]) * shape[:, 2, None, None] + pts[..., 2]
+    hits = torch.stack([masks[ii].reshape(-1)[pts[t].reshape(-1)] for t, ii in enumerate(owners)])
+    best = hits.view(k, 64, 7).sum(-1).argmax(1)
+    centre = torch.take_along_dim(cand, best.view(k, 1, 1).expand(k, 1, 3), 1)[:, 0] + torch.rand(k, 3, device=dev)
+    lo = torch.minimum((centre.long() - num // 2).clamp_min(0), dims - num)
+    lim = torch.stack([
+        torch.stack([
+            torch.where(masks[ii].bool(), images[ii], math.inf).amin(),
+            torch.where(masks[ii].bool(), images[ii], -math.inf).amax(),
+        ])
+        for ii in owners
+    ]).float()
+
+    # every box voxel of every mass in one ragged row: owner, then its box and volume indices
+    owner = torch.zeros(total, dtype=torch.int32, device=dev)
+    owner[start[1:]] = 1
+    owner = owner.cumsum(0, dtype=torch.int32)
+    per = torch.stack([
+        start, num[:, 1] * num[:, 2], num[:, 1], num[:, 2], dims[:, 1] * dims[:, 2], dims[:, 2],
+    ], 1).int().index_select(0, owner)
+    q = torch.arange(total, dtype=torch.int32, device=dev) - per[:, 0]
+    loc = torch.stack([q // per[:, 1], q // per[:, 3] % per[:, 2], q % per[:, 3]], 1)
+    flat = (base + (lo[:, 0] * dims[:, 1] + lo[:, 1]) * dims[:, 2] + lo[:, 2]).index_select(0, owner)
+    flat = flat + (loc[:, 0] * per[:, 4] + loc[:, 1] * per[:, 5] + loc[:, 2])
+    par = torch.cat([cols, centre - lo], 1).index_select(0, owner)
+    rel = (loc - par[:, 14:17]) * par[:, 0:3]  # mm from the centre
+    d = (rel * par[:, 3:6]).square().sum(1).sqrt()
+    # boundary bumps and rim thickness: trilinear noise on 5^3 knots spanning +-1.6 r of the mass,
+    # masses stacked on depth
+    knots = (0.15 * torch.randn(1, 2, 5 * k, 5, 5, device=dev)).clamp(-0.25, 0.25)
+    g = (rel * par[:, 6:7]).clamp(-1, 1)
+    row = (par[:, 13] + (g[:, 0] + 1) * 2) * (2 / (5 * k - 1)) - 1
+    grid = torch.stack([g[:, 2], g[:, 1], row], -1).view(1, total, 1, 1, 3)
+    bump, thick = F.grid_sample(knots, grid, mode="bilinear", padding_mode="border", align_corners=True).view(2, total)
+    depth = (1 - d * (1 + bump)) * par[:, 7]  # ~mm inside the boundary
+    outer = torch.sigmoid(depth * par[:, 8])
+    # rim 0.5-1.5x its thickness around the mass, 4 mm wide transition to the core
+    core = torch.sigmoid((depth - par[:, 9] * (1 + 2 * thick)) * (4.4 / 4.0)) * par[:, 10]
+    val = par[:, 11] * (outer - core) - par[:, 12] * core
+    lim = lim.index_select(0, owner)
+    out, t = {}, 0
+    size, start = size.tolist(), start.tolist()
+    for sp, n in counts.items():
+        a, b = start[t], start[t + n - 1] + size[t + n - 1]
+        out[sp] = (flat[a:b], val[a:b], outer[a:b], lim[a:b])
+        t += n
+    return out
+
+
 def patchify3d(x: Tensor, patch_size: int | tuple[int, int, int] = 8) -> Tensor:
     px, py, pz = (patch_size,) * 3 if isinstance(patch_size, int) else patch_size
     x = rearrange(x, "b (gx px) (gy py) (gz pz) -> b (gx gy gz) (px py pz)", px=px, py=py, pz=pz)
@@ -1675,3 +2081,11 @@ def _init_weights(m: nn.Module) -> None:
         nn.init.constant_(m.weight, 1.0)
         if m.bias is not None:
             nn.init.constant_(m.bias, 0)
+
+
+@lru_cache(maxsize=4096)
+def cells8_index(patch: tuple[int, int, int], device: torch.device) -> Tensor:
+    # flat voxel index in a px x py x pz patch of each 8^3 nearest-resampled voxel
+    ax = [torch.div(torch.arange(8) * p, 8, rounding_mode="floor") for p in patch]
+    i, j, k = torch.meshgrid(*ax, indexing="ij")
+    return ((i * patch[1] + j) * patch[2] + k).flatten().to(device)
