@@ -22,7 +22,11 @@ from torch import Tensor
 logger = logging.getLogger()
 
 # column order of the per-image metadata tensor; NaN = missing (masked)
-COLUMNS = ("age", "sex", "group", "field_strength", "manufacturer", "brain_volume")
+COLUMNS = ("age", "sex", "group", "field_strength", "manufacturer", "brain_volume", "seqtype")
+# MRI sequence type head (ms-aux): T1 (T1w, T1c, MP2RAGE, UNIT1) / T2 / FLAIR / DWI / other, from the
+# images.parquet modality + suffix (BIDS) columns. DWI is its own class: 43% of the qc list
+SEQTYPES = ("t1", "t2", "flair", "dwi", "other")
+T1_SUFFIXES = {"T1w", "T1c", "MP2RAGE", "UNIT1"}
 CONTROL = {"control", "controls", "normal", "hc", "cn", "healthy", "healthy control",
            "healthy controls", "typically developing", "td", "nc"}
 MANUFACTURERS = ("siemens", "ge", "philips")
@@ -31,7 +35,8 @@ MANUFACTURERS = ("siemens", "ge", "philips")
 def head_dims(cfg) -> dict[str, int]:
     # output width of each enabled head (multiplier != 0)
     dims = {"age": 1, "sex": 1, "group": len(cfg["group_classes"] or []),
-            "field_strength": 3, "manufacturer": len(MANUFACTURERS) + 1, "brain_volume": 1}
+            "field_strength": 3, "manufacturer": len(MANUFACTURERS) + 1, "brain_volume": 1,
+            "seqtype": len(SEQTYPES)}
     return {k: d for k, d in dims.items() if float(cfg.get(k) or 0.0) != 0.0}
 
 
@@ -46,7 +51,8 @@ def build_meta(cfg, paths: list[str], images_parquet: str | Path) -> Tensor:
     """Per-dataset-index metadata [N, 6] float32, joined on the sampler path
     (derivatives/<collection>/.../<stem>.npz <-> images.parquet source/<...>.nii.gz). Fills
     cfg.group_classes and cfg.age_mean / cfg.age_std (from the train filelist rows)."""
-    cols = ["path", "collection", "age", "sex", "group", "field_strength", "manufacturer", "brain_volume"]
+    cols = ["path", "collection", "age", "sex", "group", "field_strength", "manufacturer", "brain_volume",
+            "modality", "suffix"]
     table = pd.read_parquet(images_parquet, columns=cols)
     key = "derivatives/" + table["path"].str.removeprefix("source/").str.removesuffix(".nii.gz") + ".npz"
     table = table.set_index(key).reindex(paths)
@@ -86,7 +92,20 @@ def build_meta(cfg, paths: list[str], images_parquet: str | Path) -> Tensor:
         cfg["bv_std"] = float(np.nanstd(bv))
     bv = (bv - cfg["bv_mean"]) / cfg["bv_std"]
 
-    meta = np.stack([age, sex, group, field, manu, bv], axis=1)
+    def seq_class(modality, suffix) -> float:
+        if modality == "dwi":
+            return 3.0
+        if suffix in T1_SUFFIXES:
+            return 0.0
+        if suffix == "T2w":
+            return 1.0
+        if suffix == "FLAIR":
+            return 2.0
+        return 4.0
+
+    seq = np.array([seq_class(m, x) for m, x in zip(table["modality"], table["suffix"])], dtype=np.float64)
+
+    meta = np.stack([age, sex, group, field, manu, bv, seq], axis=1)
     meta[excluded] = np.nan
     known = {c: float(np.mean(~np.isnan(meta[:, ii]))) for ii, c in enumerate(COLUMNS)}
     logger.info(
@@ -152,4 +171,8 @@ class FinoHeads(nn.Module):
                     term = (F.cross_entropy(out, t.long(), reduction="none") * keep).sum() / n
                 loss = loss + self.weight * term
                 stats[k] = term.detach()
+                if k not in ("age", "brain_volume"):
+                    with torch.no_grad():
+                        pred = (out[:, 0] > 0).float() if k == "sex" else out.argmax(-1).float()
+                        stats[f"{k}_acc"] = ((pred == t) & keep).sum() / n
         return loss, stats

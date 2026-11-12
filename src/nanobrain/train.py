@@ -183,6 +183,14 @@ def main(args: DictConfig):
 
     dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
     dataset.meta = fino_meta
+    if float(args.model_kwargs.get("scanmatch_weight", 0.0) or 0.0) > 0.0:
+        # same-scan matching masks same-subject scans out of the negatives (subject tempering's key)
+        from nanobrain.data import subject_counts
+
+        keys, _ = subject_counts(dataset.paths)
+        index = {}
+        dataset.subject_ids = np.array([index.setdefault(k, len(index)) for k in keys], dtype=np.int64)
+        logger.info(f"scanmatch: {len(index)} subject keys for negative masking")
     logger.info(f"train dataset: {len(dataset)} images")
 
     if args.epochs:
@@ -480,6 +488,7 @@ def train(
                 "fino_meta": batch["fino"],
                 "fino_gamma": fino_ramp(args.fino3d.gamma_max, progress),
             }
+        aux_kwargs = {"subject_ids": batch["subject"]} if "subject" in batch else {}
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,
@@ -490,6 +499,7 @@ def train(
                 with_state=False,
                 spacing=batch.get("spacing"),
                 **fino_kwargs,
+                **aux_kwargs,
             )
 
         # the cuda graph's output buffer is overwritten by the next replay
@@ -528,6 +538,8 @@ def train(
                 for k, v in model_without_ddp.fino_stats.items():
                     log_stats[f"fino_{k}"] = float(v)
             for k, v in getattr(model_without_ddp, "shuffle_stats", {}).items():
+                log_stats[k] = float(v)
+            for k, v in getattr(model_without_ddp, "aux_stats", {}).items():
                 log_stats[k] = float(v)
             if misc.is_main_process():
                 with log_path.open("a") as f:
@@ -693,6 +705,8 @@ def make_batch_transform(args: DictConfig):
             out = {key: [sample[key] for sample in batch] for key in ("image", "mask", "spacing")}
             if "fino" in raw[0]:
                 out["fino"] = torch.from_numpy(np.stack([sample["fino"] for sample in raw]))
+            if "subject" in raw[0]:
+                out["subject"] = torch.tensor([sample["subject"] for sample in raw], dtype=torch.int64)
             return out
         images = torch.stack([sample["image"] for sample in batch])
         masks = torch.stack([sample["mask"] for sample in batch])

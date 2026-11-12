@@ -108,8 +108,46 @@ class ViTMAE3D(nn.Module):
         # tokens the encoder flags as foreign are muted for reconstruction and the MAE loss reaches
         # the detection features. g = 1 at the zero-init head (identity at step 0); 0 = off
         rtd_gate_scale: float = 0.0,
+        # ---- ms-aux pretext heads (native training only, all training-only, 0 = off) ----
+        # where-am-I: zero-init Linear(D, 3) on the visible encoder tokens regresses each token's
+        # centre in brain-normalized RAS coordinates ((centre - brain-mask centroid) / brain
+        # half-extent, per axis; smooth-L1). a brainpos_hide_frac share of the visible tokens get a
+        # learned "unknown position" embedding instead of their position embedding
+        brainpos_weight: float = 0.0,
+        brainpos_hide_frac: float = 0.25,
+        # same-scan matching: mean visible token -> MLP (D, D, scanmatch_dim) -> l2; the
+        # num_samples maskings of one scan are positives, every other scan (minus same-subject
+        # scans) a negative; symmetric InfoNCE at scanmatch_temp
+        scanmatch_weight: float = 0.0,
+        scanmatch_temp: float = 0.1,
+        scanmatch_dim: int = 256,
+        # hemisphere swap detection: a hemiswap_ratio share of the visible tokens is replaced by
+        # the left-right mirror of the contralateral block (mirrored across the brain-mask
+        # centroid x, RAS axis 0); zero-init Linear(D, 1), BCE. MAE targets stay clean
+        hemiswap_weight: float = 0.0,
+        hemiswap_ratio: float = 0.1,
+        # corruption-type detection: a corrupt_ratio share of the visible tokens gets a bias ramp
+        # (x0.7-1.3), a sigma 1 voxel blur or Rician-like noise (10% of the in-brain patch std);
+        # zero-init Linear(D, 4) over {clean, bias, blur, noise}, CE. MAE targets stay clean
+        corrupt_weight: float = 0.0,
+        corrupt_ratio: float = 0.1,
+        # edge level-set: the level head construction on the gradient magnitude (central
+        # differences per mm on the patch's own voxel grid), thresholds k x the row's in-brain
+        # median gradient, level_pool sub-blocks, BCE weighted by brain fraction
+        edgelvl_weight: float = 0.0,
+        edgelvl_thresholds: tuple[float, ...] = (0.5, 1.0, 1.5, 2.0),
     ):
         super().__init__()
+        self.brainpos_weight = float(brainpos_weight)
+        self.brainpos_hide_frac = float(brainpos_hide_frac)
+        self.scanmatch_weight = float(scanmatch_weight)
+        self.scanmatch_temp = float(scanmatch_temp)
+        self.hemiswap_weight = float(hemiswap_weight)
+        self.hemiswap_ratio = float(hemiswap_ratio)
+        self.corrupt_weight = float(corrupt_weight)
+        self.corrupt_ratio = float(corrupt_ratio)
+        self.edgelvl_weight = float(edgelvl_weight)
+        self.aux_stats = {}
         self.orient_weight = float(orient_weight)
         self.orient_ratio = float(orient_ratio)
         self.shuffle_weight = float(shuffle_weight)
@@ -243,6 +281,192 @@ class ViTMAE3D(nn.Module):
             self.shuffle_head = nn.Linear(embed_dim, 1)
             nn.init.zeros_(self.shuffle_head.weight)
             nn.init.zeros_(self.shuffle_head.bias)
+
+        # ms-aux heads, built last so every other parameter is initialized as with them off
+        def zero_linear(dout: int) -> nn.Linear:
+            head = nn.Linear(embed_dim, dout)
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+            return head
+
+        self.brainpos_head = None
+        if self.brainpos_weight > 0.0:
+            assert native, "brainpos: native training only"
+            self.brainpos_head = zero_linear(3)
+            self.brainpos_unk = nn.Parameter(torch.zeros(embed_dim))
+            nn.init.trunc_normal_(self.brainpos_unk, std=0.02)
+        self.scanmatch_proj = None
+        if self.scanmatch_weight > 0.0:
+            assert native, "scanmatch: native training only"
+            self.scanmatch_proj = nn.Sequential(
+                nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, int(scanmatch_dim))
+            )
+            self.scanmatch_proj.apply(_init_weights)
+        self.hemiswap_head = None
+        if self.hemiswap_weight > 0.0:
+            assert native, "hemiswap: native training only"
+            self.hemiswap_head = zero_linear(1)
+        self.corrupt_head = None
+        if self.corrupt_weight > 0.0:
+            assert native, "corrupt: native training only"
+            self.corrupt_head = zero_linear(4)
+        self.edgelvl_head = None
+        if self.edgelvl_weight > 0.0:
+            assert native, "edgelvl: native training only"
+            edges = [float(t) for t in edgelvl_thresholds]
+            self.edgelvl_head = zero_linear(len(edges) * (patch_size // level_pool) ** 3)
+            self.register_buffer("edgelvl_thresholds", torch.tensor(edges), persistent=False)
+
+    @torch.no_grad()
+    def brain_frame(
+        self, mask_patches: Tensor, grid: tuple[int, int, int], patch: tuple[int, int, int]
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Per image brain frame on the padded box, in voxels: token centres [num, 3], brain-mask
+        centroid [b, 3] (voxel-count weighted token centres) and half-extent [b, 3] (outermost
+        brain-touching token centres +- half a patch)."""
+        dev = mask_patches.device
+        axes = [(torch.arange(g, device=dev, dtype=torch.float32) + 0.5) * p for g, p in zip(grid, patch)]
+        centres = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(-1, 3)
+        counts = mask_patches.float().sum(-1)  # [b, num]
+        cen = counts @ centres / counts.sum(1, keepdim=True).clamp_min(1.0)
+        has = (counts > 0)[..., None]
+        hi = torch.where(has, centres[None], -math.inf).amax(1)
+        lo = torch.where(has, centres[None], math.inf).amin(1)
+        half = ((hi - lo) / 2 + torch.tensor(patch, device=dev, dtype=torch.float32) / 2)
+        half = torch.where(torch.isfinite(half), half, torch.ones_like(half)).clamp_min(1.0)
+        return centres, cen, half
+
+    @torch.no_grad()
+    def hemiswap_replace(
+        self, vis_patches: Tensor, vis_mask: Tensor, raw: Tensor, vis_order: Tensor,
+        grid: tuple[int, int, int], patch: tuple[int, int, int], cen: Tensor, img_of_row: Tensor,
+        exclude: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Replace a hemiswap_ratio share of the visible tokens by the x-flipped block at the
+        contralateral position (mirrored across the brain centroid x, RAS axis 0) of the same
+        image. raw [2, b, X, Y, Z] is the padded (image, mask) box. Eligible: the mirror block is
+        >= 50% brain, the token is >= one patch off the midline, and not in `exclude` (rtd)."""
+        px, py, pz = patch
+        gx, gy, gz = grid
+        X, Y, Z = raw.shape[-3:]
+        dev = vis_patches.device
+        t = vis_order
+        ix, iy, iz = t // (gy * gz), (t // gz) % gy, t % gz
+        sx = (ix * px).float()
+        cx = cen[img_of_row, 0][:, None]
+        start = torch.round(2 * cx - sx - px).long().clamp(0, X - px)
+        far = ((sx + px / 2) - cx).abs() >= px
+        ax, ay, az = torch.meshgrid(
+            torch.arange(px, device=dev), torch.arange(py, device=dev), torch.arange(pz, device=dev),
+            indexing="ij",
+        )
+        ax, ay, az = ax.reshape(-1), ay.reshape(-1), az.reshape(-1)
+        xs = start[..., None] + (px - 1 - ax)  # the x flip
+        ys = (iy * py)[..., None] + ay
+        zs = (iz * pz)[..., None] + az
+        flat = ((img_of_row[:, None, None] * X + xs) * Y + ys) * Z + zs
+        m_patches = raw[0].reshape(-1)[flat].to(vis_patches.dtype)
+        m_mask = raw[1].reshape(-1)[flat].to(vis_mask.dtype)
+        ok = (m_mask.float().mean(-1) >= 0.5) & far
+        if exclude is not None:
+            ok = ok & ~exclude
+        hit = (torch.rand(t.shape, device=dev) < self.hemiswap_ratio) & ok
+        sel = hit[..., None]
+        return torch.where(sel, m_patches, vis_patches), torch.where(sel, m_mask, vis_mask), hit
+
+    @torch.no_grad()
+    def corrupt_transform(
+        self, vis_patches: Tensor, vis_mask: Tensor, patch: tuple[int, int, int], exclude: Tensor | None
+    ) -> tuple[Tensor, Tensor]:
+        """Corrupt a corrupt_ratio share of the visible (>= 50% brain) tokens with 1 = a smooth
+        multiplicative bias ramp (x[0.7, 1.3] across the patch, applied above the row's in-brain
+        minimum), 2 = a sigma 1 voxel gaussian blur (normalized inside the mask), 3 = Rician-like
+        noise at 10% of the patch's in-brain std. Returns (patches, labels [rows, V] long)."""
+        rows, nv, P = vis_patches.shape
+        px, py, pz = patch
+        dev = vis_patches.device
+        x = vis_patches.float()
+        m = vis_mask.float()
+        ok = m.mean(-1) >= 0.5
+        if exclude is not None:
+            ok = ok & ~exclude
+        hit = (torch.rand(rows, nv, device=dev) < self.corrupt_ratio) & ok
+        labels = torch.where(hit, torch.randint(1, 4, (rows, nv), device=dev), 0)
+        lo = torch.where(m > 0, x, math.inf).amin(dim=(1, 2), keepdim=True)
+        lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
+        cnt = m.sum(-1, keepdim=True).clamp_min(1.0)
+        mean = (x * m).sum(-1, keepdim=True) / cnt
+        std = (((x - mean) ** 2 * m).sum(-1, keepdim=True) / cnt).sqrt()
+        # (1) bias ramp along a random direction: |u . r| <= 1 with r in [-1, 1]^3
+        axes = [((torch.arange(p, device=dev) + 0.5) / p * 2 - 1) for p in (px, py, pz)]
+        r = torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(-1, 3)
+        u = torch.randn(rows, nv, 3, device=dev)
+        u = u / u.abs().sum(-1, keepdim=True).clamp_min(1e-6)
+        amp = 0.2 + 0.1 * torch.rand(rows, nv, 1, device=dev)
+        x_bias = (x - lo) * (1 + amp * (u @ r.T)) + lo
+        # (2) separable gaussian blur, sigma 1 voxel, normalized convolution inside the mask
+        k = torch.exp(-torch.arange(-2, 3, device=dev, dtype=torch.float32) ** 2 / 2)
+        k = k / k.sum()
+        vol = torch.cat([(x * m).reshape(-1, 1, px, py, pz), m.reshape(-1, 1, px, py, pz)], 1)
+        vol = vol.reshape(-1, 1, px, py, pz)
+        for axis, size in zip((2, 3, 4), (px, py, pz)):
+            if size < 2:
+                continue
+            shape = [1, 1, 1, 1, 1]
+            shape[axis] = 5
+            pad = [0, 0, 0, 0, 0, 0]
+            pad[2 * (4 - axis)] = pad[2 * (4 - axis) + 1] = 2
+            vol = F.conv3d(F.pad(vol, pad, mode="replicate"), k.view(shape))
+        vol = vol.reshape(-1, 2, P)
+        x_blur = (vol[:, 0] / vol[:, 1].clamp_min(1e-3)).reshape(rows, nv, P)
+        # (3) Rician-like noise on the magnitude above the row minimum
+        s = 0.1 * std
+        n1 = torch.randn_like(x) * s
+        n2 = torch.randn_like(x) * s
+        x_noise = ((x - lo + n1) ** 2 + n2**2).sqrt() + lo
+        out = x
+        for c, xc in ((1, x_bias), (2, x_blur), (3, x_noise)):
+            out = torch.where((labels == c)[..., None], xc, out)
+        out = out * m
+        return out.to(vis_patches.dtype), labels
+
+    def edgelvl_terms(
+        self, tokens: Tensor, patches: Tensor, mask: Tensor, patch, spacing
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Edge level-set head: level_terms on the gradient magnitude (central differences per
+        mm, only where both neighbours are in the mask), thresholds edgelvl_thresholds x the
+        row's in-brain median gradient. Returns (weighted bce sum, normalizer, weighted abs err)."""
+        px, py, pz = patch
+        rows, nv = patches.shape[:2]
+        with torch.no_grad():
+            x = patches.float().reshape(-1, 1, px, py, pz)
+            m = mask.float().reshape(-1, 1, px, py, pz)
+            g2 = torch.zeros_like(x)
+            for axis, size, sp in zip((2, 3, 4), (px, py, pz), spacing):
+                if size < 3:
+                    continue
+                d = (x.narrow(axis, 2, size - 2) - x.narrow(axis, 0, size - 2)) / (2.0 * float(sp))
+                both = m.narrow(axis, 2, size - 2) * m.narrow(axis, 0, size - 2)
+                pad = [0, 0, 0, 0, 0, 0]
+                pad[2 * (4 - axis)] = pad[2 * (4 - axis) + 1] = 1
+                g2 = g2 + F.pad((d * both) ** 2, pad)
+            g = g2.sqrt() * m
+            # per-row in-brain median gradient
+            flat = torch.where(m > 0, g, math.inf).reshape(rows, -1)
+            cnt = (m > 0).reshape(rows, -1).sum(1)
+            srt = flat.sort(dim=1).values
+            med = srt.gather(1, (cnt // 2).clamp(max=flat.shape[1] - 1)[:, None]).squeeze(1)
+            med = torch.where(torch.isfinite(med) & (med > 0), med, torch.ones_like(med))
+            thr = med[:, None] * self.edgelvl_thresholds[None]  # [rows, L]
+            thr = thr.repeat_interleave(nv, 0).view(-1, thr.shape[1], 1, 1, 1)
+            above = (g > thr).float() * m
+            sub = self.patch_size[0] // self.level_pool
+            weight = F.adaptive_avg_pool3d(m, sub)
+            target = F.adaptive_avg_pool3d(above, sub) / weight.clamp_min(1e-6)
+        logits = self.edgelvl_head(tokens).float().reshape(target.shape)
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        err = (weight * (torch.sigmoid(logits.detach()) - target).abs()).sum()
+        return (weight * bce).sum(), weight.sum() * target.shape[1], err
 
     @torch.no_grad()
     def orient_transform(
@@ -389,10 +613,15 @@ class ViTMAE3D(nn.Module):
         self,
         x: Float[Tensor, "B N D"],
         coord: Float[Tensor, "B N 3"],
+        pos_hide: Tensor | None = None,
     ) -> Float[Tensor, "B R+N D"]:
-        # forward_encoder after the patch embedding
+        # forward_encoder after the patch embedding. pos_hide [B, N] bool (brainpos, training
+        # only): those tokens get the learned unknown-position embedding instead of their own
         B = x.shape[0]
-        x = self.pos_embed(x, coord)
+        if pos_hide is not None:
+            x = torch.where(pos_hide[..., None], x + self.brainpos_unk.to(x.dtype), self.pos_embed(x, coord))
+        else:
+            x = self.pos_embed(x, coord)
 
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
@@ -466,12 +695,13 @@ class ViTMAE3D(nn.Module):
         spacing: list[tuple[float, float, float]] | None = None,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        subject_ids: Tensor | None = None,
     ):
         if isinstance(images, list):
             # native resolution batch, images on their own voxel grids
             return self.forward_native(
                 images, mask, spacing, num_visible, num_predict, num_samples, with_state,
-                fino_meta=fino_meta, fino_gamma=fino_gamma,
+                fino_meta=fino_meta, fino_gamma=fino_gamma, subject_ids=subject_ids,
             )
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
@@ -664,6 +894,7 @@ class ViTMAE3D(nn.Module):
         with_state: bool = True,
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
+        subject_ids: Tensor | None = None,
     ):
         # images (float) and masks (bool) on their own voxel grids (sample_transform native), fit
         # here to the grid_size mm box in their voxels. images with the same spacing share one
@@ -699,11 +930,14 @@ class ViTMAE3D(nn.Module):
                 src, dst = fit_slices(images[ii].shape, box)
                 vols[0, jj][dst] = images[ii][src]
                 vols[1, jj][dst] = mask[ii][src]
+            raw = vols if (self.hemiswap_head is not None and self.training) else None
             vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
             cube = (grid, self.mask_cube) if self.mask_cube else None
             scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube).flatten(0, 1)
-            parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols})
+            parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols, "grid": grid})
             parts[-1]["scores"] = scores
+            if raw is not None:
+                parts[-1]["raw"] = raw
 
         # one argsort for all groups, rows padded with 3.0 (after every score). sorts this long are
         # stable, so these are the per group argsorts
@@ -748,13 +982,34 @@ class ViTMAE3D(nn.Module):
                     )
                 if "shuffled" in part:
                     part["shuffled"] = part["shuffled"] & ~part["rtd_label"]
+            # ms-aux: brain frame, hemisphere swap, corruption (each token carries one label)
+            if self.training and (self.brainpos_head is not None or self.hemiswap_head is not None):
+                vis_order = order[:, :num_visible]
+                img_of_row = torch.arange(b, device=device).repeat_interleave(num_samples)
+                centres, cen, half = self.brain_frame(vols[1], part["grid"], patch)
+                if self.brainpos_head is not None:
+                    rel = (centres[vis_order] - cen[img_of_row][:, None]) / half[img_of_row][:, None]
+                    part["bp_target"] = rel
+                    sp_t = torch.tensor(sp, device=device, dtype=torch.float32)
+                    part["bp_scale"] = (half * sp_t)[img_of_row][:, None].expand_as(rel)
+                    part["bp_hide"] = torch.rand(vis_order.shape, device=device) < self.brainpos_hide_frac
+                if self.hemiswap_head is not None:
+                    vis_patches, vis_mask, part["hemi_label"] = self.hemiswap_replace(
+                        vis_patches, vis_mask, part.pop("raw"), vis_order, part["grid"], patch, cen,
+                        img_of_row, part.get("rtd_label"),
+                    )
+            if self.corrupt_head is not None and self.training:
+                excl = part.get("rtd_label")
+                if "hemi_label" in part:
+                    excl = part["hemi_label"] if excl is None else excl | part["hemi_label"]
+                vis_patches, part["corrupt_label"] = self.corrupt_transform(vis_patches, vis_mask, patch, excl)
             if self.orient_head is not None and self.training:
                 vis_patches, vis_mask, part["orient_label"] = self.orient_transform(
                     vis_patches, vis_mask, patch
                 )
             part["vis_coord"], part["target_coord"] = coord.split([num_visible, num_predict], 1)
             part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
-            if self.level_head is not None:
+            if self.level_head is not None or (self.edgelvl_head is not None and self.training):
                 part["vis_patches"], part["vis_mask"] = vis_patches, vis_mask
 
         def cat(key: str) -> Tensor:
@@ -768,7 +1023,8 @@ class ViTMAE3D(nn.Module):
                 return tensors[0].flatten()
             return torch.cat([t.flatten() for t in tensors])
 
-        embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"))
+        bp_on = self.brainpos_head is not None and self.training and "bp_target" in parts[0]
+        embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None)
         rtd_on = self.rtd_head is not None and self.training and "rtd_label" in parts[0]
         rtd_logits, vis_gate = None, None
         if rtd_on:
@@ -834,7 +1090,7 @@ class ViTMAE3D(nn.Module):
             rows = torch.split(embeds, [len(part["ids"]) * num_samples for part in parts])
             for part, tokens in zip(parts, rows):
                 n, d = self.level_terms(
-                    tokens[:, self.class_tokens :], part.pop("vis_patches"), part.pop("vis_mask"),
+                    tokens[:, self.class_tokens :], part["vis_patches"], part["vis_mask"],
                     part["patch"],
                 )
                 num, den = num + n, den + d
@@ -899,9 +1155,100 @@ class ViTMAE3D(nn.Module):
                     "shuf_fpr": ((pred & (labels == 0)).sum() / neg).detach(),
                 }
 
+        aux_on = (self.brainpos_head, self.scanmatch_proj, self.hemiswap_head, self.corrupt_head, self.edgelvl_head)
+        if self.training and any(h is not None for h in aux_on):
+            loss = loss + self.aux_losses(parts, embeds, num_samples, subject_ids, device)
+        for part in parts:
+            part.pop("vis_patches", None)
+            part.pop("vis_mask", None)
+
         if not with_state:
             return loss
         return loss, {"parts": parts, "embeds": embeds}
+
+    def aux_losses(
+        self, parts: list[dict], embeds: Tensor, num_samples: int, subject_ids: Tensor | None,
+        device: torch.device,
+    ) -> Tensor:
+        # the ms-aux pretext losses (training only); stats (detached tensors) in self.aux_stats
+        loss = embeds.new_zeros((), dtype=torch.float32)
+        stats = {}
+        tokens = embeds[:, self.class_tokens :]
+
+        def cat(key: str) -> Tensor:
+            return torch.cat([part[key] for part in parts])
+
+        if self.brainpos_head is not None and "bp_target" in parts[0]:
+            pred = self.brainpos_head(tokens).float()
+            tgt = cat("bp_target")
+            bp_loss = F.smooth_l1_loss(pred, tgt, beta=0.1)
+            loss = loss + self.brainpos_weight * bp_loss
+            with torch.no_grad():
+                err = ((pred - tgt) * cat("bp_scale")).norm(dim=-1)
+                hide = cat("bp_hide")
+                stats["bp_loss"] = bp_loss.detach()
+                stats["bp_err_mm_hidden"] = (err * hide).sum() / hide.sum().clamp_min(1)
+                stats["bp_err_mm_shown"] = (err * ~hide).sum() / (~hide).sum().clamp_min(1)
+        if self.scanmatch_proj is not None:
+            img = torch.tensor([ii for part in parts for ii in part["ids"]]).repeat_interleave(num_samples)
+            pooled = tokens.mean(dim=1)
+            with torch.autocast(device_type=device.type, enabled=False):
+                z = F.normalize(self.scanmatch_proj(pooled.float()), dim=-1)
+                sim = z @ z.T / self.scanmatch_temp
+            img = img.to(device, non_blocking=True)
+            same = img[:, None] == img[None]
+            eye = torch.eye(len(img), dtype=torch.bool, device=device)
+            pos = same & ~eye
+            block = eye
+            if subject_ids is not None:
+                subj = subject_ids.to(device, non_blocking=True)[img]
+                same_subj = (subj[:, None] == subj[None]) & ~same
+                block = block | same_subj
+                stats["sm_subj_masked"] = same_subj.float().sum(1).mean()
+            sim = sim.masked_fill(block, -1e4)
+            lse_all = torch.logsumexp(sim, dim=1)
+            lse_pos = torch.logsumexp(sim.masked_fill(~pos, -1e4), dim=1)
+            sm_loss = (lse_all - lse_pos).mean()
+            loss = loss + self.scanmatch_weight * sm_loss
+            with torch.no_grad():
+                stats["sm_loss"] = sm_loss.detach()
+                stats["sm_acc"] = pos.gather(1, sim.argmax(1, keepdim=True)).float().mean()
+        if self.hemiswap_head is not None and "hemi_label" in parts[0]:
+            labels = cat("hemi_label").float()
+            logits = self.hemiswap_head(tokens).float().squeeze(-1)
+            hs_loss = F.binary_cross_entropy_with_logits(logits, labels)
+            loss = loss + self.hemiswap_weight * hs_loss
+            with torch.no_grad():
+                p = labels > 0.5
+                stats["hs_loss"] = hs_loss.detach()
+                stats["hs_frac"] = labels.mean()
+                stats["hs_tpr"] = ((logits > 0) & p).sum() / p.sum().clamp_min(1)
+                stats["hs_tnr"] = ((logits <= 0) & ~p).sum() / (~p).sum().clamp_min(1)
+        if self.corrupt_head is not None and "corrupt_label" in parts[0]:
+            labels = cat("corrupt_label").flatten()
+            logits = self.corrupt_head(tokens).float().flatten(0, 1)
+            cr_loss = F.cross_entropy(logits, labels)
+            loss = loss + self.corrupt_weight * cr_loss
+            with torch.no_grad():
+                pred = logits.argmax(-1)
+                bad = labels > 0
+                stats["cr_loss"] = cr_loss.detach()
+                stats["cr_acc_corrupt"] = ((pred == labels) & bad).sum() / bad.sum().clamp_min(1)
+                stats["cr_acc_clean"] = ((pred == 0) & ~bad).sum() / (~bad).sum().clamp_min(1)
+        if self.edgelvl_head is not None and "vis_patches" in parts[0]:
+            num, den, err = 0.0, 0.0, 0.0
+            rows = torch.split(tokens, [len(part["ids"]) * num_samples for part in parts])
+            for part, tok in zip(parts, rows):
+                n, d, e = self.edgelvl_terms(
+                    tok, part["vis_patches"], part["vis_mask"], part["patch"], part["spacing"]
+                )
+                num, den, err = num + n, den + d, err + e
+            el_loss = num / den.clamp_min(1e-6)
+            loss = loss + self.edgelvl_weight * el_loss
+            stats["el_loss"] = el_loss.detach()
+            stats["el_mae"] = (err / den.clamp_min(1e-6)).detach()
+        self.aux_stats = stats
+        return loss
 
     def compile_native(self, **kwargs) -> None:
         # the fixed-shape transformer parts. per-spacing tokenization, embedding and head stay eager
