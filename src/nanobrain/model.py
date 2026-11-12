@@ -491,8 +491,10 @@ class ViTMAE3D(nn.Module):
             g = torch.exp(sign * (0.2 + 0.3 * torch.rand(rows, k, 1, device=dev)))
             x_gamma = small + span * ((x - small) / span).clamp(0, 1) ** g
             # (5) 2x downsample-upsample: masked 2-voxel block mean held over its block (axes of
-            # fewer than 4 voxels keep full resolution)
-            ks = tuple(2 if p >= 4 else 1 for p in (px, py, pz))
+            # fewer than half the nominal patch_size voxels, i.e. coarser than ~2 mm, keep full
+            # resolution: 4 voxels at patch_size 8, 2 at patch_size 4)
+            min_vox = max(2, self.patch_size[0] // 2)
+            ks = tuple(2 if p >= min_vox else 1 for p in (px, py, pz))
             vx = torch.cat([(x * m).reshape(-1, 1, px, py, pz), m.reshape(-1, 1, px, py, pz)], 1)
             low = F.avg_pool3d(vx, kernel_size=ks, stride=ks, ceil_mode=True)
             for dim, kk, p in zip((2, 3, 4), ks, (px, py, pz)):
