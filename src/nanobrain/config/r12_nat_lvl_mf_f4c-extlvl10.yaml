@@ -1,5 +1,5 @@
-name: r12_nat_lvl_mf_f4c-extlvl50
-notes: "f4 combo round arm extlvl50: final-f4 + corrupt_extended (level_weight stays .5)"
+name: r12_nat_lvl_mf_f4c-extlvl10
+notes: "f4 combo round arm extlvl10: final-f4 + corrupt_extended + level_weight 1.0"
 output_dir: output
 train_filelist: src/nanobrain/config/fomo300k_images_qc.txt
 anneal_filelist: null
@@ -37,7 +37,7 @@ model_kwargs:
   class_tokens: 0
   drop_path_rate: 0.0
   min_mask_frac: 0.05
-  level_weight: 0.5
+  level_weight: 1.0
   # rtd off: the unified head carries the cross-subject swap class
   rtd_weight: 0.0
   rtd_ratio: 0.15
