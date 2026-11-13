@@ -135,6 +135,12 @@ class ViTMAE3D(nn.Module):
         # (patch-range gamma, |log g| in [0.2, 0.5]) and 5 = 2x downsample-upsample (masked 2-voxel
         # block mean held over the block; axes under 4 voxels untouched)
         corrupt_extended: bool = False,
+        # second extension (needs corrupt_extended): + 6 = linear contrast change about the patch's
+        # in-brain mean (x mean + c (x - mean), |log c| in [0.2, 0.5], floored at the row minimum; the
+        # gamma variant of a "contrast shift" is class 4 already) and 7 = motion ghost (the patch plus a
+        # copy shifted half the patch along one random axis, circular like a k-space ghost, amplitude
+        # a in [0.2, 0.5], renormalized by 1 + a x ghost-mask so the mean level stays put)
+        corrupt_extended2: bool = False,
         # unified corruption: ONE shared budget and ONE multi-class token head replacing the rtd and
         # corrupt heads (both must be off). a unified_ratio share of the visible (>= 50% brain)
         # tokens is corrupted, the class uniform among {cross-subject swap (rtd_replace), bias,
@@ -227,7 +233,8 @@ class ViTMAE3D(nn.Module):
         self.hemiswap_ratio = float(hemiswap_ratio)
         self.corrupt_weight = float(corrupt_weight)
         self.corrupt_ratio = float(corrupt_ratio)
-        self.corrupt_kinds = 5 if corrupt_extended else 3
+        assert not corrupt_extended2 or corrupt_extended, "corrupt_extended2: needs corrupt_extended"
+        self.corrupt_kinds = 7 if corrupt_extended2 else 5 if corrupt_extended else 3
         self.unified_weight = float(unified_weight)
         self.unified_ratio = float(unified_ratio)
         self.unified_shuffle = bool(unified_shuffle)
@@ -553,7 +560,8 @@ class ViTMAE3D(nn.Module):
     def corrupt_apply(
         self, vis_patches: Tensor, vis_mask: Tensor, patch: tuple[int, int, int], cand: Tensor, kind: Tensor
     ) -> Tensor:
-        """Apply corruption kind[r, j] (0 = none, 1 bias, 2 blur, 3 noise, 4 gamma, 5 downsample)
+        """Apply corruption kind[r, j] (0 = none, 1 bias, 2 blur, 3 noise, 4 gamma, 5 downsample,
+        6 linear contrast, 7 motion ghost)
         to the candidate tokens cand [rows, k] of vis_patches. Returns the patches."""
         rows, nv, P = vis_patches.shape
         k = cand.shape[1]
@@ -618,6 +626,30 @@ class ViTMAE3D(nn.Module):
             low = low.reshape(rows, k, 2, P)
             x_down = low[:, :, 0] / low[:, :, 1].clamp_min(1e-3)
             variants += [(4, x_gamma), (5, x_down)]
+        if self.corrupt_kinds >= 7:
+            # (6) linear contrast change about the patch's in-brain mean: c = exp(+-U[0.2, 0.5]),
+            # floored at the row minimum (the magnitude floor)
+            sign = torch.where(torch.rand(rows, k, 1, device=dev) < 0.5, -1.0, 1.0)
+            c = torch.exp(sign * (0.2 + 0.3 * torch.rand(rows, k, 1, device=dev)))
+            x_contrast = torch.maximum(mean + c * (x - mean), lo)
+            # (7) motion ghost: + a x the magnitude (above the row minimum) circularly shifted by half
+            # the patch along one random axis of >= 2 voxels, renormalized by 1 + a x shifted mask
+            sizes = (px, py, pz)
+            elig = [d for d, p in enumerate(sizes) if p >= 2]
+            a = 0.2 + 0.3 * torch.rand(rows, k, 1, device=dev)
+            pick = torch.randint(0, max(1, len(elig)), (rows, k, 1), device=dev)
+            xm = ((x - lo) * m).reshape(rows, k, px, py, pz)
+            mm = m.reshape(rows, k, px, py, pz)
+            gx, gm = torch.zeros_like(x), torch.zeros_like(m)
+            for j, d in enumerate(elig):
+                sx = xm.roll(sizes[d] // 2, dims=2 + d).reshape(rows, k, P)
+                sm = mm.roll(sizes[d] // 2, dims=2 + d).reshape(rows, k, P)
+                gx = torch.where(pick == j, sx, gx)
+                gm = torch.where(pick == j, sm, gm)
+            x_ghost = (x - lo + a * gx) / (1 + a * gm) + lo
+            if not elig:
+                x_ghost = x
+            variants += [(6, x_contrast), (7, x_ghost)]
         out = x
         for c, xc in variants:
             out = torch.where((kind == c)[..., None], xc, out)
@@ -1669,7 +1701,7 @@ class ViTMAE3D(nn.Module):
                 stats["cr_acc_corrupt"] = ((pred == labels) & bad).sum() / bad.sum().clamp_min(1)
                 stats["cr_acc_clean"] = ((pred == 0) & ~bad).sum() / (~bad).sum().clamp_min(1)
                 if self.corrupt_kinds > 3:
-                    for c, name in enumerate(["bias", "blur", "noise", "gamma", "down"], start=1):
+                    for c, name in enumerate(["bias", "blur", "noise", "gamma", "down", "contrast", "ghost"][: self.corrupt_kinds], start=1):
                         sel = labels == c
                         stats[f"cr_rec_{name}"] = ((pred == c) & sel).sum() / sel.sum().clamp_min(1)
         if self.unified_head is not None and "unified_label" in parts[0]:
@@ -1684,7 +1716,7 @@ class ViTMAE3D(nn.Module):
                 stats["uc_frac"] = bad.float().mean()
                 stats["uc_acc_corrupt"] = ((pred == labels) & bad).sum() / bad.sum().clamp_min(1)
                 stats["uc_acc_clean"] = ((pred == 0) & ~bad).sum() / (~bad).sum().clamp_min(1)
-                names = ["swap", "bias", "blur", "noise", "gamma", "down"][: 1 + self.corrupt_kinds]
+                names = ["swap", "bias", "blur", "noise", "gamma", "down", "contrast", "ghost"][: 1 + self.corrupt_kinds]
                 if self.unified_shuffle:
                     names.append("shuf")
                 for c, name in enumerate(names, start=1):
