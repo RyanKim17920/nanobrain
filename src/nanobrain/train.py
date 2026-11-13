@@ -140,6 +140,14 @@ def main(args: DictConfig):
     model.batched_corrupt = bool(args.get("native_batched_corrupt", False))
     # speed (off when unset): every spacing group's level / lesion targets with one head pass each
     model.batched_level = bool(args.get("native_batched_level", False))
+    # speed (off when unset): token rows gathered from the padded volumes instead of patchifying them whole
+    model.lazy_patchify = bool(args.get("native_lazy_patchify", False))
+    # speed (off when unset; needs native_prep_tokens + native_batched_corrupt): each corruption on its own
+    # candidates only (data-dependent sizes, so a sync of the prep stream, never of the main one)
+    model.corrupt_compact = bool(args.get("native_corrupt_compact", False))
+    # speed (off when unset): one flat reconstruction loss pass over all groups (bit-identical sums)
+    model.flat_loss = bool(args.get("native_flat_loss", False))
+    assert not model.corrupt_compact or (args.get("native_prep_tokens") and args.get("native_batched_corrupt"))
     if args.get("natinit") and args.natinit.enabled:
         # natural-image pretrained blocks (+ inflated patch embedding). a resumed checkpoint
         # (misc.load_model below) overwrites this, as it should
@@ -164,6 +172,12 @@ def main(args: DictConfig):
         # native_compile_mode (speed, off when unset): e.g. reduce-overhead replays the fixed-shape
         # encoder / decoder fwd + bwd as cuda graphs (same inductor kernels, ~1 launch instead of ~1.5k)
         mode = args.get("native_compile_mode")
+        if args.get("native_inductor_cd"):
+            # speed (off when unset): inductor's coordinate descent tuning of the generated triton kernels'
+            # launch configs (the same fused ops; more compile time)
+            import torch._inductor.config as inductor_config
+
+            inductor_config.coordinate_descent_tuning = True
         model_without_ddp.compile_native(**({"mode": mode} if mode else {}))
         native_cudagraphs = mode in ("reduce-overhead", "max-autotune")
     elif args.compile and args.cudagraphs:
@@ -288,7 +302,12 @@ def main(args: DictConfig):
         sampler=sampler,
         num_workers=args.num_workers,
         # no collate (variable shapes); the fast prep plans its numpy part in the workers
-        collate_fn=list if not fast_prep else functools.partial(
+        collate_fn=(
+            functools.partial(prep.native_concat, clip_quantiles=tuple(args.clip_quantiles))
+            if args.get("native_batched_prep")
+            else functools.partial(prep.clip_batch, clip_quantiles=tuple(args.clip_quantiles))
+            if args.get("native_worker_clip") else list
+        ) if not fast_prep else functools.partial(
             prep.plan_batch,
             target_spacing=args.target_spacing,
             clip_quantiles=tuple(args.clip_quantiles),
@@ -319,7 +338,7 @@ def main(args: DictConfig):
             with torch.autocast(device_type=device.type, dtype=getattr(torch, args.amp_dtype), enabled=args.amp):
                 batch["tokens"] = model_without_ddp.native_prepare(
                     batch["image"], batch["mask"], batch["spacing"], args.num_visible, args.num_predict,
-                    args.num_samples,
+                    args.num_samples, lims=batch.get("lim"),
                 )
             return batch
 
@@ -531,6 +550,9 @@ def train(
         aux_kwargs = {"subject_ids": batch["subject"]} if "subject" in batch else {}
         if "tokens" in batch:
             aux_kwargs["prepared"] = batch["tokens"]
+        if args.get("native_log_stats_only"):
+            # speed: the aux heads' accuracy stats (logged only) computed on log steps only
+            model_without_ddp.want_stats = log_step
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,
@@ -733,6 +755,9 @@ def make_lr_schedule(
 
 def make_batch_transform(args: DictConfig):
     def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
+        if isinstance(batch, dict) and "samples" in batch:
+            # native_batched_prep: a native_concat batch
+            return prep.native_batch_transform(batch, args.target_spacing)
         raw = batch
         batch = [
             sample_transform(
@@ -751,6 +776,8 @@ def make_batch_transform(args: DictConfig):
                 out["fino"] = torch.from_numpy(np.stack([sample["fino"] for sample in raw]))
             if "subject" in raw[0]:
                 out["subject"] = torch.tensor([sample["subject"] for sample in raw], dtype=torch.int64)
+            if any(sample["lim"] is not None for sample in batch):
+                out["lim"] = [sample["lim"] for sample in batch]
             return out
         images = torch.stack([sample["image"] for sample in batch])
         masks = torch.stack([sample["mask"] for sample in batch])
@@ -770,14 +797,24 @@ def sample_transform(
     # pretraining preprocessing, on gpu. eval preprocessing is ViTMAE3D.transform_cuda, keep in sync
     # (native training still evaluates on 1 mm inputs)
     values = sample["values"].float() * sample["scale"]
-    values = normalize_values(values, clip_quantiles)
+    lim = None
+    if sample.get("clip") is not None:
+        # native_worker_clip: the same nearest rank thresholds, from the loader workers' int16 histogram
+        # (prep.normalize_values' ops). lim: the image's in-mask (min, max), the normalized thresholds
+        # (both are voxel values, the map is increasing), for plan_tumors
+        values = values.clamp(*sample["clip"])
+        mean, std = values.mean(), values.std(correction=0).clamp_min(1e-6)
+        values = (values - mean) / std
+        lim = (torch.stack([values.new_full((), sample["clip"][0]), values.new_full((), sample["clip"][1])]) - mean) / std
+    else:
+        values = normalize_values(values, clip_quantiles)
     mask = brle_to_dense(sample["mask_rle"], shape=sample["shape"])
     image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
     image, mask, affine = reorient_to_ras(image, mask, sample["affine"])
     if native:
         # no resampling. forward_native fits the grid_size mm box in the image's own voxels
         spacing = native_spacing(affine, target_spacing)
-        return {"image": image, "mask": mask, "affine": affine, "spacing": spacing}
+        return {"image": image, "mask": mask, "affine": affine, "spacing": spacing, "lim": lim}
     image, mask, affine = resample_to_spacing(image, mask, affine, target_spacing)
     image, mask, affine = fit_to_shape(image, mask, affine, grid_size)
     return {"image": image, "mask": mask, "affine": affine}

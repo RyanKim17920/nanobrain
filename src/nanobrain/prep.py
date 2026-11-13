@@ -44,6 +44,77 @@ def int16_clip(values: np.ndarray, scale: float, clip_quantiles=(0.005, 0.995)):
     return float(low), float(high)
 
 
+def clip_batch(batch: list[dict], clip_quantiles=(0.005, 0.995)) -> list[dict]:
+    # native loader collate_fn (native_worker_clip): only the int16 histogram clip thresholds, in the workers
+    for sample in batch:
+        sample["clip"] = int16_clip(sample["values"].numpy(), sample["scale"], clip_quantiles)
+    return batch
+
+
+def native_concat(batch: list[dict], clip_quantiles=(0.005, 0.995)) -> dict | list[dict]:
+    # native loader collate_fn (native_batched_prep): clip_batch, then one int16 values and one run length
+    # tensor per batch (+ per sample scale, clip, lengths), so the gpu prep runs batch wide in
+    # native_batch_transform. falls back to the per sample list when a sample has no int16 clip
+    batch = clip_batch(batch, clip_quantiles)
+    if any(s["clip"] is None for s in batch) or len({(s["values"].dtype, s["mask_rle"].dtype) for s in batch}) > 1:
+        return batch
+    for s in batch:
+        s["n_values"], s["n_runs"] = len(s["values"]), len(s["mask_rle"])
+    out = {
+        "values": torch.cat([s.pop("values") for s in batch]),
+        "mask_rle": torch.cat([s.pop("mask_rle") for s in batch]),
+        "num_values": torch.tensor([s["n_values"] for s in batch], dtype=torch.int64),
+        "num_runs": torch.tensor([s["n_runs"] for s in batch], dtype=torch.int64),
+        "scale": torch.tensor([s["scale"] for s in batch], dtype=torch.float32),
+        "clip": torch.tensor([s["clip"] for s in batch], dtype=torch.float32),
+    }
+    out["samples"] = batch
+    return out
+
+
+def native_batch_transform(batch: dict, target_spacing: float = 1.0) -> dict:
+    # train.make_batch_transform's native output (per image: normalize with the worker clip, dense mask, in-mask
+    # scatter, reorient to ras) for a native_concat batch, with batch wide kernels; the per image mean / std
+    # reductions and the reorient copies stay per image, so every value is the same as the per sample path
+    from .data import native_spacing, reorient_to_ras
+
+    samples = batch["samples"]
+    dev = batch["values"].device
+    B = len(samples)
+    nv = [s["n_values"] for s in samples]
+    shapes = [tuple(s["shape"]) for s in samples]
+    vox = [int(np.prod(sh)) for sh in shapes]
+    ids = torch.arange(B, device=dev)
+    seg = torch.repeat_interleave(ids, batch["num_values"], output_size=sum(nv))
+    values = batch["values"].float() * batch["scale"][seg]
+    values = values.clamp(batch["clip"][seg, 0], batch["clip"][seg, 1])
+    # each image's own (fresh, aligned) buffer for its reductions: the reduction kernels' vectorization, so
+    # their rounding, follows the buffer's alignment, and the per sample path reduces a fresh tensor
+    parts = [p.clone() for p in values.split(nv)]
+    mean = torch.stack([p.mean() for p in parts])
+    std = torch.stack([p.std(correction=0) for p in parts]).clamp_min(1e-6)
+    values = (values - mean[seg]) / std[seg]
+    lims = (batch["clip"] - mean[:, None]) / std[:, None]
+    # data.brle_to_dense over the concatenated run lengths (each image's runs start with a false run)
+    runs = batch["mask_rle"].long()
+    rseg = torch.repeat_interleave(ids, batch["num_runs"], output_size=sum(s["n_runs"] for s in samples))
+    rstart = batch["num_runs"].cumsum(0) - batch["num_runs"]
+    flags = (torch.arange(runs.shape[0], device=dev) - rstart[rseg]) % 2 == 1
+    mask = torch.repeat_interleave(flags, runs, output_size=sum(vox))
+    image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
+    out = {"image": [], "mask": [], "spacing": [], "lim": list(lims.unbind(0))}
+    for img, msk, sh, s in zip(image.split(vox), mask.split(vox), shapes, samples):
+        img, msk, affine = reorient_to_ras(img.view(sh), msk.view(sh), s["affine"])
+        out["image"].append(img)
+        out["mask"].append(msk)
+        out["spacing"].append(native_spacing(affine, target_spacing))
+    if "fino" in samples[0]:
+        out["fino"] = torch.from_numpy(np.stack([s["fino"] for s in samples]))
+    if "subject" in samples[0]:
+        out["subject"] = torch.tensor([s["subject"] for s in samples], dtype=torch.int64)
+    return out
+
+
 def plan_batch(
     batch: list[dict], target_spacing: float = 1.0, clip_quantiles=(0.005, 0.995), lean: bool = False
 ):

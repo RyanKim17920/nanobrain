@@ -666,7 +666,7 @@ class ViTMAE3D(nn.Module):
         return vis_patches.scatter(1, idx, torch.where(hit[..., None], out, vis_patches.gather(1, idx)))
 
     @torch.no_grad()
-    def corrupt_apply_batched(self, items: list[tuple]) -> list[Tensor]:
+    def corrupt_apply_batched(self, items: list[tuple], compact: bool = False) -> list[Tensor]:
         """corrupt_apply over every spacing group at once (speed: ~200 kernel launches in total instead of
         ~150 per group; the per-group python loop was ~half the main thread's launches). items: one
         (vis_patches, vis_mask, patch, cand, kind) per group, as corrupt_apply takes them; returns the
@@ -694,6 +694,7 @@ class ViTMAE3D(nn.Module):
             kinds.append(kind.reshape(-1))
             meta.append((rows * k, P, *patch))
         X, M, kind, lo = (torch.cat(t) if len(t) > 1 else t[0] for t in (xs, ms, kinds, los))
+        Mfull = M
         lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
         # per candidate (P, px, py, pz) and the 2x downsample block grid, built on the cpu (known sizes)
         min_vox = max(2, self.patch_size[0] // 2)
@@ -708,12 +709,43 @@ class ViTMAE3D(nn.Module):
         tab = torch.tensor(cpu, dtype=torch.int64)
         tab = (tab.pin_memory() if dev.type == "cuda" else tab).to(dev, non_blocking=True)
         per = torch.repeat_interleave(tab[:, 1:], tab[:, 0], dim=0, output_size=C)
-        # per candidate columns (int32, contiguous): voxels, patch dims, downsample factors, block grid
-        Pc, p0, p1, p2, k0, k1, k2, n0, n1, n2, nblk = per.t().to(torch.int32).contiguous().unbind(0)
         i32 = torch.int32
+        # random draws per candidate (all C, the same draws with or without compact)
+        u = torch.randn(C, 3, device=dev)
+        u = rnd(u / u.abs().sum(-1, keepdim=True).clamp_min(1e-6)).t().contiguous()
+        amp = 0.2 + 0.1 * torch.rand(C, device=dev)
+        draws = {"amp": amp}
+        if self.corrupt_kinds >= 5:
+            draws["g"] = torch.exp(torch.where(torch.rand(C, device=dev) < 0.5, -1.0, 1.0) * (0.2 + 0.3 * torch.rand(C, device=dev)))
+        if self.corrupt_kinds >= 7:
+            draws["c"] = torch.exp(torch.where(torch.rand(C, device=dev) < 0.5, -1.0, 1.0) * (0.2 + 0.3 * torch.rand(C, device=dev)))
+            draws["a"] = 0.2 + 0.3 * torch.rand(C, device=dev)
+            draws["pick"] = torch.rand(C, device=dev)
+        Xfull = X
+        if compact:
+            # corrupt_compact (prep threads, where a sync only waits for the prep stream): just the hit candidates,
+            # sorted by kind, so each corruption runs on its own candidates' voxels only (~1/10 of the work)
+            order = torch.argsort(kind, stable=True)
+            nk = self.corrupt_kinds
+            counts = torch.bincount(kind, minlength=nk + 1)
+            vox = torch.zeros(nk + 1, device=dev, dtype=torch.int64).index_add_(0, kind, per[:, 0])
+            counts, vox = torch.stack([counts, vox]).tolist()
+            sel = order[counts[0]:]
+            start_full = (per[:, 0].cumsum(0) - per[:, 0])[sel]
+            per, lo, kind, u = per[sel], lo[sel], kind[sel], u[:, sel]
+            draws = {k_: v_[sel] for k_, v_ in draws.items()}
+            C, V = sum(counts[1:]), sum(vox[1:])
+            if C == 0:
+                return [vis for vis, *_ in items]
+            Btot = int(per[:, 10].sum())
+        # per candidate columns (int32, contiguous): voxels, patch dims, downsample factors, block grid
+        Pc, p0, p1, p2, k0, k1, k2, n0, n1, n2, nblk = per.t().to(i32).contiguous().unbind(0)
         seg = torch.repeat_interleave(torch.arange(C, device=dev, dtype=i32), per[:, 0], output_size=V)
         flat = torch.arange(V, device=dev, dtype=i32)
         q = flat - (Pc.cumsum(0, dtype=i32) - Pc)[seg]
+        if compact:
+            vsel = start_full[seg] + q
+            X, M = Xfull[vsel], M[vsel]
         P0, P1, P2 = p0[seg], p1[seg], p2[seg]
         S0 = P1 * P2
         c0 = q // S0
@@ -722,89 +754,122 @@ class ViTMAE3D(nn.Module):
         c2 = rem - c1 * P2
         coord, dims, strides = (c0, c1, c2), (P0, P1, P2), (S0, P2, None)
         LO = lo[seg]
-
-        def seg_sum(v: Tensor) -> Tensor:
-            return torch.zeros(C, device=dev, dtype=v.dtype).index_add_(0, seg, v)
-
         XM = X * M
-        cnt = seg_sum(M).clamp_min(1.0)
-        mean = seg_sum(XM) / cnt
-        std = (seg_sum((X - mean[seg]) ** 2 * M) / cnt).sqrt()
-        # (1) bias ramp along a random direction (u @ r.T in the autocast dtype, as corrupt_apply)
-        u = torch.randn(C, 3, device=dev)
-        u = rnd(u / u.abs().sum(-1, keepdim=True).clamp_min(1e-6)).t().contiguous()
-        amp = 0.2 + 0.1 * torch.rand(C, device=dev)
-        ur = None
-        for ax in range(3):
-            r = rnd((coord[ax].float() + 0.5) / dims[ax].float() * 2 - 1)
-            term = u[ax][seg] * r
-            ur = term if ur is None else ur + term
-        x_bias = (X - LO) * (1 + amp[seg] * rnd(ur)) + LO
-        # (2) separable gaussian blur, sigma 1 voxel, replicate padded, normalized inside the mask; the
-        # conv's autocast rounding per pass; axes of < 2 voxels skipped
+
+        def seg_sum(v: Tensor, sg: Tensor) -> Tensor:
+            return torch.zeros(C, device=dev, dtype=v.dtype).index_add_(0, sg, v)
+
+        memo = {}
+
+        def stats(sl):
+            # in-mask count, mean and std of the candidates of voxel slice sl
+            if sl == slice(None) and "all" in memo:
+                return memo["all"]
+            sg, x, m = seg[sl], X[sl], M[sl]
+            cnt = seg_sum(m, sg).clamp_min(1.0)
+            mean = seg_sum(x * m, sg) / cnt
+            res = mean, (seg_sum((x - mean[sg]) ** 2 * m, sg) / cnt).sqrt()
+            if sl == slice(None):
+                memo["all"] = res
+            return res
+
+        def bias(sl):
+            # (1) bias ramp along a random direction (u @ r.T in the autocast dtype, as corrupt_apply)
+            sg = seg[sl]
+            ur = None
+            for ax in range(3):
+                r = rnd((coord[ax][sl].float() + 0.5) / dims[ax][sl].float() * 2 - 1)
+                term = u[ax][sg] * r
+                ur = term if ur is None else ur + term
+            return (X[sl] - LO[sl]) * (1 + draws["amp"][sg] * rnd(ur)) + LO[sl]
+
         kern = torch.exp(-torch.arange(-2, 3, dtype=torch.float32) ** 2 / 2)
         kern = rnd(kern / kern.sum()).tolist()
-        vw = torch.stack([rnd(XM), rnd(M)], 1)
-        for ax in range(3):
-            ca, pa = coord[ax], dims[ax]
-            sa = strides[ax]
-            acc = None
-            for t in range(-2, 3):
-                d = torch.minimum((ca + t).clamp_min(0), pa - 1) - ca
-                src = flat + (d * sa if sa is not None else d)
-                term = kern[t + 2] * vw.index_select(0, src)
-                acc = term if acc is None else acc + term
-            vw = torch.where((pa >= 2)[:, None], rnd(acc), vw)
-        x_blur = (vw[:, 0].to(cdt) / vw[:, 1].to(cdt).clamp_min(1e-3)).float()
-        # (3) Rician-like noise on the magnitude above the row minimum
-        s = (0.1 * std)[seg]
-        x_noise = ((X - LO + torch.randn_like(X) * s) ** 2 + (torch.randn_like(X) * s) ** 2).sqrt() + LO
-        variants = [(1, x_bias), (2, x_blur), (3, x_noise)]
-        if self.corrupt_kinds >= 5:
+
+        def blur(sl):
+            # (2) separable gaussian blur, sigma 1 voxel, replicate padded, normalized inside the mask; the
+            # conv's autocast rounding per pass; axes of < 2 voxels skipped
+            vw = torch.stack([rnd(XM[sl]), rnd(M[sl])], 1)
+            loc = torch.arange(vw.shape[0], device=dev, dtype=i32)
+            for ax in range(3):
+                ca, pa, sa = coord[ax][sl], dims[ax][sl], strides[ax]
+                sa = None if sa is None else sa[sl]
+                acc = None
+                for t in range(-2, 3):
+                    d = torch.minimum((ca + t).clamp_min(0), pa - 1) - ca
+                    term = kern[t + 2] * vw.index_select(0, loc + (d * sa if sa is not None else d))
+                    acc = term if acc is None else acc + term
+                vw = torch.where((pa >= 2)[:, None], rnd(acc), vw)
+            return (vw[:, 0].to(cdt) / vw[:, 1].to(cdt).clamp_min(1e-3)).float()
+
+        def noise(sl):
+            # (3) Rician-like noise on the magnitude above the row minimum
+            x, lo_ = X[sl], LO[sl]
+            s_ = (0.1 * stats(sl)[1])[seg[sl]]
+            return ((x - lo_ + torch.randn_like(x) * s_) ** 2 + (torch.randn_like(x) * s_) ** 2).sqrt() + lo_
+
+        def gamma(sl):
             # (4) gamma on the patch's in-brain range
-            inb = M > 0
-            big = torch.full((C,), -math.inf, device=dev).scatter_reduce_(0, seg.long(), torch.where(inb, X, -math.inf), "amax")
-            small = torch.full((C,), math.inf, device=dev).scatter_reduce_(0, seg.long(), torch.where(inb, X, math.inf), "amin")
+            sg, x = seg[sl], X[sl]
+            inb = M[sl] > 0
+            big = torch.full((C,), -math.inf, device=dev).scatter_reduce_(0, sg.long(), torch.where(inb, x, -math.inf), "amax")
+            small = torch.full((C,), math.inf, device=dev).scatter_reduce_(0, sg.long(), torch.where(inb, x, math.inf), "amin")
             span = (big - small).clamp_min(1e-6)
             span = torch.where(torch.isfinite(span), span, torch.ones_like(span))
             small = torch.where(torch.isfinite(small), small, torch.zeros_like(small))
-            sign = torch.where(torch.rand(C, device=dev) < 0.5, -1.0, 1.0)
-            g = torch.exp(sign * (0.2 + 0.3 * torch.rand(C, device=dev)))
-            sm_, sp_ = small[seg], span[seg]
-            x_gamma = sm_ + sp_ * ((X - sm_) / sp_).clamp(0, 1) ** g[seg]
+            sm_, sp_ = small[sg], span[sg]
+            return sm_ + sp_ * ((x - sm_) / sp_).clamp(0, 1) ** draws["g"][sg]
+
+        def down(sl):
             # (5) 2x downsample-upsample: masked block mean (avg_pool3d, ceil_mode) held over its block
-            N1, N2 = n1[seg], n2[seg]
-            bid = (nblk.cumsum(0, dtype=i32) - nblk)[seg] + ((c0 // k0[seg]) * N1 + c1 // k1[seg]) * N2 + c2 // k2[seg]
-            sums = torch.zeros(Btot, 3, device=dev).index_add_(0, bid, torch.stack([XM, M, torch.ones_like(M)], 1))
+            sg = seg[sl]
+            c0_, c1_, c2_ = (c[sl] for c in coord)
+            bid = (nblk.cumsum(0, dtype=i32) - nblk)[sg] + ((c0_ // k0[sg]) * n1[sg] + c1_ // k1[sg]) * n2[sg] + c2_ // k2[sg]
+            m = M[sl]
+            sums = torch.zeros(Btot, 3, device=dev).index_add_(0, bid, torch.stack([XM[sl], m, torch.ones_like(m)], 1))
             low = (sums[:, :2] / sums[:, 2:]).index_select(0, bid)
-            x_down = low[:, 0] / low[:, 1].clamp_min(1e-3)
-            variants += [(4, x_gamma), (5, x_down)]
-        if self.corrupt_kinds >= 7:
+            return low[:, 0] / low[:, 1].clamp_min(1e-3)
+
+        def contrast(sl):
             # (6) linear contrast about the patch's in-brain mean, floored at the row minimum
-            sign = torch.where(torch.rand(C, device=dev) < 0.5, -1.0, 1.0)
-            c = torch.exp(sign * (0.2 + 0.3 * torch.rand(C, device=dev)))
-            x_contrast = torch.maximum(mean[seg] + c[seg] * (X - mean[seg]), LO)
+            sg = seg[sl]
+            mean = stats(sl)[0][sg]
+            return torch.maximum(mean + draws["c"][sg] * (X[sl] - mean), LO[sl])
+
+        def ghost(sl):
             # (7) motion ghost along one random axis of >= 2 voxels (circular half-patch shift)
-            a_ = 0.2 + 0.3 * torch.rand(C, device=dev)
             elig = torch.stack([p0, p1, p2], 1) >= 2
             ne = elig.sum(1)
-            pick = (torch.rand(C, device=dev) * ne.clamp_min(1)).long()
-            pick = torch.minimum(pick, (ne - 1).clamp_min(0))
-            axis = (elig & (elig.long().cumsum(1) == (pick + 1)[:, None])).long().argmax(1)[seg]
-            src = flat.clone()
+            pick = torch.minimum((draws["pick"] * ne.clamp_min(1)).long(), (ne - 1).clamp_min(0))
+            sg = seg[sl]
+            axis = (elig & (elig.long().cumsum(1) == (pick + 1)[:, None])).long().argmax(1)[sg]
+            src = torch.arange(axis.shape[0], device=dev, dtype=i32)
             for ax in range(3):
-                ca, pa = coord[ax], dims[ax]
+                ca, pa = coord[ax][sl], dims[ax][sl]
                 d = (ca - pa // 2) % pa - ca
-                src = torch.where(axis == ax, src + (d * strides[ax] if strides[ax] is not None else d), src)
-            XL = (X - LO) * M
-            av = a_[seg]
-            x_ghost = (X - LO + av * XL[src]) / (1 + av * M[src]) + LO
-            x_ghost = torch.where(ne[seg] > 0, x_ghost, X)
-            variants += [(6, x_contrast), (7, x_ghost)]
-        kv = kind[seg]
-        out = X
-        for cls, xc in variants:
-            out = torch.where(kv == cls, xc, out)
+                src = torch.where(axis == ax, src + (d * strides[ax][sl] if strides[ax] is not None else d), src)
+            x, lo_, m = X[sl], LO[sl], M[sl]
+            XL = (x - lo_) * m
+            av = draws["a"][sg]
+            out = (x - lo_ + av * XL[src]) / (1 + av * m[src]) + lo_
+            return torch.where(ne[sg] > 0, out, x)
+
+        fns = [bias, blur, noise, gamma, down, contrast, ghost][: self.corrupt_kinds]
+        if compact:
+            out = X.clone()
+            v0 = 0
+            for cls, fn in enumerate(fns, start=1):
+                n_ = vox[cls]
+                if n_:
+                    out[v0 : v0 + n_] = fn(slice(v0, v0 + n_))
+                v0 += n_
+            out = Xfull.clone().index_copy_(0, vsel, out)
+            M = Mfull
+        else:
+            kv = kind[seg]
+            out = X
+            for cls, fn in enumerate(fns, start=1):
+                out = torch.where(kv == cls, fn(slice(None)), out)
         out = out * M
         res, off = [], 0
         for (vis, vmask, patch, cand, kd), (n, P, *_) in zip(items, meta):
@@ -1501,6 +1566,17 @@ class ViTMAE3D(nn.Module):
         # patch geometry; the global loss is the weight-masked mean across groups
         losses, wts = [], []
         grad_num, grad_den = [], []
+        if "flat_w" in parts[0]:
+            # flat_loss: the same elementwise (w * mse) and sums as below, on the flat group-order buffers
+            preds = []
+            for part, feat in zip(parts, feats):
+                sp = part["spacing"]
+                part["pred_patches"] = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
+                preds.append(part["pred_patches"].flatten())
+            w = parts[0].pop("flat_w")
+            losses.append(w * F.mse_loss(flat_rows(preds), parts[0].pop("flat_t"), reduction="none"))
+            wts.append(w)
+            feats = ()
         for part, feat in zip(parts, feats):
             sp = part["spacing"]
             pred = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
@@ -1598,7 +1674,8 @@ class ViTMAE3D(nn.Module):
             les_loss = (weight * bce).sum() / lw
             loss = loss + self.lesion_mask_weight * self.lesion_scale * les_loss
             self.level_mirror_stats = {
-                **self.level_mirror_stats, "les_bce": les_loss.detach(), "les_pos": ((weight * target).sum() / lw).detach(),
+                **self.level_mirror_stats, "les_bce": les_loss.detach(),
+                **({"les_pos": ((weight * target).sum() / lw).detach()} if getattr(self, "want_stats", True) else {}),
             }
         for part in parts:
             part.pop("syn_clean", None)
@@ -1676,6 +1753,12 @@ class ViTMAE3D(nn.Module):
             return loss
         return loss, {"parts": parts, "embeds": embeds}
 
+    def flat_loss_ok(self) -> bool:
+        # flat_loss applies: plain masked mse (no target curriculum / normalization / fg or gradient terms)
+        return bool(getattr(self, "flat_loss", False)) and self.training and not (
+            self.target_lp_mm > 0.0 or self.norm_target or self.fg_loss_weight > 0.0 or self.grad_loss_weight > 0.0
+        )
+
     def native_groups(self, spacing: list, device: torch.device) -> tuple[dict, dict]:
         # images by spacing (insertion order) and each spacing's token geometry
         token_mm = self.patch_size[0] * self.target_spacing
@@ -1688,17 +1771,18 @@ class ViTMAE3D(nn.Module):
     @torch.no_grad()
     def native_prepare(
         self, images: list[Tensor], mask: list[Tensor], spacing: list, num_visible: int, num_predict: int,
-        num_samples: int,
+        num_samples: int, lims: list | None = None,
     ) -> dict:
         # native_prep_tokens: forward_native's weight-free tokenization of a batch (run in a prep thread,
-        # under the training autocast), passed back as forward(prepared=...)
+        # under the training autocast), passed back as forward(prepared=...). lims: per image in-mask
+        # (min, max) if known (native_worker_clip), else plan_tumors computes them
         groups, geoms = self.native_groups(spacing, images[0].device)
-        parts = self.native_tokens(images, mask, groups, geoms, num_visible, num_predict, num_samples)
+        parts = self.native_tokens(images, mask, groups, geoms, num_visible, num_predict, num_samples, lims=lims)
         return {"groups": groups, "geoms": geoms, "parts": parts}
 
     def native_tokens(
         self, images: list[Tensor], mask: list[Tensor], groups: dict, geoms: dict, num_visible: int,
-        num_predict: int, num_samples: int,
+        num_predict: int, num_samples: int, lims: list | None = None,
     ) -> list[dict]:
         # forward_native's tokenization (no weights): tumour paste, patchify, sequences, token corruptions,
         # per group; each part keeps its visible patches as "vis_tok" for the patch embedding
@@ -1708,7 +1792,7 @@ class ViTMAE3D(nn.Module):
         if self.training and self.tumor_prob * self.tumor_scale > 0:
             tumors = plan_tumors(
                 images, mask, groups, geoms, self.tumor_prob * self.tumor_scale, self.tumor_radius, self.tumor_ring,
-                self.tumor_contrast, self.tumor_edge, self.tumor_nodule, neg=self.tumor_neg_prob,
+                self.tumor_contrast, self.tumor_edge, self.tumor_nodule, neg=self.tumor_neg_prob, lims=lims,
             )
         parts = []
         for sp, ids in groups.items():
@@ -1737,17 +1821,28 @@ class ViTMAE3D(nn.Module):
                 if tumor is not None:
                     lesion = tumor if lesion is None else torch.maximum(lesion, tumor)
             raw = vols if (self.hemiswap_head is not None and self.training) else None
-            vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
             cube = (grid, self.mask_cube) if self.mask_cube else None
-            scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube).flatten(0, 1)
+            # lazy_patchify (speed): the token rows are gathered from the padded volumes on demand (only the
+            # ~1.3k sampled of ~10k+ tokens per image are ever read), the same values as patchify3d's rows
+            lazy = getattr(self, "lazy_patchify", False) and self.level_mirror_head is None and (
+                self.brainpos_head is None and self.hemiswap_head is None  # brain_frame reads whole patch rows
+            )
+            patchify = (lambda t: LazyTokens(t, patch, grid)) if lazy else (lambda t: patchify3d(t, patch))
+            if lazy:
+                vols = LazyTokens(vols, patch, grid)
+                scores = sequence_scores(None, num_samples, self.min_mask_frac, cube=cube, mask_frac=vols[1].frac())
+            else:
+                vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
+                scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube)
+            scores = scores.flatten(0, 1)
             parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols, "grid": grid})
             parts[-1]["scores"] = scores
             if raw is not None:
                 parts[-1]["raw"] = raw
             if self.lesion_head is not None and self.training:
-                parts[-1]["lesion"] = None if lesion is None else patchify3d(lesion, patch)
+                parts[-1]["lesion"] = None if lesion is None else patchify(lesion)
             if clean_img is not None:
-                parts[-1]["clean_img"] = patchify3d(clean_img, patch)
+                parts[-1]["clean_img"] = patchify(clean_img)
 
         # one argsort for all groups, rows padded with 3.0 (after every score). sorts this long are
         # stable, so these are the per group argsorts
@@ -1881,8 +1976,14 @@ class ViTMAE3D(nn.Module):
                 continue
             finish(part, order, num, vols, coord, b, vis_patches, vis_mask)
         if batched:
-            for item, corrupted in zip(deferred, self.corrupt_apply_batched(pending)):
+            compact = getattr(self, "corrupt_compact", False)
+            for item, corrupted in zip(deferred, self.corrupt_apply_batched(pending, compact=compact)):
                 finish(*item[:6], corrupted, item[7])
+        if self.flat_loss_ok():
+            # flat_loss: the reconstruction loss' weights (in-mask fraction / voxels) and targets of every group,
+            # flat in group order, so forward_native's loss is one pass over the cat of the predictions
+            parts[0]["flat_w"] = flat_rows([(p.pop("target_mask_patches") / p["target_patches"].shape[-1]).flatten() for p in parts])
+            parts[0]["flat_t"] = flat_rows([p.pop("target_patches").flatten() for p in parts])
         return parts
 
     def aux_losses(
@@ -1963,19 +2064,21 @@ class ViTMAE3D(nn.Module):
             logits = self.unified_head(tokens).float().flatten(0, 1)
             uc_loss = F.cross_entropy(logits, labels)
             loss = loss + self.unified_weight * self.unified_scale * uc_loss
-            with torch.no_grad():
-                pred = logits.argmax(-1)
-                bad = labels > 0
-                stats["uc_loss"] = uc_loss.detach()
-                stats["uc_frac"] = bad.float().mean()
-                stats["uc_acc_corrupt"] = ((pred == labels) & bad).sum() / bad.sum().clamp_min(1)
-                stats["uc_acc_clean"] = ((pred == 0) & ~bad).sum() / (~bad).sum().clamp_min(1)
-                names = ["swap", "bias", "blur", "noise", "gamma", "down", "contrast", "ghost"][: 1 + self.corrupt_kinds]
-                if self.unified_shuffle:
-                    names.append("shuf")
-                for c, name in enumerate(names, start=1):
-                    sel = labels == c
-                    stats[f"uc_rec_{name}"] = ((pred == c) & sel).sum() / sel.sum().clamp_min(1)
+            stats["uc_loss"] = uc_loss.detach()
+            # want_stats (native_log_stats_only: only on log steps): the logged accuracies, not in the loss
+            if getattr(self, "want_stats", True):
+                with torch.no_grad():
+                    pred = logits.argmax(-1)
+                    bad = labels > 0
+                    stats["uc_frac"] = bad.float().mean()
+                    stats["uc_acc_corrupt"] = ((pred == labels) & bad).sum() / bad.sum().clamp_min(1)
+                    stats["uc_acc_clean"] = ((pred == 0) & ~bad).sum() / (~bad).sum().clamp_min(1)
+                    names = ["swap", "bias", "blur", "noise", "gamma", "down", "contrast", "ghost"][: 1 + self.corrupt_kinds]
+                    if self.unified_shuffle:
+                        names.append("shuf")
+                    for c, name in enumerate(names, start=1):
+                        sel = labels == c
+                        stats[f"uc_rec_{name}"] = ((pred == c) & sel).sum() / sel.sum().clamp_min(1)
         if self.edgelvl_head is not None and "vis_patches" in parts[0]:
             num, den, err = 0.0, 0.0, 0.0
             rows = torch.split(tokens, [len(part["ids"]) * num_samples for part in parts])
@@ -2182,6 +2285,7 @@ def plan_tumors(
     edge: tuple[float, float],
     nodule: float,
     neg: float = 0.0,
+    lims: list | None = None,
 ) -> dict[tuple, tuple[Tensor, Tensor, Tensor, Tensor]]:
     # one lobulated mass sized in mm in a prob share of the batch, centred >= 6 mm inside the mask: a
     # solid bright 3-10 mm nodule (share nodule), else a bright 3-8 mm rim of uneven thickness on a
@@ -2250,8 +2354,9 @@ def plan_tumors(
     best = hits.view(k, 64, 7).sum(-1).argmax(1)
     centre = torch.take_along_dim(cand, best.view(k, 1, 1).expand(k, 1, 3), 1)[:, 0] + torch.rand(k, 3, device=dev)
     lo = torch.minimum((centre.long() - num // 2).clamp_min(0), dims - num)
+    # lims (native_worker_clip): the same in-mask (min, max), known from the normalization
     lim = torch.stack([
-        torch.stack([
+        lims[ii] if lims is not None and lims[ii] is not None else torch.stack([
             torch.where(masks[ii].bool(), images[ii], math.inf).amin(),
             torch.where(masks[ii].bool(), images[ii], -math.inf).amax(),
         ])
@@ -2294,26 +2399,30 @@ def plan_tumors(
     return out
 
 
-@lru_cache(maxsize=4096)
-def pool_matrix(size: int, out: int, device: torch.device) -> Tensor:
-    # [out, size]: adaptive average pooling's bins (floor(i size / out) .. ceil((i + 1) size / out)) as weights
-    a = torch.zeros(out, size, dtype=torch.float32)
-    for i in range(out):
-        lo, hi = (i * size) // out, -((-(i + 1) * size) // out)
-        a[i, lo:hi] = 1.0 / (hi - lo)
-    return _cached(a.to(device))
+@lru_cache(maxsize=1024)
+def pool_kron(shape: tuple[int, int, int], out: int, device: torch.device) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    # adaptive average pooling's bins (floor(i size / out) .. ceil((i + 1) size / out) per axis) as a 0/1
+    # [out^3, X Y Z] indicator matrix, and the bin lengths per axis
+    ind, lens = [], []
+    for size in shape:
+        a = torch.zeros(out, size, dtype=torch.float32)
+        for i in range(out):
+            a[i, (i * size) // out : -((-(i + 1) * size) // out)] = 1.0
+        ind.append(a)
+        lens.append(a.sum(1))
+    k = torch.einsum("ai,bj,ck->abcijk", *ind).reshape(out**3, -1)
+    return tuple(_cached(t.to(device)) for t in (k, *lens))
 
 
 def sep_pool(v: Tensor, out: int) -> Tensor:
-    # F.adaptive_avg_pool3d(v, out) for v [N, C, X, Y, Z] as separable fp32 matmuls over the small axes (the same
-    # bins and weights; ~20x faster than the adaptive pool kernel on ~1e5 rows of 8^3 voxels)
+    # F.adaptive_avg_pool3d(v, out) for v [N, C, X, Y, Z]: the bin sums as one fp32 GEMM with a 0/1 indicator
+    # (exact for 0/1 inputs), then / len_x / len_y / len_z as the pool kernel divides (~10x faster than its
+    # kernel on ~1e5 rows of small patches)
     n, c, x, y, z = v.shape
-    ax, ay, az = (pool_matrix(s, out, v.device) for s in (x, y, z))
+    k, lx, ly, lz = pool_kron((x, y, z), out, v.device)
     with torch.autocast(v.device.type, enabled=False):
-        t = v.float().reshape(-1, z) @ az.t()                                   # [n c x y, o]
-        t = (t.view(n * c * x, y, out).transpose(1, 2) @ ay.t())                # [n c x, o(z), o(y)]
-        t = t.view(n * c, x, out * out).transpose(1, 2) @ ax.t()                # [n c, o(z) o(y), o(x)]
-    return t.view(n, c, out, out, out).permute(0, 1, 4, 3, 2)
+        s = (v.float().reshape(n * c, x * y * z) @ k.t()).view(n, c, out, out, out)
+    return s / lx.view(-1, 1, 1) / ly.view(1, -1, 1) / lz.view(1, 1, -1)
 
 
 # native_prep_tokens: the lru-cached device constants below may be built in one prep thread (on its side
@@ -2325,6 +2434,38 @@ def _cached(t: Tensor) -> Tensor:
     if CACHE_SYNC and t.is_cuda:
         torch.cuda.current_stream(t.device).synchronize()
     return t
+
+
+class LazyTokens:
+    """patchify3d(vol.flatten(0, k), patch).unflatten(...) of a padded volume [*lead, X, Y, Z] without the copy:
+    flatten(0, j) over every leading dim + the token dim, then index_select(0, rows) gathers just those token rows
+    (the same values), [i] selects a leading index; frac() is the per token mask fraction (the mean of the rows)."""
+
+    def __init__(self, vol: Tensor, patch, grid):
+        self.vol, self.patch, self.grid = vol, tuple(patch), tuple(grid)
+        self.num = math.prod(grid)
+
+    def __getitem__(self, i: int) -> "LazyTokens":
+        return LazyTokens(self.vol[i], self.patch, self.grid)
+
+    def flatten(self, start: int, end: int) -> "LazyTokens":
+        assert start == 0 and end == self.vol.dim() - 3, "LazyTokens: flatten every leading dim and the tokens"
+        return self
+
+    def index_select(self, dim: int, rows: Tensor) -> Tensor:
+        # advanced indexing on the patch-blocked view [lead, gx, gy, gz, px, py, pz] (no voxel index tensor)
+        assert dim == 0
+        (gx, gy, gz), (px, py, pz) = self.grid, self.patch
+        v = self.vol.reshape(-1, gx, px, gy, py, gz, pz).permute(0, 1, 3, 5, 2, 4, 6)
+        t = rows % self.num
+        return v[rows // self.num, t // (gy * gz), t // gz % gy, t % gz].reshape(len(rows), -1)
+
+    def frac(self) -> Tensor:
+        # [lead, N]: the mean of each token's voxels (exact counts; the same division as Tensor.mean)
+        lead = self.vol.shape[:-3]
+        v = self.vol.reshape(-1, 1, *self.vol.shape[-3:]).float()
+        k = F.avg_pool3d(v, self.patch, stride=self.patch, divisor_override=1)
+        return (k.reshape(*lead, -1) / math.prod(self.patch))
 
 
 def flat_rows(tensors: list[Tensor]) -> Tensor:
@@ -2419,17 +2560,19 @@ def sample_sequences(
 
 
 def sequence_scores(
-    mask_patches: torch.Tensor,
+    mask_patches: torch.Tensor | None,
     num_samples: int,
     min_mask_frac: float = 0.25,
     cube: tuple[tuple[int, int, int], int] | None = None,
+    mask_frac: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    # sample_sequences' sort keys, [B, num_samples, N]
-    batch_size, num_patches, _ = mask_patches.shape
-    mask_frac = mask_patches.float().mean(dim=2)
+    # sample_sequences' sort keys, [B, num_samples, N]. mask_frac [B, N]: the patches' mask fractions, if known
+    if mask_frac is None:
+        mask_frac = mask_patches.float().mean(dim=2)
+    batch_size, num_patches = mask_frac.shape
     # one independent shuffle per sequence, with patches outside the mask sorted last so
     # they are only used when a volume has too few mask patches
-    scores = torch.rand(batch_size, num_samples, num_patches, device=mask_patches.device)
+    scores = torch.rand(batch_size, num_samples, num_patches, device=mask_frac.device)
     if cube is not None:
         # cube: (patch grid, edge in patches). one uniform score per cube, shared by its patches,
         # so they are ordered (visible / predicted) together; the white noise only breaks ties
