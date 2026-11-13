@@ -147,6 +147,12 @@ def main(args: DictConfig):
     model.corrupt_compact = bool(args.get("native_corrupt_compact", False))
     # speed (off when unset): one flat reconstruction loss pass over all groups (bit-identical sums)
     model.flat_loss = bool(args.get("native_flat_loss", False))
+    # speed (off when unset; with native_batched_corrupt + native_lazy_patchify): the unified corruption's
+    # candidate / class draws for all groups at once
+    model.batched_unified = bool(args.get("native_batched_unified", False))
+    # OPTIMIZATION-CHANGING (off when unset): the encoder / decoder residual streams in bf16 (fp32 now)
+    model.bf16_residual = bool(args.get("native_bf16_residual", False))
+    assert not model.batched_unified or (args.get("native_batched_corrupt") and args.get("native_lazy_patchify"))
     assert not model.corrupt_compact or (args.get("native_prep_tokens") and args.get("native_batched_corrupt"))
     if args.get("natinit") and args.natinit.enabled:
         # natural-image pretrained blocks (+ inflated patch embedding). a resumed checkpoint
@@ -757,7 +763,7 @@ def make_batch_transform(args: DictConfig):
     def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         if isinstance(batch, dict) and "samples" in batch:
             # native_batched_prep: a native_concat batch
-            return prep.native_batch_transform(batch, args.target_spacing)
+            return prep.native_batch_transform(batch, args.target_spacing, index=bool(args.get("native_index_prep")))
         raw = batch
         batch = [
             sample_transform(

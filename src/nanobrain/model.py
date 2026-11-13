@@ -1098,6 +1098,9 @@ class ViTMAE3D(nn.Module):
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
 
+        if getattr(self, "bf16_residual", False) and self.training:
+            # bf16_residual (speed, CHANGES NUMERICS: the residual stream in bf16, not fp32; training only)
+            x = x.to(torch.bfloat16)
         for block in self.blocks:
             x = block(x)
         x = self.norm(x)
@@ -1174,6 +1177,8 @@ class ViTMAE3D(nn.Module):
             mask_tokens = mask_tokens + pooled
 
         x = torch.cat([embeds, mask_tokens], dim=1)
+        if getattr(self, "bf16_residual", False) and self.training:
+            x = x.to(torch.bfloat16)
         gate = None
         if vis_gate is not None:
             ones_c = vis_gate.new_ones(B, self.class_tokens)
@@ -1828,15 +1833,19 @@ class ViTMAE3D(nn.Module):
                 self.brainpos_head is None and self.hemiswap_head is None  # brain_frame reads whole patch rows
             )
             patchify = (lambda t: LazyTokens(t, patch, grid)) if lazy else (lambda t: patchify3d(t, patch))
+            mask_frac = None
             if lazy:
                 vols = LazyTokens(vols, patch, grid)
-                scores = sequence_scores(None, num_samples, self.min_mask_frac, cube=cube, mask_frac=vols[1].frac())
+                mask_frac = vols[1].frac()
+                scores = sequence_scores(None, num_samples, self.min_mask_frac, cube=cube, mask_frac=mask_frac)
             else:
                 vols = patchify3d(vols.flatten(0, 1), patch).unflatten(0, (2, len(ids)))
                 scores = sequence_scores(vols[1], num_samples, self.min_mask_frac, cube=cube)
             scores = scores.flatten(0, 1)
             parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols, "grid": grid})
             parts[-1]["scores"] = scores
+            if mask_frac is not None:
+                parts[-1]["mask_frac"] = mask_frac
             if raw is not None:
                 parts[-1]["raw"] = raw
             if self.lesion_head is not None and self.training:
@@ -1857,7 +1866,32 @@ class ViTMAE3D(nn.Module):
             for part, num, rows in zip(parts, num_tokens, num_rows):
                 scores[row : row + rows, :num] = part["scores"]
                 row += rows
-        orders = scores.argsort(dim=1, stable=True)[:, :seq_length].split(num_rows)
+        order_all = scores.argsort(dim=1, stable=True)[:, :seq_length]
+        orders = order_all.split(num_rows)
+        uni = None
+        if (
+            getattr(self, "batched_unified", False) and getattr(self, "batched_corrupt", False)
+            and self.unified_head is not None and self.training
+            and not self.unified_shuffle and self.shuffle_head is None and self.rtd_head is None
+            and all("mask_frac" in part for part in parts)
+        ):
+            # batched_unified (speed): unified_transform's candidate / class draws for every group's rows at once
+            # (the eligibility from the lazy mask fractions = the visible mask rows' means); rtd swaps stay per group
+            frac = parts[0]["mask_frac"].new_zeros((sum(len(part["ids"]) for part in parts), max(num_tokens)))
+            img = 0
+            for part, num in zip(parts, num_tokens):
+                frac[img : img + len(part["ids"]), :num] = part.pop("mask_frac")
+                img += len(part["ids"])
+            vis_order = order_all[:, :num_visible]
+            row_img = torch.arange(order_all.shape[0], device=device) // num_samples
+            ok = frac[row_img].gather(1, vis_order) >= 0.5
+            cand, hit = self.corrupt_candidates(ok, self.unified_ratio)
+            cls = torch.where(hit, torch.randint(1, self.unified_classes, hit.shape, device=device), 0)
+            labels = torch.zeros_like(vis_order).scatter(1, cand, cls)
+            kind = torch.where((cls >= 2) & (cls < 2 + self.corrupt_kinds), cls - 1, 0)
+            uni = [t.split(num_rows) for t in (cand, labels, kind)]
+        for part in parts:
+            part.pop("mask_frac", None)
 
         def finish(part, order, num, vols, coord, b, vis_patches, vis_mask):
             # a group's tokenization after its unified corruption (split out so batched_corrupt can apply
@@ -1966,7 +2000,19 @@ class ViTMAE3D(nn.Module):
                     )
                 if "shuffled" in part:
                     part["shuffled"] = part["shuffled"] & ~part["rtd_label"]
-            if self.unified_head is not None and self.training:
+            if uni is not None:
+                gi = len(deferred)
+                cand, labels, kind = (t[gi] for t in uni)
+                if b >= 2:
+                    vis_patches, vis_mask, done = self.rtd_replace(
+                        vis_patches, vis_mask, order, vols, b, num, num_samples, num_visible, select=labels == 1
+                    )
+                    labels = torch.where((labels == 1) & ~done, 0, labels)
+                else:
+                    labels = torch.where(labels == 1, 0, labels)
+                part["unified_label"] = labels
+                pending.append((vis_patches, vis_mask, patch, cand, kind))
+            elif self.unified_head is not None and self.training:
                 vis_patches, vis_mask, part["unified_label"] = self.unified_transform(
                     vis_patches, vis_mask, patch, order, vols, b, num, num_samples, num_visible,
                     defer=pending if batched else None,

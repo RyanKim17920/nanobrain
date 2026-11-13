@@ -72,7 +72,7 @@ def native_concat(batch: list[dict], clip_quantiles=(0.005, 0.995)) -> dict | li
     return out
 
 
-def native_batch_transform(batch: dict, target_spacing: float = 1.0) -> dict:
+def native_batch_transform(batch: dict, target_spacing: float = 1.0, index: bool = False) -> dict:
     # train.make_batch_transform's native output (per image: normalize with the worker clip, dense mask, in-mask
     # scatter, reorient to ras) for a native_concat batch, with batch wide kernels; the per image mean / std
     # reductions and the reorient copies stay per image, so every value is the same as the per sample path
@@ -100,10 +100,43 @@ def native_batch_transform(batch: dict, target_spacing: float = 1.0) -> dict:
     rseg = torch.repeat_interleave(ids, batch["num_runs"], output_size=sum(s["n_runs"] for s in samples))
     rstart = batch["num_runs"].cumsum(0) - batch["num_runs"]
     flags = (torch.arange(runs.shape[0], device=dev) - rstart[rseg]) % 2 == 1
-    mask = torch.repeat_interleave(flags, runs, output_size=sum(vox))
-    image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
     out = {"image": [], "mask": [], "spacing": [], "lim": list(lims.unbind(0))}
-    for img, msk, sh, s in zip(image.split(vox), mask.split(vox), shapes, samples):
+    if index:
+        # native_index_prep: each in-mask value written straight to its reoriented (flipped, permuted) voxel,
+        # from the runs' voxel ranges (no dense mask scan / masked_scatter / flip copies); the same values in
+        # contiguous tensors of the ras shape (the per sample path gives permuted views)
+        N = sum(nv)
+        rel = runs.cumsum(0) - runs - (runs.cumsum(0) - runs)[rstart][rseg]  # each run's first voxel in its image
+        tlen = torch.where(flags, runs, 0)
+        tstart = tlen.cumsum(0) - tlen
+        rep_start = torch.repeat_interleave(rel - tstart, tlen, output_size=N)
+        flat = rep_start + torch.arange(N, device=dev)  # = run start + position within the run
+        geo, outs, off = [], [], 0
+        for sh, s in zip(shapes, samples):
+            flip_axes, order, affine = ras_orientation(s["affine"], sh)
+            osh = [sh[a] for a in order]
+            geo.append([*sh, *[int(a in flip_axes) for a in range(3)], *order, *osh, off])
+            outs.append((osh, affine))
+            off += int(np.prod(sh))
+        geo = torch.tensor(geo, dtype=torch.int64)
+        geo = (geo.pin_memory() if dev.type == "cuda" else geo).to(dev, non_blocking=True)[seg]
+        X, Y, Z = geo[:, 0], geo[:, 1], geo[:, 2]
+        # flat is relative to the image's first value: + the image's first voxel offset is not needed (per image ids)
+        c = torch.stack([flat // (Y * Z), flat // Z % Y, flat % Z], 1)
+        dims = torch.stack([X, Y, Z], 1)
+        c = torch.where(geo[:, 3:6].bool(), dims - 1 - c, c)
+        o = c.gather(1, geo[:, 6:9])
+        dst = (o[:, 0] * geo[:, 10] + o[:, 1]) * geo[:, 11] + o[:, 2] + geo[:, 12]
+        image = values.new_zeros(off).index_put_((dst,), values)
+        mask = torch.zeros(off, dtype=torch.bool, device=dev).index_fill_(0, dst, True)
+        for img, msk, (osh, affine) in zip(image.split(vox), mask.split(vox), outs):
+            out["image"].append(img.view(osh))
+            out["mask"].append(msk.view(osh))
+            out["spacing"].append(native_spacing(affine, target_spacing))
+    else:
+        mask = torch.repeat_interleave(flags, runs, output_size=sum(vox))
+        image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
+    for img, msk, sh, s in zip(image.split(vox), mask.split(vox), shapes, samples) if not index else ():
         img, msk, affine = reorient_to_ras(img.view(sh), msk.view(sh), s["affine"])
         out["image"].append(img)
         out["mask"].append(msk)
