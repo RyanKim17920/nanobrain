@@ -476,6 +476,17 @@ def train(
             lp_frac = float(args.get("target_lp_frac", 0.5))
             band = (prog - 0.5 * lp_frac) / max(0.5 * lp_frac, 1e-6)
             model_without_ddp.target_band = float(min(1.0, max(0.0, band)))
+        if getattr(model_without_ddp, "aux_schedules", None):
+            # aux loss / paste-probability schedules on the LR schedule's progress clock
+            # (time_keyed_lr: (wall - train_t0) / (time_limit - train_t0), 0 before the origin is set)
+            if time_schedule:
+                wall = prev_wall_time + time.monotonic() - start_time
+                aux_prog = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+            else:
+                aux_prog = step / total_steps
+            aux_scales = model_without_ddp.set_aux_progress(min(max(aux_prog, 0.0), 1.0))
+            if log_step:
+                metric_logger.update(**aux_scales)
         fino_kwargs = {}
         if "fino" in batch:
             # FINO's gamma ramp over training progress (the time schedule's clock when time keyed)

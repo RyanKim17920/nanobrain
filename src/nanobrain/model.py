@@ -178,8 +178,47 @@ class ViTMAE3D(nn.Module):
         # tokens a corruption replaced or altered (rtd / unified / hemiswap / corrupt / orient /
         # shuffle) are out of this loss and of the mirror level loss
         lesion_mask_weight: float = 0.0,
+        # aux schedules over training progress t in [0, 1] (the LR schedule's clock; set each step by
+        # the training loop through set_aux_progress; None = off, scale 1). [start, end] fractions:
+        # *_ramp scales linearly 0 -> 1 between them, unified_decay 1 -> 0. unified_ramp / unified_decay
+        # scale unified_weight, lesion_ramp lesion_mask_weight, tumor_prob_ramp the paste probability
+        unified_ramp: tuple[float, float] | None = None,
+        unified_decay: tuple[float, float] | None = None,
+        lesion_ramp: tuple[float, float] | None = None,
+        tumor_prob_ramp: tuple[float, float] | None = None,
+        # multi-level feature fusion (MFF, Liu et al. ICCV 2023; port of loop n0119): training-only
+        # zero-init per-layer projections (after a LayerNorm) of these encoder levels (0 = the
+        # position-embedded patch embedding, l = block l output) summed, scaled by fuse_scale, and
+        # added to the projected encoder tokens at the decoder input. the evaluated encoder output
+        # is unchanged. empty / scale 0 = off (no params)
+        fuse_layers: tuple[int, ...] = (),
+        fuse_scale: float = 1.0,
+        # tumours in ONE view only: the num_samples sequences of a pasted image gather the pasted
+        # volume in view 0 and the clean (pre-paste) volume in every other view, whose lesion
+        # targets are 0 (training only; False = every view sees the paste)
+        tumor_one_view: bool = False,
     ):
         super().__init__()
+        self.tumor_one_view = bool(tumor_one_view)
+        assert not tumor_one_view or tumor_prob, "tumor_one_view: needs tumor_prob"
+        assert not (tumor_one_view and level_mirror), "tumor_one_view: mirror refs come from the pasted volume"
+        assert not (tumor_one_view and blob_prob), "tumor_one_view: blobs are pasted into every view"
+        self.fuse_layers = tuple(int(l) for l in fuse_layers) if fuse_scale else ()
+        self.fuse_scale = float(fuse_scale)
+        assert all(0 <= l < depth for l in self.fuse_layers), "fuse_layers: 0 (embed) .. depth-1"
+        assert len(set(self.fuse_layers)) == len(self.fuse_layers), "fuse_layers: duplicates"
+        self.aux_schedules = {
+            k: (float(v[0]), float(v[1]))
+            for k, v in (("unified_ramp", unified_ramp), ("unified_decay", unified_decay),
+                         ("lesion_ramp", lesion_ramp), ("tumor_prob_ramp", tumor_prob_ramp))
+            if v is not None
+        }
+        for k, (a, b) in self.aux_schedules.items():
+            assert 0.0 <= a <= b <= 1.0, f"{k}: need 0 <= start <= end <= 1, got {[a, b]}"
+        # multipliers the schedules drive (exactly 1.0 when off: x * 1.0 == x, the flags-off path is unchanged)
+        self.unified_scale = 1.0
+        self.lesion_scale = 1.0
+        self.tumor_scale = 1.0
         self.brainpos_weight = float(brainpos_weight)
         self.brainpos_hide_frac = float(brainpos_hide_frac)
         self.scanmatch_weight = float(scanmatch_weight)
@@ -409,6 +448,16 @@ class ViTMAE3D(nn.Module):
                 self.lesion_head = nn.Linear(embed_dim, (patch_size // level_pool) ** 3)
             nn.init.zeros_(self.lesion_head.weight)
             nn.init.zeros_(self.lesion_head.bias)
+        self.fuse_norms = self.fuse_projs = None
+        if self.fuse_layers:
+            assert native, "fuse_layers: native path only"
+            with torch.random.fork_rng(devices=[]):
+                self.fuse_norms = nn.ModuleList([LayerNorm(embed_dim) for _ in self.fuse_layers])
+                self.fuse_projs = nn.ModuleList([nn.Linear(embed_dim, decoder_embed_dim) for _ in self.fuse_layers])
+            for proj in self.fuse_projs:
+                # zero init: the decoder input equals the unfused one at step 0
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
 
     @torch.no_grad()
     def brain_frame(
@@ -793,6 +842,36 @@ class ViTMAE3D(nn.Module):
         x = self.norm(x)
         return x
 
+    def encode_tokens_fused(
+        self,
+        x: Float[Tensor, "B N D"],
+        coord: Float[Tensor, "B N 3"],
+        pos_hide: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        # encode_tokens (same final output) plus the multi-level skip for the decoder input:
+        # fuse_scale * sum_l proj_l(norm_l(h_l)) over the fuse_layers levels (training only)
+        B = x.shape[0]
+        if pos_hide is not None:
+            x = torch.where(pos_hide[..., None], x + self.brainpos_unk.to(x.dtype), self.pos_embed(x, coord))
+        else:
+            x = self.pos_embed(x, coord)
+
+        if self.class_tokens:
+            x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
+
+        index = {l: jj for jj, l in enumerate(self.fuse_layers)}
+        skip = None
+        if 0 in index:
+            skip = self.fuse_projs[index[0]](self.fuse_norms[index[0]](x))
+        for ii, block in enumerate(self.blocks):
+            x = block(x)
+            jj = index.get(ii + 1)
+            if jj is not None:
+                term = self.fuse_projs[jj](self.fuse_norms[jj](x))
+                skip = term if skip is None else skip + term
+        x = self.norm(x)
+        return x, self.fuse_scale * skip
+
     def forward_decoder(
         self,
         embeds: Float[Tensor, "B R+N D"],
@@ -805,6 +884,7 @@ class ViTMAE3D(nn.Module):
         embeds: Float[Tensor, "B R+N D"],
         target_coord: Float[Tensor, "B M 3"],
         vis_gate: Float[Tensor, "B N"] | None = None,
+        skip: Float[Tensor, "B R+N E"] | None = None,
     ) -> Float[Tensor, "B M D"]:
         # forward_decoder before the head. vis_gate (rtd suspicion gating, training only): a per
         # visible token value gate in every decoder attention; class and mask tokens stay at 1
@@ -820,7 +900,12 @@ class ViTMAE3D(nn.Module):
             embeds = embeds[:, : self.class_tokens + keep]
             if vis_gate is not None:
                 vis_gate = vis_gate[:, :keep]
+            if skip is not None:
+                skip = skip[:, : self.class_tokens + keep]
         embeds = self.decoder_proj(embeds)
+        if skip is not None:
+            # multi-level fusion (fuse_layers): the shallow-level skip, decoder width, per encoder token
+            embeds = embeds + skip
 
         mask_tokens = self.mask_token.expand(B, M, -1)
         mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
@@ -1161,9 +1246,9 @@ class ViTMAE3D(nn.Module):
             embed_ws, head_ws = dict(zip(native_sps, embed_ws)), dict(zip(native_sps, head_ws))
 
         tumors = {}
-        if self.training and self.tumor_prob > 0:
+        if self.training and self.tumor_prob * self.tumor_scale > 0:
             tumors = plan_tumors(
-                images, mask, groups, geoms, self.tumor_prob, self.tumor_radius, self.tumor_ring,
+                images, mask, groups, geoms, self.tumor_prob * self.tumor_scale, self.tumor_radius, self.tumor_ring,
                 self.tumor_contrast, self.tumor_edge, self.tumor_nodule,
             )
         parts = []
@@ -1185,6 +1270,9 @@ class ViTMAE3D(nn.Module):
                     vols[0], vols[1], patch, sp, self.blob_prob, self.blob_max, self.blob_radius,
                     self.blob_contrast, self.blob_edge, with_mask=self.lesion_head is not None,
                 )
+            clean_img = None
+            if sp in tumors and self.tumor_one_view:
+                clean_img = vols[0].clone()
             if sp in tumors:
                 tumor = paste_tumors(vols[0], vols[1], tumors[sp], with_mask=self.lesion_head is not None)
                 if tumor is not None:
@@ -1199,6 +1287,8 @@ class ViTMAE3D(nn.Module):
                 parts[-1]["raw"] = raw
             if self.lesion_head is not None and self.training:
                 parts[-1]["lesion"] = None if lesion is None else patchify3d(lesion, patch)
+            if clean_img is not None:
+                parts[-1]["clean_img"] = patchify3d(clean_img, patch)
 
         # one argsort for all groups, rows padded with 3.0 (after every score). sorts this long are
         # stable, so these are the per group argsorts
@@ -1224,6 +1314,12 @@ class ViTMAE3D(nn.Module):
             flat_ids = part["order"] + gather_offsets(b, num, device)
             patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
             patches, mask_patches = patches.view(2, b * num_samples, seq_length, -1)
+            if "clean_img" in part:
+                # tumor_one_view: views 1.. of every image read the clean (pre-paste) volume
+                clean = part.pop("clean_img").flatten(0, 1).index_select(0, flat_ids.flatten())
+                clean = clean.view(b * num_samples, seq_length, -1)
+                later = (torch.arange(b * num_samples, device=device) % num_samples > 0).view(-1, 1, 1)
+                patches = torch.where(later, clean, patches)
             coord = geoms[sp][3][0][order]
             vis_patches, part["target_patches"] = patches.split([num_visible, num_predict], 1)
             part["target_mask_patches"] = mask_patches[:, num_visible:]
@@ -1288,6 +1384,10 @@ class ViTMAE3D(nn.Module):
                 if "lesion" in part:
                     if part["lesion"] is not None:
                         part["lesion"] = part["lesion"].flatten(0, 1).index_select(0, vis_ids)
+                        if self.tumor_one_view:
+                            # views 1.. saw the clean volume: no lesion there (blobs are off with this flag)
+                            les = part["lesion"].view(b, num_samples, num_visible, -1)
+                            part["lesion"] = torch.cat([les[:, :1], torch.zeros_like(les[:, 1:])], 1).flatten(0, 2)
                     lm = vis_mask
                     if altered is not None:
                         lm = vis_mask * ~altered[..., None]
@@ -1310,7 +1410,13 @@ class ViTMAE3D(nn.Module):
             return torch.cat([t.flatten() for t in tensors])
 
         bp_on = self.brainpos_head is not None and self.training and "bp_target" in parts[0]
-        embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None)
+        fuse_skip = None
+        if self.fuse_layers and self.training:
+            embeds, fuse_skip = self.encode_tokens_fused(
+                cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None
+            )
+        else:
+            embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None)
         rtd_on = self.rtd_head is not None and self.training and "rtd_label" in parts[0]
         rtd_logits, vis_gate = None, None
         if rtd_on:
@@ -1318,7 +1424,10 @@ class ViTMAE3D(nn.Module):
             if self.rtd_gate_scale > 0.0:
                 vis_gate = (2.0 * torch.sigmoid(-self.rtd_gate_scale * rtd_logits)).clamp(max=1.0)
                 vis_gate = vis_gate.to(embeds.dtype)
-        feats = self.decode_features(embeds, cat("target_coord"), vis_gate)
+        if fuse_skip is None:
+            feats = self.decode_features(embeds, cat("target_coord"), vis_gate)
+        else:
+            feats = self.decode_features(embeds, cat("target_coord"), vis_gate, fuse_skip)
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
         # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
@@ -1352,9 +1461,11 @@ class ViTMAE3D(nn.Module):
                 pv = pred.reshape(BM, px, py, pz)
                 tv = tgt.reshape(BM, px, py, pz)
                 mv = mask.reshape(BM, px, py, pz).to(w.dtype)
-                dx = F.mse_loss(pv[:, 1:], tv[:, 1:] - tv[:, :-1], reduction="none")
-                dy = F.mse_loss(pv[:, :, 1:], tv[:, :, 1:] - tv[:, :, :-1], reduction="none")
-                dz = F.mse_loss(pv[:, :, :, 1:], tv[:, :, :, 1:] - tv[:, :, :, :-1], reduction="none")
+                # finite differences of the prediction vs of the target (the non-native reference);
+                # was pv[:, 1:] (the raw prediction) against the target difference
+                dx = F.mse_loss(pv[:, 1:] - pv[:, :-1], tv[:, 1:] - tv[:, :-1], reduction="none")
+                dy = F.mse_loss(pv[:, :, 1:] - pv[:, :, :-1], tv[:, :, 1:] - tv[:, :, :-1], reduction="none")
+                dz = F.mse_loss(pv[:, :, :, 1:] - pv[:, :, :, :-1], tv[:, :, :, 1:] - tv[:, :, :, :-1], reduction="none")
                 mx = mv[:, 1:] * mv[:, :-1]
                 my = mv[:, :, 1:] * mv[:, :, :-1]
                 mz = mv[:, :, :, 1:] * mv[:, :, :, :-1]
@@ -1362,10 +1473,10 @@ class ViTMAE3D(nn.Module):
                 grad_den += [mx.sum(), my.sum(), mz.sum()]
         loss = flat_cat(losses).sum() / flat_cat(wts).sum()
         if self.grad_loss_weight > 0.0:
-            loss = loss + self.grad_loss_weight * (
-                grad_num[0] / grad_den[0].clamp_min(1.0)
-                + grad_num[1] / grad_den[1].clamp_min(1.0)
-                + grad_num[2] / grad_den[2].clamp_min(1.0)
+            # per axis over every spacing group (grad_num holds x, y, z per group; only the first
+            # group's three terms were used before)
+            loss = loss + self.grad_loss_weight * sum(
+                sum(grad_num[a::3]) / sum(grad_den[a::3]).clamp_min(1.0) for a in range(3)
             ) / 3.0
         # an all 1 mm batch leaves the residuals without a gradient, and ddp needs one every step
         residuals = (self.patch_embed.residual, self.decoder_head.residual)
@@ -1407,7 +1518,7 @@ class ViTMAE3D(nn.Module):
             bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
             lw = weight.sum().clamp_min(1e-6)
             les_loss = (weight * bce).sum() / lw
-            loss = loss + self.lesion_mask_weight * les_loss
+            loss = loss + self.lesion_mask_weight * self.lesion_scale * les_loss
             self.level_mirror_stats = {
                 **self.level_mirror_stats, "les_bce": les_loss.detach(), "les_pos": ((weight * target).sum() / lw).detach(),
             }
@@ -1564,7 +1675,7 @@ class ViTMAE3D(nn.Module):
             labels = cat("unified_label").flatten()
             logits = self.unified_head(tokens).float().flatten(0, 1)
             uc_loss = F.cross_entropy(logits, labels)
-            loss = loss + self.unified_weight * uc_loss
+            loss = loss + self.unified_weight * self.unified_scale * uc_loss
             with torch.no_grad():
                 pred = logits.argmax(-1)
                 bad = labels > 0
@@ -1593,9 +1704,29 @@ class ViTMAE3D(nn.Module):
         self.aux_stats = stats
         return loss
 
+    def set_aux_progress(self, t: float) -> dict[str, float]:
+        # the aux schedules at training progress t (no-op without schedules); returns the scales
+        def lin(k):
+            a, b = self.aux_schedules[k]
+            return 1.0 if t >= b else (0.0 if t <= a else (t - a) / (b - a))
+        sched = self.aux_schedules
+        if not sched:
+            return {}
+        unified = 1.0
+        if "unified_ramp" in sched:
+            unified *= lin("unified_ramp")
+        if "unified_decay" in sched:
+            unified *= 1.0 - lin("unified_decay")
+        self.unified_scale = unified
+        self.lesion_scale = lin("lesion_ramp") if "lesion_ramp" in sched else 1.0
+        self.tumor_scale = lin("tumor_prob_ramp") if "tumor_prob_ramp" in sched else 1.0
+        return {"unified_scale": self.unified_scale, "lesion_scale": self.lesion_scale, "tumor_scale": self.tumor_scale}
+
     def compile_native(self, **kwargs) -> None:
         # the fixed-shape transformer parts. per-spacing tokenization, embedding and head stay eager
         self.encode_tokens = torch.compile(self.encode_tokens, **kwargs)
+        if self.fuse_layers:
+            self.encode_tokens_fused = torch.compile(self.encode_tokens_fused, **kwargs)
         self.decode_features = torch.compile(self.decode_features, **kwargs)
 
     def compile_cudagraphs(self) -> None:
