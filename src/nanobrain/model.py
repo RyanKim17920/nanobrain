@@ -1316,7 +1316,8 @@ class ViTMAE3D(nn.Module):
             patches, mask_patches = patches.view(2, b * num_samples, seq_length, -1)
             if "clean_img" in part:
                 # tumor_one_view: views 1.. of every image read the clean (pre-paste) volume
-                clean = part.pop("clean_img").flatten(0, 1).index_select(0, flat_ids.flatten())
+                # flat_ids [2, b, S, seq] (image | mask rows): the image half indexes the [b * num] clean rows
+                clean = part.pop("clean_img").flatten(0, 1).index_select(0, flat_ids[0].flatten())
                 clean = clean.view(b * num_samples, seq_length, -1)
                 later = (torch.arange(b * num_samples, device=device) % num_samples > 0).view(-1, 1, 1)
                 patches = torch.where(later, clean, patches)
