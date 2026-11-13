@@ -179,6 +179,10 @@ class ViTMAE3D(nn.Module):
         tumor_contrast: tuple[float, float] = (0.8, 2.5),
         tumor_edge: tuple[float, float] = (3.0, 8.0),
         tumor_nodule: float = 0.25,
+        # h-tneg: share of masses whose amplitude is sign-flipped (rim / nodule / diffuse mass darker than
+        # the tissue instead of brighter; a ring's core darkening keeps its sign, so a flipped ring is a
+        # dark mass with a darker core). 0 = off: no extra draw, the paste and its RNG stream unchanged
+        tumor_neg_prob: float = 0.0,
         # zero-init linear head on the visible encoder tokens: BCE to the inserted lesion (blobs,
         # tumours) fraction of each level_pool^3 sub-block, in-mask weighted (weight; 0 = off).
         # tokens a corruption replaced or altered (rtd / unified / hemiswap / corrupt / orient /
@@ -192,6 +196,8 @@ class ViTMAE3D(nn.Module):
         unified_decay: tuple[float, float] | None = None,
         lesion_ramp: tuple[float, float] | None = None,
         tumor_prob_ramp: tuple[float, float] | None = None,
+        # h-tdecay: the paste probability scales 1 -> 0 between [start, end] (no paste after end)
+        tumor_prob_decay: tuple[float, float] | None = None,
         # multi-level feature fusion (MFF, Liu et al. ICCV 2023; port of loop n0119): training-only
         # zero-init per-layer projections (after a LayerNorm) of these encoder levels (0 = the
         # position-embedded patch embedding, l = block l output) summed, scaled by fuse_scale, and
@@ -216,7 +222,8 @@ class ViTMAE3D(nn.Module):
         self.aux_schedules = {
             k: (float(v[0]), float(v[1]))
             for k, v in (("unified_ramp", unified_ramp), ("unified_decay", unified_decay),
-                         ("lesion_ramp", lesion_ramp), ("tumor_prob_ramp", tumor_prob_ramp))
+                         ("lesion_ramp", lesion_ramp), ("tumor_prob_ramp", tumor_prob_ramp),
+                         ("tumor_prob_decay", tumor_prob_decay))
             if v is not None
         }
         for k, (a, b) in self.aux_schedules.items():
@@ -447,6 +454,8 @@ class ViTMAE3D(nn.Module):
         self.tumor_contrast = tuple(float(v) for v in tumor_contrast)
         self.tumor_edge = tuple(float(v) for v in tumor_edge)
         self.tumor_nodule = float(tumor_nodule)
+        self.tumor_neg_prob = float(tumor_neg_prob)
+        assert 0.0 <= self.tumor_neg_prob <= 1.0, "tumor_neg_prob: in [0, 1]"
         self.lesion_mask_weight = float(lesion_mask_weight)
         self.lesion_head = None
         if self.lesion_mask_weight:
@@ -1281,7 +1290,7 @@ class ViTMAE3D(nn.Module):
         if self.training and self.tumor_prob * self.tumor_scale > 0:
             tumors = plan_tumors(
                 images, mask, groups, geoms, self.tumor_prob * self.tumor_scale, self.tumor_radius, self.tumor_ring,
-                self.tumor_contrast, self.tumor_edge, self.tumor_nodule,
+                self.tumor_contrast, self.tumor_edge, self.tumor_nodule, neg=self.tumor_neg_prob,
             )
         parts = []
         for sp, ids in groups.items():
@@ -1752,7 +1761,12 @@ class ViTMAE3D(nn.Module):
             unified *= 1.0 - lin("unified_decay")
         self.unified_scale = unified
         self.lesion_scale = lin("lesion_ramp") if "lesion_ramp" in sched else 1.0
-        self.tumor_scale = lin("tumor_prob_ramp") if "tumor_prob_ramp" in sched else 1.0
+        tumor = 1.0
+        if "tumor_prob_ramp" in sched:
+            tumor *= lin("tumor_prob_ramp")
+        if "tumor_prob_decay" in sched:
+            tumor *= 1.0 - lin("tumor_prob_decay")
+        self.tumor_scale = tumor
         return {"unified_scale": self.unified_scale, "lesion_scale": self.lesion_scale, "tumor_scale": self.tumor_scale}
 
     def compile_native(self, **kwargs) -> None:
@@ -1922,6 +1936,7 @@ def plan_tumors(
     contrast: tuple[float, float],
     edge: tuple[float, float],
     nodule: float,
+    neg: float = 0.0,
 ) -> dict[tuple, tuple[Tensor, Tensor, Tensor, Tensor]]:
     # one lobulated mass sized in mm in a prob share of the batch, centred >= 6 mm inside the mask: a
     # solid bright 3-10 mm nodule (share nodule), else a bright 3-8 mm rim of uneven thickness on a
@@ -1959,6 +1974,9 @@ def plan_tumors(
     width = torch.where(hot, 2.0, torch.minimum(edge[0] + u[:, 5] * (edge[1] - edge[0]), r))
     rim = torch.minimum(3.0 + 5.0 * u[:, 6], 0.6 * r)
     amp = torch.where(hot, 2.0 + 3.0 * u[:, 7], contrast[0] + u[:, 7] * (contrast[1] - contrast[0]))
+    if neg > 0:
+        # h-tneg: a neg share of the masses darker than the tissue (drawn only when on: the default stream is unchanged)
+        amp = torch.where(torch.rand(k, dtype=torch.float64) < neg, -amp, amp)
     # box per axis: its semi-axis at the largest boundary bump (d = 1 / 0.75), + the edge
     num = torch.minimum(dims, torch.ceil(2 * (axes / 0.75 + width[:, None]) / spc)).long()
     size = num.prod(1)
