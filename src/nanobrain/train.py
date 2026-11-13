@@ -138,6 +138,8 @@ def main(args: DictConfig):
     model.decoder_prune_last = args.decoder_prune_last
     # speed (off when unset): the unified corruptions of every spacing group in one batched pass
     model.batched_corrupt = bool(args.get("native_batched_corrupt", False))
+    # speed (off when unset): every spacing group's level / lesion targets with one head pass each
+    model.batched_level = bool(args.get("native_batched_level", False))
     if args.get("natinit") and args.natinit.enabled:
         # natural-image pretrained blocks (+ inflated patch embedding). a resumed checkpoint
         # (misc.load_model below) overwrites this, as it should
@@ -303,6 +305,24 @@ def main(args: DictConfig):
         )
     else:
         batch_transform = make_batch_transform(args)
+    if args.get("native_prep_tokens"):
+        # speed (off when unset): forward_native's weight-free tokenization (tumour paste, patchify,
+        # sequences, token corruptions, level targets) in the prep threads, ahead of the main thread
+        assert args.native and args.prep_threads, "native_prep_tokens: native training with prep threads"
+        import nanobrain.model as model_module
+
+        model_module.CACHE_SYNC = True
+        base_transform = batch_transform
+
+        def batch_transform(batch):
+            batch = base_transform(batch)
+            with torch.autocast(device_type=device.type, dtype=getattr(torch, args.amp_dtype), enabled=args.amp):
+                batch["tokens"] = model_without_ddp.native_prepare(
+                    batch["image"], batch["mask"], batch["spacing"], args.num_visible, args.num_predict,
+                    args.num_samples,
+                )
+            return batch
+
     if args.prep_threads:
         train_loader = misc.prep_thread(train_loader, batch_transform, device, args.prep_threads)
         batch_transform = None
@@ -509,6 +529,8 @@ def train(
                 "fino_gamma": fino_ramp(args.fino3d.gamma_max, progress),
             }
         aux_kwargs = {"subject_ids": batch["subject"]} if "subject" in batch else {}
+        if "tokens" in batch:
+            aux_kwargs["prepared"] = batch["tokens"]
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=args.amp):
             loss = model(
                 images,

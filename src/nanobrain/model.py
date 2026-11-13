@@ -1139,12 +1139,13 @@ class ViTMAE3D(nn.Module):
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
         subject_ids: Tensor | None = None,
+        prepared: dict | None = None,
     ):
         if isinstance(images, list):
             # native resolution batch, images on their own voxel grids
             return self.forward_native(
                 images, mask, spacing, num_visible, num_predict, num_samples, with_state,
-                fino_meta=fino_meta, fino_gamma=fino_gamma, subject_ids=subject_ids,
+                fino_meta=fino_meta, fino_gamma=fino_gamma, subject_ids=subject_ids, prepared=prepared,
             )
         seqs, order = self.sample_patches(images, mask, num_visible, num_predict, num_samples)
         if not with_state:
@@ -1314,6 +1315,18 @@ class ViTMAE3D(nn.Module):
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         return (weight * bce).sum(), weight.sum() * target.shape[1]
 
+    def level_targets(self, patches: Tensor, mask: Tensor, patch) -> tuple[Tensor, Tensor]:
+        # level_terms' (weight [R, 1, s, s, s], target [R, T, s, s, s]) of one group, R = rows x tokens
+        px, py, pz = patch
+        x = patches.float().reshape(-1, 1, px, py, pz)
+        m = mask.float().reshape(-1, 1, px, py, pz)
+        above = (x > self.level_thresholds.view(1, -1, 1, 1, 1)).float() * m
+        sub = self.patch_size[0] // self.level_pool
+        # one pass of sep_pool over (mask, levels) (adaptive_avg_pool3d's bins as 3 small fp32 matmuls)
+        pooled = sep_pool(torch.cat([m, above], 1), sub)
+        weight = pooled[:, :1]
+        return weight, pooled[:, 1:] / weight.clamp_min(1e-6)
+
     def level_loss(self, tokens: Tensor, patches: Tensor, mask: Tensor) -> Tensor:
         # level head BCE, sub-blocks weighted by their in-mask fraction
         p, q = self.patch_size[0], self.level_pool
@@ -1380,15 +1393,17 @@ class ViTMAE3D(nn.Module):
         bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
         return (m_weight * bce).sum(), m_weight.sum(), weight.sum(), (m_weight * target).sum((0, 2, 3, 4))
 
-    def lesion_targets(self, lesion: Tensor | None, mask: Tensor, patch) -> tuple[Tensor, Tensor]:
-        # level_terms' sub-blocks of the visible tokens: in-mask fraction, lesion fraction of it
+    def lesion_targets(self, lesion: Tensor | None, mask: Tensor, patch, pool=None) -> tuple[Tensor, Tensor]:
+        # level_terms' sub-blocks of the visible tokens: in-mask fraction, lesion fraction of it.
+        # pool: the adaptive average pool (default F.adaptive_avg_pool3d; batched_level: sep_pool)
+        pool = pool or F.adaptive_avg_pool3d
         px, py, pz = patch
         m = mask.float().reshape(-1, 1, px, py, pz)
         sub = self.patch_size[0] // self.level_pool
-        weight = F.adaptive_avg_pool3d(m, sub).flatten(1)
+        weight = pool(m, sub).flatten(1)
         if lesion is None:
             return weight, torch.zeros_like(weight)
-        target = F.adaptive_avg_pool3d(lesion.float().reshape(m.shape) * m, sub).flatten(1)
+        target = pool(lesion.float().reshape(m.shape) * m, sub).flatten(1)
         return weight, target / weight.clamp_min(1e-6)
 
     @staticmethod
@@ -1417,6 +1432,7 @@ class ViTMAE3D(nn.Module):
         fino_meta: Tensor | None = None,
         fino_gamma: float = 0.0,
         subject_ids: Tensor | None = None,
+        prepared: dict | None = None,
     ):
         # images (float) and masks (bool) on their own voxel grids (sample_transform native), fit
         # here to the grid_size mm box in their voxels. images with the same spacing share one
@@ -1424,14 +1440,12 @@ class ViTMAE3D(nn.Module):
         # by its in-mask fraction whatever its voxel count; with 1 mm images only this is
         # forward's loss, bitwise
         assert self.native and num_predict is not None
-        seq_length = num_visible + num_predict
-        token_mm = self.patch_size[0] * self.target_spacing
-        groups: dict[tuple, list[int]] = {}
-        for ii, sp in enumerate(spacing):
-            groups.setdefault(tuple(sp), []).append(ii)
-
-        device = images[0].device
-        geoms = {sp: native_geometry(sp, tuple(self.grid_size), token_mm, device) for sp in groups}
+        # prepared (native_prep_tokens): native_prepare's weight-free tokenization, done ahead in a prep
+        # thread; else here, between the weights below and the embeddings (the same ops in the same order)
+        if prepared is None:
+            groups, geoms = self.native_groups(spacing, images[0].device)
+        else:
+            groups, geoms = prepared["groups"], prepared["geoms"]
         # embedding and head weights of all non 1 mm spacings in one pass each
         native_sps = [sp for sp in groups if sp != (1.0, 1.0, 1.0)]
         embed_ws, head_ws = {}, {}
@@ -1441,6 +1455,255 @@ class ViTMAE3D(nn.Module):
             head_ws = self.decoder_head.native_weights(native_sps, sp_patches)
             embed_ws, head_ws = dict(zip(native_sps, embed_ws)), dict(zip(native_sps, head_ws))
 
+        if prepared is None:
+            parts = self.native_tokens(images, mask, groups, geoms, num_visible, num_predict, num_samples)
+        else:
+            parts = prepared["parts"]
+        device = parts[0]["vis_coord"].device
+        for part in parts:
+            sp = part["spacing"]
+            part["embeds"] = self.patch_embed.native(part.pop("vis_tok"), sp, part["patch"], embed_ws.get(sp))
+
+        def cat(key: str) -> Tensor:
+            # contiguous for one group too, the compiled encoder would recompile on view strides
+            if len(parts) == 1:
+                return parts[0][key].contiguous()
+            return torch.cat([part[key] for part in parts])
+
+        def flat_cat(tensors: list[Tensor]) -> Tensor:
+            if len(tensors) == 1:
+                return tensors[0].flatten()
+            return torch.cat([t.flatten() for t in tensors])
+
+        bp_on = self.brainpos_head is not None and self.training and "bp_target" in parts[0]
+        fuse_skip = None
+        if self.fuse_layers and self.training:
+            embeds, fuse_skip = self.encode_tokens_fused(
+                cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None
+            )
+        else:
+            embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None)
+        rtd_on = self.rtd_head is not None and self.training and "rtd_label" in parts[0]
+        rtd_logits, vis_gate = None, None
+        if rtd_on:
+            rtd_logits = self.rtd_head(embeds[:, self.class_tokens :]).squeeze(-1).float()
+            if self.rtd_gate_scale > 0.0:
+                vis_gate = (2.0 * torch.sigmoid(-self.rtd_gate_scale * rtd_logits)).clamp(max=1.0)
+                vis_gate = vis_gate.to(embeds.dtype)
+        if fuse_skip is None:
+            feats = self.decode_features(embeds, cat("target_coord"), vis_gate)
+        else:
+            feats = self.decode_features(embeds, cat("target_coord"), vis_gate, fuse_skip)
+        feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
+        # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
+        # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
+        # weights the mse per voxel, and the xyz gradient penalty runs per group on its own
+        # patch geometry; the global loss is the weight-masked mean across groups
+        losses, wts = [], []
+        grad_num, grad_den = [], []
+        for part, feat in zip(parts, feats):
+            sp = part["spacing"]
+            pred = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
+            part["pred_patches"] = pred
+            px, py, pz = part["patch"]
+            tgt = part["target_patches"]
+            if self.target_lp_mm > 0.0 and self.target_band < 1.0:
+                # coarse-to-fine target bandwidth curriculum: blend the target toward its
+                # target_lp_mm block-mean (low band) projection; band 0 = low band only, 1 = full
+                low = lowpass_patches(tgt, (px, py, pz), sp, self.target_lp_mm)
+                tgt = low + self.target_band * (tgt - low)
+            if self.norm_target:
+                tgt = (tgt - tgt.mean(dim=-1, keepdim=True)) / (tgt.var(dim=-1, keepdim=True) + 1e-6) ** 0.5
+            mse = F.mse_loss(pred, tgt, reduction="none")
+            mask = part["target_mask_patches"]
+            w = mask / pred.shape[-1]
+            if self.fg_loss_weight > 0.0:
+                fg_w = 1.0 + self.fg_loss_weight * (part["target_patches"].abs() > 0.05).to(w.dtype)
+                w = w * fg_w
+            losses.append((w * mse).flatten())
+            wts.append(w.flatten())
+            if self.grad_loss_weight > 0.0:
+                BM = pred.shape[0] * pred.shape[1]
+                pv = pred.reshape(BM, px, py, pz)
+                tv = tgt.reshape(BM, px, py, pz)
+                mv = mask.reshape(BM, px, py, pz).to(w.dtype)
+                # finite differences of the prediction vs of the target (the non-native reference);
+                # was pv[:, 1:] (the raw prediction) against the target difference
+                dx = F.mse_loss(pv[:, 1:] - pv[:, :-1], tv[:, 1:] - tv[:, :-1], reduction="none")
+                dy = F.mse_loss(pv[:, :, 1:] - pv[:, :, :-1], tv[:, :, 1:] - tv[:, :, :-1], reduction="none")
+                dz = F.mse_loss(pv[:, :, :, 1:] - pv[:, :, :, :-1], tv[:, :, :, 1:] - tv[:, :, :, :-1], reduction="none")
+                mx = mv[:, 1:] * mv[:, :-1]
+                my = mv[:, :, 1:] * mv[:, :, :-1]
+                mz = mv[:, :, :, 1:] * mv[:, :, :, :-1]
+                grad_num += [(mx * dx).sum(), (my * dy).sum(), (mz * dz).sum()]
+                grad_den += [mx.sum(), my.sum(), mz.sum()]
+        loss = flat_cat(losses).sum() / flat_cat(wts).sum()
+        if self.grad_loss_weight > 0.0:
+            # per axis over every spacing group (grad_num holds x, y, z per group; only the first
+            # group's three terms were used before)
+            loss = loss + self.grad_loss_weight * sum(
+                sum(grad_num[a::3]) / sum(grad_den[a::3]).clamp_min(1.0) for a in range(3)
+            ) / 3.0
+        # an all 1 mm batch leaves the residuals without a gradient, and ddp needs one every step
+        residuals = (self.patch_embed.residual, self.decoder_head.residual)
+        residuals += (self.decoder_head.bias_residual,)
+        loss = loss + 0.0 * sum(r.sum() for r in residuals)
+        if self.level_head is not None:
+            num, den = 0.0, 0.0
+            rows = torch.split(embeds, [len(part["ids"]) * num_samples for part in parts])
+            if "lvl_w" in parts[0]:
+                # batched_level: every group's targets, one head pass (level_terms' sums over all rows)
+                weight = flat_rows([part.pop("lvl_w") for part in parts])
+                target = flat_rows([part.pop("lvl_t") for part in parts])
+                logits = self.level_head(embeds[:, self.class_tokens :]).float().reshape(target.shape)
+                bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+                num, den = (weight * bce).sum(), weight.sum() * target.shape[1]
+            else:
+                for part, tokens in zip(parts, rows):
+                    n, d = self.level_terms(
+                        tokens[:, self.class_tokens :], part["vis_patches"], part["vis_mask"],
+                        part["patch"],
+                    )
+                    num, den = num + n, den + d
+            loss = loss + self.level_weight * num / den.clamp_min(1e-6)
+            if self.level_mirror_head is not None:
+                mterms = [
+                    self.mirror_terms(
+                        tokens[:, self.class_tokens :], part["vis_patches"], part["vis_mask"], part["patch"],
+                        part.pop("mirror_ref"), part["syn_clean"],
+                    )
+                    for part, tokens in zip(parts, rows)
+                ]
+                # summed over groups: (weighted bce, valid weight, level weight, weighted positives [M])
+                mb, mw, lw, mp = [sum(t[k] for t in mterms) for k in range(4)]
+                T = len(self.level_thresholds)
+                # same per-channel weight as the level channels (r18: / (valid weight * T))
+                loss = loss + self.level_weight * mb / (mw * T).clamp_min(1e-6)
+                M = len(self.level_mirror)
+                self.level_mirror_stats = {
+                    "bce": (mb / (mw * M).clamp_min(1e-6)).detach(),
+                    "valid": (mw / lw.clamp_min(1e-6)).detach(),
+                    **{f"pos{t:g}": v for t, v in zip(self.level_mirror, (mp / mw.clamp_min(1e-6)).detach())},
+                }
+        if self.lesion_head is not None and self.training:
+            if "les_w" in parts[0]:
+                weight = flat_rows([part.pop("les_w") for part in parts])
+                target = flat_rows([part.pop("les_t") for part in parts])
+            else:
+                pairs = [self.lesion_targets(part.pop("lesion"), part.pop("lesion_mask"), part["patch"]) for part in parts]
+                weight, target = [torch.cat(v) for v in zip(*pairs)]
+            logits = self.lesion_head(embeds[:, self.class_tokens :]).float().reshape(target.shape)
+            bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+            lw = weight.sum().clamp_min(1e-6)
+            les_loss = (weight * bce).sum() / lw
+            loss = loss + self.lesion_mask_weight * self.lesion_scale * les_loss
+            self.level_mirror_stats = {
+                **self.level_mirror_stats, "les_bce": les_loss.detach(), "les_pos": ((weight * target).sum() / lw).detach(),
+            }
+        for part in parts:
+            part.pop("syn_clean", None)
+        if self.fino_heads is not None and fino_meta is not None:
+            # the global embedding of each sequence: mean of its visible encoder tokens (eval:
+            # mean of all brain-touching tokens); rows are part by part, image-major
+            pooled = embeds[:, self.class_tokens :].mean(dim=1)
+            # fino_meta stays on the cpu: one pinned non blocking copy, no sync with the gpu queue
+            rows = torch.tensor([ii for part in parts for ii in part["ids"]]).repeat_interleave(num_samples)
+            meta = fino_meta.cpu()[rows]
+            if device.type == "cuda":
+                meta = meta.pin_memory().to(device, non_blocking=True)
+            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
+            loss = loss + fino_loss
+        if rtd_on:
+            labels = cat("rtd_label").float()
+            logits = rtd_logits
+            rtd_loss = F.binary_cross_entropy_with_logits(logits, labels)
+            loss = loss + self.rtd_weight * rtd_loss
+            with torch.no_grad():
+                pos = labels > 0.5
+                acc_pos = ((logits > 0) & pos).sum() / pos.sum().clamp_min(1)
+                acc_neg = ((logits <= 0) & ~pos).sum() / (~pos).sum().clamp_min(1)
+            self.rtd_stats = {"rtd_loss": rtd_loss.detach(), "rtd_tpr": acc_pos, "rtd_tnr": acc_neg}
+            if vis_gate is not None:
+                with torch.no_grad():
+                    g = vis_gate.float()
+                    self.rtd_stats["rtd_gate_pos"] = (g * pos).sum() / pos.sum().clamp_min(1)
+                    self.rtd_stats["rtd_gate_neg"] = (g * ~pos).sum() / (~pos).sum().clamp_min(1)
+            self.fino_stats = {**self.fino_stats, **self.rtd_stats}
+        if self.orient_head is not None and self.training and "orient_label" in parts[0]:
+            labels = cat("orient_label").flatten()
+            logits = self.orient_head(embeds[:, self.class_tokens :]).float().flatten(0, 1)
+            orient_loss = F.cross_entropy(logits, labels)
+            loss = loss + self.orient_weight * orient_loss
+            with torch.no_grad():
+                pred = logits.argmax(-1)
+                rot = labels > 0
+                acc_rot = ((pred == labels) & rot).sum() / rot.sum().clamp_min(1)
+                acc_id = ((pred == 0) & ~rot).sum() / (~rot).sum().clamp_min(1)
+            self.fino_stats = {
+                **self.fino_stats, "orient_loss": orient_loss.detach(),
+                "orient_acc_rot": acc_rot, "orient_acc_id": acc_id,
+            }
+        if self.shuffle_head is not None and self.training:
+            # displaced-token detection on the visible encoder tokens (rows part by part, as embeds)
+            labels = torch.cat([part.pop("shuffled") for part in parts]).float()
+            logits = self.shuffle_head(embeds[:, self.class_tokens :]).float().squeeze(-1)
+            # balanced BCE: positives (~ratio) and negatives weigh equally, so the head cannot
+            # win by predicting "clean" everywhere
+            pos = labels.sum().clamp_min(1.0)
+            neg = (1.0 - labels).sum().clamp_min(1.0)
+            weight = labels / pos + (1.0 - labels) / neg
+            bce = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
+            loss = loss + self.shuffle_weight * 0.5 * (weight * bce).sum()
+            with torch.no_grad():
+                pred = logits > 0
+                self.shuffle_stats = {
+                    "shuf_frac": labels.mean().detach(),
+                    "shuf_recall": ((pred & (labels > 0)).sum() / pos).detach(),
+                    "shuf_fpr": ((pred & (labels == 0)).sum() / neg).detach(),
+                }
+
+        aux_on = (
+            self.brainpos_head, self.scanmatch_proj, self.hemiswap_head, self.corrupt_head, self.edgelvl_head,
+            self.unified_head,
+        )
+        if self.training and any(h is not None for h in aux_on):
+            loss = loss + self.aux_losses(parts, embeds, num_samples, subject_ids, device)
+        for part in parts:
+            part.pop("vis_patches", None)
+            part.pop("vis_mask", None)
+
+        if not with_state:
+            return loss
+        return loss, {"parts": parts, "embeds": embeds}
+
+    def native_groups(self, spacing: list, device: torch.device) -> tuple[dict, dict]:
+        # images by spacing (insertion order) and each spacing's token geometry
+        token_mm = self.patch_size[0] * self.target_spacing
+        groups: dict[tuple, list[int]] = {}
+        for ii, sp in enumerate(spacing):
+            groups.setdefault(tuple(sp), []).append(ii)
+        geoms = {sp: native_geometry(sp, tuple(self.grid_size), token_mm, device) for sp in groups}
+        return groups, geoms
+
+    @torch.no_grad()
+    def native_prepare(
+        self, images: list[Tensor], mask: list[Tensor], spacing: list, num_visible: int, num_predict: int,
+        num_samples: int,
+    ) -> dict:
+        # native_prep_tokens: forward_native's weight-free tokenization of a batch (run in a prep thread,
+        # under the training autocast), passed back as forward(prepared=...)
+        groups, geoms = self.native_groups(spacing, images[0].device)
+        parts = self.native_tokens(images, mask, groups, geoms, num_visible, num_predict, num_samples)
+        return {"groups": groups, "geoms": geoms, "parts": parts}
+
+    def native_tokens(
+        self, images: list[Tensor], mask: list[Tensor], groups: dict, geoms: dict, num_visible: int,
+        num_predict: int, num_samples: int,
+    ) -> list[dict]:
+        # forward_native's tokenization (no weights): tumour paste, patchify, sequences, token corruptions,
+        # per group; each part keeps its visible patches as "vis_tok" for the patch embedding
+        seq_length = num_visible + num_predict
+        device = images[0].device
         tumors = {}
         if self.training and self.tumor_prob * self.tumor_scale > 0:
             tumors = plan_tumors(
@@ -1533,8 +1796,14 @@ class ViTMAE3D(nn.Module):
                     vis_patches, vis_mask, patch
                 )
             part["vis_coord"], part["target_coord"] = coord.split([num_visible, num_predict], 1)
-            part["embeds"] = self.patch_embed.native(vis_patches, sp, patch, embed_ws.get(sp))
-            if self.level_head is not None or (self.edgelvl_head is not None and self.training):
+            part["vis_tok"] = vis_patches
+            lvl_pre = self.level_head is not None and self.training and getattr(self, "batched_level", False)
+            if lvl_pre:
+                # batched_level: the level targets here (weight-free), one level head pass over all groups
+                part["lvl_w"], part["lvl_t"] = self.level_targets(vis_patches, vis_mask, patch)
+            if (self.level_head is not None and not (lvl_pre and self.level_mirror_head is None)) or (
+                self.edgelvl_head is not None and self.training
+            ):
                 part["vis_patches"], part["vis_mask"] = vis_patches, vis_mask
             if self.lesion_head is not None or self.level_mirror_head is not None:
                 # ms-syn: visible token ids into the [b * num] token grid; tokens a corruption altered
@@ -1554,6 +1823,10 @@ class ViTMAE3D(nn.Module):
                     if altered is not None:
                         lm = vis_mask * ~altered[..., None]
                     part["lesion_mask"] = lm
+                    if lvl_pre:
+                        part["les_w"], part["les_t"] = self.lesion_targets(
+                            part.pop("lesion"), part.pop("lesion_mask"), patch, pool=sep_pool
+                        )
                 if self.level_mirror_head is not None:
                     # mirror references of the visible tokens [b * S * num_visible, 64], from the
                     # clean (lesion-pasted, uncorrupted) volumes
@@ -1610,206 +1883,7 @@ class ViTMAE3D(nn.Module):
         if batched:
             for item, corrupted in zip(deferred, self.corrupt_apply_batched(pending)):
                 finish(*item[:6], corrupted, item[7])
-
-        def cat(key: str) -> Tensor:
-            # contiguous for one group too, the compiled encoder would recompile on view strides
-            if len(parts) == 1:
-                return parts[0][key].contiguous()
-            return torch.cat([part[key] for part in parts])
-
-        def flat_cat(tensors: list[Tensor]) -> Tensor:
-            if len(tensors) == 1:
-                return tensors[0].flatten()
-            return torch.cat([t.flatten() for t in tensors])
-
-        bp_on = self.brainpos_head is not None and self.training and "bp_target" in parts[0]
-        fuse_skip = None
-        if self.fuse_layers and self.training:
-            embeds, fuse_skip = self.encode_tokens_fused(
-                cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None
-            )
-        else:
-            embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None)
-        rtd_on = self.rtd_head is not None and self.training and "rtd_label" in parts[0]
-        rtd_logits, vis_gate = None, None
-        if rtd_on:
-            rtd_logits = self.rtd_head(embeds[:, self.class_tokens :]).squeeze(-1).float()
-            if self.rtd_gate_scale > 0.0:
-                vis_gate = (2.0 * torch.sigmoid(-self.rtd_gate_scale * rtd_logits)).clamp(max=1.0)
-                vis_gate = vis_gate.to(embeds.dtype)
-        if fuse_skip is None:
-            feats = self.decode_features(embeds, cat("target_coord"), vis_gate)
-        else:
-            feats = self.decode_features(embeds, cat("target_coord"), vis_gate, fuse_skip)
-        feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
-        # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
-        # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
-        # weights the mse per voxel, and the xyz gradient penalty runs per group on its own
-        # patch geometry; the global loss is the weight-masked mean across groups
-        losses, wts = [], []
-        grad_num, grad_den = [], []
-        for part, feat in zip(parts, feats):
-            sp = part["spacing"]
-            pred = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
-            part["pred_patches"] = pred
-            px, py, pz = part["patch"]
-            tgt = part["target_patches"]
-            if self.target_lp_mm > 0.0 and self.target_band < 1.0:
-                # coarse-to-fine target bandwidth curriculum: blend the target toward its
-                # target_lp_mm block-mean (low band) projection; band 0 = low band only, 1 = full
-                low = lowpass_patches(tgt, (px, py, pz), sp, self.target_lp_mm)
-                tgt = low + self.target_band * (tgt - low)
-            if self.norm_target:
-                tgt = (tgt - tgt.mean(dim=-1, keepdim=True)) / (tgt.var(dim=-1, keepdim=True) + 1e-6) ** 0.5
-            mse = F.mse_loss(pred, tgt, reduction="none")
-            mask = part["target_mask_patches"]
-            w = mask / pred.shape[-1]
-            if self.fg_loss_weight > 0.0:
-                fg_w = 1.0 + self.fg_loss_weight * (part["target_patches"].abs() > 0.05).to(w.dtype)
-                w = w * fg_w
-            losses.append((w * mse).flatten())
-            wts.append(w.flatten())
-            if self.grad_loss_weight > 0.0:
-                BM = pred.shape[0] * pred.shape[1]
-                pv = pred.reshape(BM, px, py, pz)
-                tv = tgt.reshape(BM, px, py, pz)
-                mv = mask.reshape(BM, px, py, pz).to(w.dtype)
-                # finite differences of the prediction vs of the target (the non-native reference);
-                # was pv[:, 1:] (the raw prediction) against the target difference
-                dx = F.mse_loss(pv[:, 1:] - pv[:, :-1], tv[:, 1:] - tv[:, :-1], reduction="none")
-                dy = F.mse_loss(pv[:, :, 1:] - pv[:, :, :-1], tv[:, :, 1:] - tv[:, :, :-1], reduction="none")
-                dz = F.mse_loss(pv[:, :, :, 1:] - pv[:, :, :, :-1], tv[:, :, :, 1:] - tv[:, :, :, :-1], reduction="none")
-                mx = mv[:, 1:] * mv[:, :-1]
-                my = mv[:, :, 1:] * mv[:, :, :-1]
-                mz = mv[:, :, :, 1:] * mv[:, :, :, :-1]
-                grad_num += [(mx * dx).sum(), (my * dy).sum(), (mz * dz).sum()]
-                grad_den += [mx.sum(), my.sum(), mz.sum()]
-        loss = flat_cat(losses).sum() / flat_cat(wts).sum()
-        if self.grad_loss_weight > 0.0:
-            # per axis over every spacing group (grad_num holds x, y, z per group; only the first
-            # group's three terms were used before)
-            loss = loss + self.grad_loss_weight * sum(
-                sum(grad_num[a::3]) / sum(grad_den[a::3]).clamp_min(1.0) for a in range(3)
-            ) / 3.0
-        # an all 1 mm batch leaves the residuals without a gradient, and ddp needs one every step
-        residuals = (self.patch_embed.residual, self.decoder_head.residual)
-        residuals += (self.decoder_head.bias_residual,)
-        loss = loss + 0.0 * sum(r.sum() for r in residuals)
-        if self.level_head is not None:
-            num, den = 0.0, 0.0
-            rows = torch.split(embeds, [len(part["ids"]) * num_samples for part in parts])
-            for part, tokens in zip(parts, rows):
-                n, d = self.level_terms(
-                    tokens[:, self.class_tokens :], part["vis_patches"], part["vis_mask"],
-                    part["patch"],
-                )
-                num, den = num + n, den + d
-            loss = loss + self.level_weight * num / den.clamp_min(1e-6)
-            if self.level_mirror_head is not None:
-                mterms = [
-                    self.mirror_terms(
-                        tokens[:, self.class_tokens :], part["vis_patches"], part["vis_mask"], part["patch"],
-                        part.pop("mirror_ref"), part["syn_clean"],
-                    )
-                    for part, tokens in zip(parts, rows)
-                ]
-                # summed over groups: (weighted bce, valid weight, level weight, weighted positives [M])
-                mb, mw, lw, mp = [sum(t[k] for t in mterms) for k in range(4)]
-                T = len(self.level_thresholds)
-                # same per-channel weight as the level channels (r18: / (valid weight * T))
-                loss = loss + self.level_weight * mb / (mw * T).clamp_min(1e-6)
-                M = len(self.level_mirror)
-                self.level_mirror_stats = {
-                    "bce": (mb / (mw * M).clamp_min(1e-6)).detach(),
-                    "valid": (mw / lw.clamp_min(1e-6)).detach(),
-                    **{f"pos{t:g}": v for t, v in zip(self.level_mirror, (mp / mw.clamp_min(1e-6)).detach())},
-                }
-        if self.lesion_head is not None and self.training:
-            pairs = [self.lesion_targets(part.pop("lesion"), part.pop("lesion_mask"), part["patch"]) for part in parts]
-            weight, target = [torch.cat(v) for v in zip(*pairs)]
-            logits = self.lesion_head(embeds[:, self.class_tokens :]).float().reshape(target.shape)
-            bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-            lw = weight.sum().clamp_min(1e-6)
-            les_loss = (weight * bce).sum() / lw
-            loss = loss + self.lesion_mask_weight * self.lesion_scale * les_loss
-            self.level_mirror_stats = {
-                **self.level_mirror_stats, "les_bce": les_loss.detach(), "les_pos": ((weight * target).sum() / lw).detach(),
-            }
-        for part in parts:
-            part.pop("syn_clean", None)
-        if self.fino_heads is not None and fino_meta is not None:
-            # the global embedding of each sequence: mean of its visible encoder tokens (eval:
-            # mean of all brain-touching tokens); rows are part by part, image-major
-            pooled = embeds[:, self.class_tokens :].mean(dim=1)
-            # fino_meta stays on the cpu: one pinned non blocking copy, no sync with the gpu queue
-            rows = torch.tensor([ii for part in parts for ii in part["ids"]]).repeat_interleave(num_samples)
-            meta = fino_meta.cpu()[rows]
-            if device.type == "cuda":
-                meta = meta.pin_memory().to(device, non_blocking=True)
-            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
-            loss = loss + fino_loss
-        if rtd_on:
-            labels = cat("rtd_label").float()
-            logits = rtd_logits
-            rtd_loss = F.binary_cross_entropy_with_logits(logits, labels)
-            loss = loss + self.rtd_weight * rtd_loss
-            with torch.no_grad():
-                pos = labels > 0.5
-                acc_pos = ((logits > 0) & pos).sum() / pos.sum().clamp_min(1)
-                acc_neg = ((logits <= 0) & ~pos).sum() / (~pos).sum().clamp_min(1)
-            self.rtd_stats = {"rtd_loss": rtd_loss.detach(), "rtd_tpr": acc_pos, "rtd_tnr": acc_neg}
-            if vis_gate is not None:
-                with torch.no_grad():
-                    g = vis_gate.float()
-                    self.rtd_stats["rtd_gate_pos"] = (g * pos).sum() / pos.sum().clamp_min(1)
-                    self.rtd_stats["rtd_gate_neg"] = (g * ~pos).sum() / (~pos).sum().clamp_min(1)
-            self.fino_stats = {**self.fino_stats, **self.rtd_stats}
-        if self.orient_head is not None and self.training and "orient_label" in parts[0]:
-            labels = cat("orient_label").flatten()
-            logits = self.orient_head(embeds[:, self.class_tokens :]).float().flatten(0, 1)
-            orient_loss = F.cross_entropy(logits, labels)
-            loss = loss + self.orient_weight * orient_loss
-            with torch.no_grad():
-                pred = logits.argmax(-1)
-                rot = labels > 0
-                acc_rot = ((pred == labels) & rot).sum() / rot.sum().clamp_min(1)
-                acc_id = ((pred == 0) & ~rot).sum() / (~rot).sum().clamp_min(1)
-            self.fino_stats = {
-                **self.fino_stats, "orient_loss": orient_loss.detach(),
-                "orient_acc_rot": acc_rot, "orient_acc_id": acc_id,
-            }
-        if self.shuffle_head is not None and self.training:
-            # displaced-token detection on the visible encoder tokens (rows part by part, as embeds)
-            labels = torch.cat([part.pop("shuffled") for part in parts]).float()
-            logits = self.shuffle_head(embeds[:, self.class_tokens :]).float().squeeze(-1)
-            # balanced BCE: positives (~ratio) and negatives weigh equally, so the head cannot
-            # win by predicting "clean" everywhere
-            pos = labels.sum().clamp_min(1.0)
-            neg = (1.0 - labels).sum().clamp_min(1.0)
-            weight = labels / pos + (1.0 - labels) / neg
-            bce = F.binary_cross_entropy_with_logits(logits, labels, reduction="none")
-            loss = loss + self.shuffle_weight * 0.5 * (weight * bce).sum()
-            with torch.no_grad():
-                pred = logits > 0
-                self.shuffle_stats = {
-                    "shuf_frac": labels.mean().detach(),
-                    "shuf_recall": ((pred & (labels > 0)).sum() / pos).detach(),
-                    "shuf_fpr": ((pred & (labels == 0)).sum() / neg).detach(),
-                }
-
-        aux_on = (
-            self.brainpos_head, self.scanmatch_proj, self.hemiswap_head, self.corrupt_head, self.edgelvl_head,
-            self.unified_head,
-        )
-        if self.training and any(h is not None for h in aux_on):
-            loss = loss + self.aux_losses(parts, embeds, num_samples, subject_ids, device)
-        for part in parts:
-            part.pop("vis_patches", None)
-            part.pop("vis_mask", None)
-
-        if not with_state:
-            return loss
-        return loss, {"parts": parts, "embeds": embeds}
+        return parts
 
     def aux_losses(
         self, parts: list[dict], embeds: Tensor, num_samples: int, subject_ids: Tensor | None,
@@ -2220,6 +2294,44 @@ def plan_tumors(
     return out
 
 
+@lru_cache(maxsize=4096)
+def pool_matrix(size: int, out: int, device: torch.device) -> Tensor:
+    # [out, size]: adaptive average pooling's bins (floor(i size / out) .. ceil((i + 1) size / out)) as weights
+    a = torch.zeros(out, size, dtype=torch.float32)
+    for i in range(out):
+        lo, hi = (i * size) // out, -((-(i + 1) * size) // out)
+        a[i, lo:hi] = 1.0 / (hi - lo)
+    return _cached(a.to(device))
+
+
+def sep_pool(v: Tensor, out: int) -> Tensor:
+    # F.adaptive_avg_pool3d(v, out) for v [N, C, X, Y, Z] as separable fp32 matmuls over the small axes (the same
+    # bins and weights; ~20x faster than the adaptive pool kernel on ~1e5 rows of 8^3 voxels)
+    n, c, x, y, z = v.shape
+    ax, ay, az = (pool_matrix(s, out, v.device) for s in (x, y, z))
+    with torch.autocast(v.device.type, enabled=False):
+        t = v.float().reshape(-1, z) @ az.t()                                   # [n c x y, o]
+        t = (t.view(n * c * x, y, out).transpose(1, 2) @ ay.t())                # [n c x, o(z), o(y)]
+        t = t.view(n * c, x, out * out).transpose(1, 2) @ ax.t()                # [n c, o(z) o(y), o(x)]
+    return t.view(n, c, out, out, out).permute(0, 1, 4, 3, 2)
+
+
+# native_prep_tokens: the lru-cached device constants below may be built in one prep thread (on its side
+# stream) and read by another before that stream ran; with this set, a cache miss waits for its stream
+CACHE_SYNC = False
+
+
+def _cached(t: Tensor) -> Tensor:
+    if CACHE_SYNC and t.is_cuda:
+        torch.cuda.current_stream(t.device).synchronize()
+    return t
+
+
+def flat_rows(tensors: list[Tensor]) -> Tensor:
+    # torch.cat for several, the tensor itself for one
+    return tensors[0] if len(tensors) == 1 else torch.cat(tensors)
+
+
 def patchify3d(x: Tensor, patch_size: int | tuple[int, int, int] = 8) -> Tensor:
     px, py, pz = (patch_size,) * 3 if isinstance(patch_size, int) else patch_size
     x = rearrange(x, "b (gx px) (gy py) (gz pz) -> b (gx gy gz) (px py pz)", px=px, py=py, pz=pz)
@@ -2244,7 +2356,7 @@ def native_geometry(
         voxel = (torch.arange(num, dtype=torch.float64, device=device) + 0.5) * p
         centres.append((((voxel - size / 2) * sp + mm / 2) / token_mm - 0.5).float())
     coord = torch.stack(torch.meshgrid(*centres, indexing="ij"), dim=-1).reshape(1, -1, 3)
-    return patch, box, grid, coord
+    return patch, box, grid, _cached(coord)
 
 
 def unpatchify3d(x: Tensor, grid_size: tuple[int, int, int], patch_size: int = 8) -> Tensor:
@@ -2414,13 +2526,13 @@ def fit_slices(
 @lru_cache(maxsize=4096)
 def gather_offsets(batch_size: int, num_patches: int, device: torch.device) -> Tensor:
     # [2, B, 1, 1] flat row offsets of (image | mask, image) in a [2, B, N, P] patch tensor
-    return torch.arange(2 * batch_size, device=device).view(2, batch_size, 1, 1) * num_patches
+    return _cached(torch.arange(2 * batch_size, device=device).view(2, batch_size, 1, 1) * num_patches)
 
 
 @lru_cache(maxsize=4096)
 def grid_coords(grid: tuple[int, int, int], device: torch.device) -> Tensor:
     axes = [torch.arange(size, device=device) for size in grid]
-    return torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(1, -1, 3)
+    return _cached(torch.stack(torch.meshgrid(*axes, indexing="ij"), dim=-1).reshape(1, -1, 3))
 
 
 # JAX ViT xavier uniform init
@@ -2441,4 +2553,4 @@ def cells8_index(patch: tuple[int, int, int], device: torch.device) -> Tensor:
     # flat voxel index in a px x py x pz patch of each 8^3 nearest-resampled voxel
     ax = [torch.div(torch.arange(8) * p, 8, rounding_mode="floor") for p in patch]
     i, j, k = torch.meshgrid(*ax, indexing="ij")
-    return ((i * patch[1] + j) * patch[2] + k).flatten().to(device)
+    return _cached(((i * patch[1] + j) * patch[2] + k).flatten().to(device))
