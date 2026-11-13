@@ -136,6 +136,8 @@ def main(args: DictConfig):
     # model
     model = ViTMAE3D.from_config(args)
     model.decoder_prune_last = args.decoder_prune_last
+    # speed (off when unset): the unified corruptions of every spacing group in one batched pass
+    model.batched_corrupt = bool(args.get("native_batched_corrupt", False))
     if args.get("natinit") and args.natinit.enabled:
         # natural-image pretrained blocks (+ inflated patch embedding). a resumed checkpoint
         # (misc.load_model below) overwrites this, as it should
@@ -154,9 +156,14 @@ def main(args: DictConfig):
     if args.distributed:
         model = DDP(model, broadcast_buffers=False)
 
+    native_cudagraphs = False
     if args.compile and args.native:
-        # the image shapes vary, so only the fixed-shape transformer parts compile
-        model_without_ddp.compile_native()
+        # the image shapes vary, so only the fixed-shape transformer parts compile.
+        # native_compile_mode (speed, off when unset): e.g. reduce-overhead replays the fixed-shape
+        # encoder / decoder fwd + bwd as cuda graphs (same inductor kernels, ~1 launch instead of ~1.5k)
+        mode = args.get("native_compile_mode")
+        model_without_ddp.compile_native(**({"mode": mode} if mode else {}))
+        native_cudagraphs = mode in ("reduce-overhead", "max-autotune")
     elif args.compile and args.cudagraphs:
         assert not args.distributed, "cudagraphs is single gpu only"
         model_without_ddp.compile_cudagraphs()
@@ -319,6 +326,7 @@ def main(args: DictConfig):
         device,
         batch_flops,
         stop_event,
+        native_cudagraphs,
     )
 
     if args.distributed:
@@ -374,6 +382,7 @@ def train(
     device: torch.device,
     batch_flops: float,
     stop_event: threading.Event,
+    native_cudagraphs: bool = False,
 ) -> dict:
     model.train()
 
@@ -463,7 +472,7 @@ def train(
         images = batch["image"]
         masks = batch["mask"]
 
-        if args.cudagraphs:
+        if args.cudagraphs or native_cudagraphs:
             torch.compiler.cudagraph_mark_step_begin()
         if getattr(model_without_ddp, "target_lp_mm", 0.0) > 0.0:
             # coarse-to-fine target bandwidth: low band only until half of target_lp_frac of the

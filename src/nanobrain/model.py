@@ -666,9 +666,160 @@ class ViTMAE3D(nn.Module):
         return vis_patches.scatter(1, idx, torch.where(hit[..., None], out, vis_patches.gather(1, idx)))
 
     @torch.no_grad()
+    def corrupt_apply_batched(self, items: list[tuple]) -> list[Tensor]:
+        """corrupt_apply over every spacing group at once (speed: ~200 kernel launches in total instead of
+        ~150 per group; the per-group python loop was ~half the main thread's launches). items: one
+        (vis_patches, vis_mask, patch, cand, kind) per group, as corrupt_apply takes them; returns the
+        patches per group. Same per-candidate math as corrupt_apply on one flat buffer of every voxel of
+        every candidate token (ragged over the groups' patch shapes); the random draws are laid out per
+        candidate instead of per group (same distributions), and the bf16 autocast rounding of the
+        matmul / conv steps is reproduced explicitly."""
+        dev = items[0][0].device
+        ac = torch.is_autocast_enabled(dev.type)
+        cdt = torch.get_autocast_dtype(dev.type) if ac else torch.float32
+
+        def rnd(t: Tensor) -> Tensor:
+            # the autocast compute dtype's rounding (identity without autocast)
+            return t.to(cdt).float() if ac else t
+
+        xs, ms, kinds, los, meta = [], [], [], [], []
+        for vis, vmask, patch, cand, kind in items:
+            rows, nv, P = vis.shape
+            k = cand.shape[1]
+            lo = torch.where(vmask.float() > 0, vis.float(), math.inf).amin(dim=(1, 2))
+            los.append(lo[:, None].expand(rows, k).reshape(-1))
+            idx = cand[..., None].expand(rows, k, P)
+            xs.append(vis.gather(1, idx).float().reshape(-1))
+            ms.append(vmask.gather(1, idx).float().reshape(-1))
+            kinds.append(kind.reshape(-1))
+            meta.append((rows * k, P, *patch))
+        X, M, kind, lo = (torch.cat(t) if len(t) > 1 else t[0] for t in (xs, ms, kinds, los))
+        lo = torch.where(torch.isfinite(lo), lo, torch.zeros_like(lo))
+        # per candidate (P, px, py, pz) and the 2x downsample block grid, built on the cpu (known sizes)
+        min_vox = max(2, self.patch_size[0] // 2)
+        cpu = []
+        for n, P, px, py, pz in meta:
+            ks = [2 if q >= min_vox else 1 for q in (px, py, pz)]
+            nb = [-(-q // kk) for q, kk in zip((px, py, pz), ks)]
+            cpu.append([n, P, px, py, pz, *ks, *nb, nb[0] * nb[1] * nb[2]])
+        C, V = sum(r[0] for r in cpu), sum(r[0] * r[1] for r in cpu)
+        Btot = sum(r[0] * r[11] for r in cpu)
+        # the per group table to the gpu, expanded there (cpu repeat_interleave was ~10 ms)
+        tab = torch.tensor(cpu, dtype=torch.int64)
+        tab = (tab.pin_memory() if dev.type == "cuda" else tab).to(dev, non_blocking=True)
+        per = torch.repeat_interleave(tab[:, 1:], tab[:, 0], dim=0, output_size=C)
+        # per candidate columns (int32, contiguous): voxels, patch dims, downsample factors, block grid
+        Pc, p0, p1, p2, k0, k1, k2, n0, n1, n2, nblk = per.t().to(torch.int32).contiguous().unbind(0)
+        i32 = torch.int32
+        seg = torch.repeat_interleave(torch.arange(C, device=dev, dtype=i32), per[:, 0], output_size=V)
+        flat = torch.arange(V, device=dev, dtype=i32)
+        q = flat - (Pc.cumsum(0, dtype=i32) - Pc)[seg]
+        P0, P1, P2 = p0[seg], p1[seg], p2[seg]
+        S0 = P1 * P2
+        c0 = q // S0
+        rem = q - c0 * S0
+        c1 = rem // P2
+        c2 = rem - c1 * P2
+        coord, dims, strides = (c0, c1, c2), (P0, P1, P2), (S0, P2, None)
+        LO = lo[seg]
+
+        def seg_sum(v: Tensor) -> Tensor:
+            return torch.zeros(C, device=dev, dtype=v.dtype).index_add_(0, seg, v)
+
+        XM = X * M
+        cnt = seg_sum(M).clamp_min(1.0)
+        mean = seg_sum(XM) / cnt
+        std = (seg_sum((X - mean[seg]) ** 2 * M) / cnt).sqrt()
+        # (1) bias ramp along a random direction (u @ r.T in the autocast dtype, as corrupt_apply)
+        u = torch.randn(C, 3, device=dev)
+        u = rnd(u / u.abs().sum(-1, keepdim=True).clamp_min(1e-6)).t().contiguous()
+        amp = 0.2 + 0.1 * torch.rand(C, device=dev)
+        ur = None
+        for ax in range(3):
+            r = rnd((coord[ax].float() + 0.5) / dims[ax].float() * 2 - 1)
+            term = u[ax][seg] * r
+            ur = term if ur is None else ur + term
+        x_bias = (X - LO) * (1 + amp[seg] * rnd(ur)) + LO
+        # (2) separable gaussian blur, sigma 1 voxel, replicate padded, normalized inside the mask; the
+        # conv's autocast rounding per pass; axes of < 2 voxels skipped
+        kern = torch.exp(-torch.arange(-2, 3, dtype=torch.float32) ** 2 / 2)
+        kern = rnd(kern / kern.sum()).tolist()
+        vw = torch.stack([rnd(XM), rnd(M)], 1)
+        for ax in range(3):
+            ca, pa = coord[ax], dims[ax]
+            sa = strides[ax]
+            acc = None
+            for t in range(-2, 3):
+                d = torch.minimum((ca + t).clamp_min(0), pa - 1) - ca
+                src = flat + (d * sa if sa is not None else d)
+                term = kern[t + 2] * vw.index_select(0, src)
+                acc = term if acc is None else acc + term
+            vw = torch.where((pa >= 2)[:, None], rnd(acc), vw)
+        x_blur = (vw[:, 0].to(cdt) / vw[:, 1].to(cdt).clamp_min(1e-3)).float()
+        # (3) Rician-like noise on the magnitude above the row minimum
+        s = (0.1 * std)[seg]
+        x_noise = ((X - LO + torch.randn_like(X) * s) ** 2 + (torch.randn_like(X) * s) ** 2).sqrt() + LO
+        variants = [(1, x_bias), (2, x_blur), (3, x_noise)]
+        if self.corrupt_kinds >= 5:
+            # (4) gamma on the patch's in-brain range
+            inb = M > 0
+            big = torch.full((C,), -math.inf, device=dev).scatter_reduce_(0, seg.long(), torch.where(inb, X, -math.inf), "amax")
+            small = torch.full((C,), math.inf, device=dev).scatter_reduce_(0, seg.long(), torch.where(inb, X, math.inf), "amin")
+            span = (big - small).clamp_min(1e-6)
+            span = torch.where(torch.isfinite(span), span, torch.ones_like(span))
+            small = torch.where(torch.isfinite(small), small, torch.zeros_like(small))
+            sign = torch.where(torch.rand(C, device=dev) < 0.5, -1.0, 1.0)
+            g = torch.exp(sign * (0.2 + 0.3 * torch.rand(C, device=dev)))
+            sm_, sp_ = small[seg], span[seg]
+            x_gamma = sm_ + sp_ * ((X - sm_) / sp_).clamp(0, 1) ** g[seg]
+            # (5) 2x downsample-upsample: masked block mean (avg_pool3d, ceil_mode) held over its block
+            N1, N2 = n1[seg], n2[seg]
+            bid = (nblk.cumsum(0, dtype=i32) - nblk)[seg] + ((c0 // k0[seg]) * N1 + c1 // k1[seg]) * N2 + c2 // k2[seg]
+            sums = torch.zeros(Btot, 3, device=dev).index_add_(0, bid, torch.stack([XM, M, torch.ones_like(M)], 1))
+            low = (sums[:, :2] / sums[:, 2:]).index_select(0, bid)
+            x_down = low[:, 0] / low[:, 1].clamp_min(1e-3)
+            variants += [(4, x_gamma), (5, x_down)]
+        if self.corrupt_kinds >= 7:
+            # (6) linear contrast about the patch's in-brain mean, floored at the row minimum
+            sign = torch.where(torch.rand(C, device=dev) < 0.5, -1.0, 1.0)
+            c = torch.exp(sign * (0.2 + 0.3 * torch.rand(C, device=dev)))
+            x_contrast = torch.maximum(mean[seg] + c[seg] * (X - mean[seg]), LO)
+            # (7) motion ghost along one random axis of >= 2 voxels (circular half-patch shift)
+            a_ = 0.2 + 0.3 * torch.rand(C, device=dev)
+            elig = torch.stack([p0, p1, p2], 1) >= 2
+            ne = elig.sum(1)
+            pick = (torch.rand(C, device=dev) * ne.clamp_min(1)).long()
+            pick = torch.minimum(pick, (ne - 1).clamp_min(0))
+            axis = (elig & (elig.long().cumsum(1) == (pick + 1)[:, None])).long().argmax(1)[seg]
+            src = flat.clone()
+            for ax in range(3):
+                ca, pa = coord[ax], dims[ax]
+                d = (ca - pa // 2) % pa - ca
+                src = torch.where(axis == ax, src + (d * strides[ax] if strides[ax] is not None else d), src)
+            XL = (X - LO) * M
+            av = a_[seg]
+            x_ghost = (X - LO + av * XL[src]) / (1 + av * M[src]) + LO
+            x_ghost = torch.where(ne[seg] > 0, x_ghost, X)
+            variants += [(6, x_contrast), (7, x_ghost)]
+        kv = kind[seg]
+        out = X
+        for cls, xc in variants:
+            out = torch.where(kv == cls, xc, out)
+        out = out * M
+        res, off = [], 0
+        for (vis, vmask, patch, cand, kd), (n, P, *_) in zip(items, meta):
+            rows, nv, _ = vis.shape
+            k = cand.shape[1]
+            o = out[off : off + n * P].view(rows, k, P).to(vis.dtype)
+            off += n * P
+            idx = cand[..., None].expand(rows, k, P)
+            res.append(vis.scatter(1, idx, torch.where((kd > 0)[..., None], o, vis.gather(1, idx))))
+        return res
+
+    @torch.no_grad()
     def unified_transform(
         self, vis_patches: Tensor, vis_mask: Tensor, patch: tuple[int, int, int], order: Tensor,
-        vols: Tensor, b: int, num: int, num_samples: int, num_visible: int,
+        vols: Tensor, b: int, num: int, num_samples: int, num_visible: int, defer: list | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Unified corruption: a unified_ratio share of the visible (>= 50% brain) tokens, class
         uniform among swap / corruptions / (shuffle). Each token carries one label; a class that
@@ -693,6 +844,10 @@ class ViTMAE3D(nn.Module):
         else:
             labels = torch.where(labels == 1, 0, labels)
         kind = torch.where((cls >= 2) & (cls < 2 + self.corrupt_kinds), cls - 1, 0)
+        if defer is not None:
+            # batched_corrupt: corrupt_apply_batched applies it later, all groups at once
+            defer.append((vis_patches, vis_mask, patch, cand, kind))
+            return vis_patches, vis_mask, labels
         vis_patches = self.corrupt_apply(vis_patches, vis_mask, patch, cand, kind)
         return vis_patches, vis_mask, labels
 
@@ -1346,45 +1501,10 @@ class ViTMAE3D(nn.Module):
                 row += rows
         orders = scores.argsort(dim=1, stable=True)[:, :seq_length].split(num_rows)
 
-        for part, order, num in zip(parts, orders, num_tokens):
-            sp, patch, vols = part["spacing"], part["patch"], part.pop("vols")
-            del part["scores"]
-            b = len(part["ids"])
-            part["order"] = order.unflatten(0, (b, num_samples))
-            # images and masks gathered together by flat token ids
-            flat_ids = part["order"] + gather_offsets(b, num, device)
-            patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
-            patches, mask_patches = patches.view(2, b * num_samples, seq_length, -1)
-            if "clean_img" in part:
-                # tumor_one_view: views 1.. of every image read the clean (pre-paste) volume
-                # flat_ids [2, b, S, seq] (image | mask rows): the image half indexes the [b * num] clean rows
-                clean = part.pop("clean_img").flatten(0, 1).index_select(0, flat_ids[0].flatten())
-                clean = clean.view(b * num_samples, seq_length, -1)
-                later = (torch.arange(b * num_samples, device=device) % num_samples > 0).view(-1, 1, 1)
-                patches = torch.where(later, clean, patches)
-            coord = geoms[sp][3][0][order]
-            vis_patches, part["target_patches"] = patches.split([num_visible, num_predict], 1)
-            part["target_mask_patches"] = mask_patches[:, num_visible:]
-            vis_mask = mask_patches[:, :num_visible]
-            if self.shuffle_head is not None and self.training:
-                # displaced visible tokens first (donors are clean same-scan patches); rtd below
-                # may then overwrite some of them with a foreign patch, which clears the label
-                vis_patches, vis_mask, part["shuffled"] = self.shuffle_replace(vis_patches, vis_mask)
-            if self.rtd_head is not None and self.training:
-                if b >= 2:
-                    vis_patches, vis_mask, part["rtd_label"] = self.rtd_replace(
-                        vis_patches, vis_mask, order, vols, b, num, num_samples, num_visible
-                    )
-                else:
-                    part["rtd_label"] = torch.zeros(
-                        vis_patches.shape[:2], dtype=torch.bool, device=device
-                    )
-                if "shuffled" in part:
-                    part["shuffled"] = part["shuffled"] & ~part["rtd_label"]
-            if self.unified_head is not None and self.training:
-                vis_patches, vis_mask, part["unified_label"] = self.unified_transform(
-                    vis_patches, vis_mask, patch, order, vols, b, num, num_samples, num_visible
-                )
+        def finish(part, order, num, vols, coord, b, vis_patches, vis_mask):
+            # a group's tokenization after its unified corruption (split out so batched_corrupt can apply
+            # the corruptions of every group first; inline otherwise, the same ops in the same order)
+            sp, patch = part["spacing"], part["patch"]
             # ms-aux: brain frame, hemisphere swap, corruption (each token carries one label)
             if self.training and (self.brainpos_head is not None or self.hemiswap_head is not None):
                 vis_order = order[:, :num_visible]
@@ -1439,6 +1559,57 @@ class ViTMAE3D(nn.Module):
                     # clean (lesion-pasted, uncorrupted) volumes
                     ref = self.mirror_ref(vols, patch, geoms[sp][1], geoms[sp][2], sp)
                     part["mirror_ref"] = ref.flatten(0, 1).index_select(0, vis_ids)
+
+        # batched_corrupt (speed): the unified corruptions of all groups in one corrupt_apply_batched
+        batched = self.training and self.unified_head is not None and getattr(self, "batched_corrupt", False)
+        deferred, pending = [], []
+        for part, order, num in zip(parts, orders, num_tokens):
+            sp, patch, vols = part["spacing"], part["patch"], part.pop("vols")
+            del part["scores"]
+            b = len(part["ids"])
+            part["order"] = order.unflatten(0, (b, num_samples))
+            # images and masks gathered together by flat token ids
+            flat_ids = part["order"] + gather_offsets(b, num, device)
+            patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
+            patches, mask_patches = patches.view(2, b * num_samples, seq_length, -1)
+            if "clean_img" in part:
+                # tumor_one_view: views 1.. of every image read the clean (pre-paste) volume
+                # flat_ids [2, b, S, seq] (image | mask rows): the image half indexes the [b * num] clean rows
+                clean = part.pop("clean_img").flatten(0, 1).index_select(0, flat_ids[0].flatten())
+                clean = clean.view(b * num_samples, seq_length, -1)
+                later = (torch.arange(b * num_samples, device=device) % num_samples > 0).view(-1, 1, 1)
+                patches = torch.where(later, clean, patches)
+            coord = geoms[sp][3][0][order]
+            vis_patches, part["target_patches"] = patches.split([num_visible, num_predict], 1)
+            part["target_mask_patches"] = mask_patches[:, num_visible:]
+            vis_mask = mask_patches[:, :num_visible]
+            if self.shuffle_head is not None and self.training:
+                # displaced visible tokens first (donors are clean same-scan patches); rtd below
+                # may then overwrite some of them with a foreign patch, which clears the label
+                vis_patches, vis_mask, part["shuffled"] = self.shuffle_replace(vis_patches, vis_mask)
+            if self.rtd_head is not None and self.training:
+                if b >= 2:
+                    vis_patches, vis_mask, part["rtd_label"] = self.rtd_replace(
+                        vis_patches, vis_mask, order, vols, b, num, num_samples, num_visible
+                    )
+                else:
+                    part["rtd_label"] = torch.zeros(
+                        vis_patches.shape[:2], dtype=torch.bool, device=device
+                    )
+                if "shuffled" in part:
+                    part["shuffled"] = part["shuffled"] & ~part["rtd_label"]
+            if self.unified_head is not None and self.training:
+                vis_patches, vis_mask, part["unified_label"] = self.unified_transform(
+                    vis_patches, vis_mask, patch, order, vols, b, num, num_samples, num_visible,
+                    defer=pending if batched else None,
+                )
+            if batched:
+                deferred.append((part, order, num, vols, coord, b, vis_patches, vis_mask))
+                continue
+            finish(part, order, num, vols, coord, b, vis_patches, vis_mask)
+        if batched:
+            for item, corrupted in zip(deferred, self.corrupt_apply_batched(pending)):
+                finish(*item[:6], corrupted, item[7])
 
         def cat(key: str) -> Tensor:
             # contiguous for one group too, the compiled encoder would recompile on view strides
