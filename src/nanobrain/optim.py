@@ -40,6 +40,7 @@ class Muon(torch.optim.Optimizer):
         ns_steps=5,
         fused=False,
         graph=False,
+        combo=False,
     ):
         defaults = dict(
             lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps
@@ -58,6 +59,10 @@ class Muon(torch.optim.Optimizer):
         # captured as one cuda graph and replayed on static copies of the grads / clip scale (the same compiled
         # kernels on the same values, ~1 launch instead of the per shape compiled calls' python + launches)
         self.graph = graph and fused
+        # combo (speed, off when unset; with fused): every group / shape batch in one compiled call with inductor's
+        # combo kernels (the per matrix momentum / cast / apply kernels horizontally fused). same math as fused;
+        # the fused kernels' float rounding differs by ~1 ulp
+        self.combo = combo and fused
         self._graph = None
         self._graph_steps = 0
 
@@ -147,6 +152,8 @@ class Muon(torch.optim.Optimizer):
             grad_scale = self.grad_scale
         self.grad_scale = None
         gi = iter(grads) if grads is not None else None
+        combo = self.combo and not self.graph
+        items = []
         for group in self.param_groups:
             # batch by the orientation newton-schulz runs in (rows <= cols)
             by_shape = defaultdict(list)
@@ -168,10 +175,14 @@ class Muon(torch.optim.Optimizer):
                     bufs.append(state["momentum_buffer"])
                 # python float scalars would be baked into the compiled graph, so they go in
                 # as 0-d tensors (fill_ doesn't sync). graph: one pair per (group, shape), filled before replay
-                coefs = self._coefs((id(group), shape) if self.graph else shape, params[0].device)
+                coefs = self._coefs((id(group), shape) if self.graph or combo else shape, params[0].device)
                 if set_coefs:
                     coefs[0].fill_(1 - lr * wd)
                     coefs[1].fill_(-lr * 0.2 * max(shape) ** 0.5)
+                if combo:
+                    items.append((params, [grad_of[p] for p in params], bufs, coefs[0], coefs[1],
+                                  group["momentum"], group["nesterov"], group["ns_steps"]))
+                    continue
                 _fused_muon_update(
                     params,
                     [grad_of[p] for p in params],
@@ -183,6 +194,8 @@ class Muon(torch.optim.Optimizer):
                     nesterov=group["nesterov"],
                     ns_steps=group["ns_steps"],
                 )
+        if items:
+            _fused_muon_update_all(items, grad_scale)
 
     def _coefs(self, shape, device) -> tuple[Tensor, Tensor]:
         cache = self.__dict__.setdefault("_coef_cache", {})
@@ -211,8 +224,7 @@ def _newtonschulz5_poly(X: Tensor, steps: int) -> Tensor:
 torch._dynamo.config.cache_size_limit = max(torch._dynamo.config.cache_size_limit, 64)
 
 
-@torch.compile(fullgraph=True, dynamic=False)
-def _fused_muon_update(
+def _fused_muon_body(
     params: list[Tensor],
     grads: list[Tensor],
     bufs: list[Tensor],
@@ -236,6 +248,17 @@ def _fused_muon_update(
         if p.size(0) > p.size(1):
             u = u.mT
         p.mul_(decay).add_(u.to(p.dtype) * alpha)
+
+
+_fused_muon_update = torch.compile(_fused_muon_body, fullgraph=True, dynamic=False)
+
+
+def _fused_muon_all(items: list[tuple], grad_scale: Tensor | None):
+    for params, grads, bufs, decay, alpha, momentum, nesterov, ns_steps in items:
+        _fused_muon_body(params, grads, bufs, decay, alpha, grad_scale, momentum, nesterov, ns_steps)
+
+
+_fused_muon_update_all = torch.compile(_fused_muon_all, fullgraph=True, dynamic=False, options={"combo_kernels": True})
 
 
 class CombinedOptimizer:

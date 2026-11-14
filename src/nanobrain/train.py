@@ -150,6 +150,10 @@ def main(args: DictConfig):
     # speed (off when unset; with native_batched_corrupt + native_lazy_patchify): the unified corruption's
     # candidate / class draws for all groups at once
     model.batched_unified = bool(args.get("native_batched_unified", False))
+    # speed (off when unset): the level / lesion / unified token heads as one linear (same math; bf16 gemm rounding)
+    model.fused_heads = bool(args.get("native_fused_heads", False))
+    # speed (off when unset): the reconstruction / level / lesion loss sums as compiled reductions (same math)
+    model.compiled_loss = bool(args.get("native_compiled_loss", False))
     # OPTIMIZATION-CHANGING (off when unset): the encoder / decoder residual streams in bf16 (fp32 now)
     model.bf16_residual = bool(args.get("native_bf16_residual", False))
     assert not args.get("native_sparse_tokens") or (args.get("native_prep_tokens") and args.get("native_batched_prep"))
@@ -783,6 +787,8 @@ def make_optimizer(args: DictConfig, model: nn.Module):
                 muon_groups, momentum=args.muon_momentum, fused=args.muon_fused,
                 # speed (off when unset): the fused muon step replayed as one cuda graph (same kernels and values)
                 graph=bool(args.get("native_muon_graph", False)),
+                # speed (off when unset): one combo-kernel compiled call for every shape batch (Muon.combo)
+                combo=bool(args.get("native_muon_combo", False)),
             ),
         ]
     )

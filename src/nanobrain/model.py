@@ -1569,6 +1569,18 @@ class ViTMAE3D(nn.Module):
             )
         else:
             embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None)
+        self._fh = {}
+        if getattr(self, "fused_heads", False) and self.training:
+            # fused_heads: the level / lesion / unified token heads as one linear (one weight cast, one input grad)
+            use = {"level_head": "lvl_w" in parts[0], "lesion_head": True, "unified_head": "unified_label" in parts[0]}
+            hs = [(n, getattr(self, n)) for n, u in use.items() if u and getattr(self, n) is not None]
+            if len(hs) > 1:
+                # zero rows pad the output width to a multiple of 8 (aligned gemm)
+                n = sum(h.out_features for _, h in hs)
+                pad = -n % 8
+                w = torch.cat([*(h.weight for _, h in hs), hs[0][1].weight.new_zeros(pad, embeds.shape[-1])])
+                out = F.linear(embeds[:, self.class_tokens :], w, F.pad(torch.cat([h.bias for _, h in hs]), (0, pad)))
+                self._fh = dict(zip([k for k, _ in hs], out.split([h.out_features for _, h in hs] + [pad], -1)))
         rtd_on = self.rtd_head is not None and self.training and "rtd_label" in parts[0]
         rtd_logits, vis_gate = None, None
         if rtd_on:
@@ -1595,8 +1607,14 @@ class ViTMAE3D(nn.Module):
                 part["pred_patches"] = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
                 preds.append(part["pred_patches"].flatten())
             w = parts[0].pop("flat_w")
-            losses.append(w * F.mse_loss(flat_rows(preds), parts[0].pop("flat_t"), reduction="none"))
-            wts.append(w)
+            if getattr(self, "compiled_loss", False):
+                # compiled_loss: the masked mse sums as one compiled reduction (dynamic length)
+                num, den = _wmse(flat_rows(preds), parts[0].pop("flat_t"), w)
+                losses.append(num.view(1))
+                wts.append(den.view(1))
+            else:
+                losses.append(w * F.mse_loss(flat_rows(preds), parts[0].pop("flat_t"), reduction="none"))
+                wts.append(w)
             feats = ()
         for part, feat in zip(parts, feats):
             sp = part["spacing"]
@@ -1652,9 +1670,9 @@ class ViTMAE3D(nn.Module):
                 # batched_level: every group's targets, one head pass (level_terms' sums over all rows)
                 weight = flat_rows([part.pop("lvl_w") for part in parts])
                 target = flat_rows([part.pop("lvl_t") for part in parts])
-                logits = self.level_head(embeds[:, self.class_tokens :]).float().reshape(target.shape)
-                bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-                num, den = (weight * bce).sum(), weight.sum() * target.shape[1]
+                logits = self._head("level_head", embeds[:, self.class_tokens :])
+                num, den = _wbce(logits, target, weight) if getattr(self, "compiled_loss", False) else _wbce_eager(logits, target, weight)
+                den = den * target.shape[1]
             else:
                 for part, tokens in zip(parts, rows):
                     n, d = self.level_terms(
@@ -1689,10 +1707,10 @@ class ViTMAE3D(nn.Module):
             else:
                 pairs = [self.lesion_targets(part.pop("lesion"), part.pop("lesion_mask"), part["patch"]) for part in parts]
                 weight, target = [torch.cat(v) for v in zip(*pairs)]
-            logits = self.lesion_head(embeds[:, self.class_tokens :]).float().reshape(target.shape)
-            bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
-            lw = weight.sum().clamp_min(1e-6)
-            les_loss = (weight * bce).sum() / lw
+            logits = self._head("lesion_head", embeds[:, self.class_tokens :])
+            num, lw = _wbce(logits, target, weight) if getattr(self, "compiled_loss", False) else _wbce_eager(logits, target, weight)
+            lw = lw.clamp_min(1e-6)
+            les_loss = num / lw
             loss = loss + self.lesion_mask_weight * self.lesion_scale * les_loss
             self.level_mirror_stats = {
                 **self.level_mirror_stats, "les_bce": les_loss.detach(),
@@ -1773,6 +1791,11 @@ class ViTMAE3D(nn.Module):
         if not with_state:
             return loss
         return loss, {"parts": parts, "embeds": embeds}
+
+    def _head(self, name: str, x: Tensor) -> Tensor:
+        # the head's output: fused_heads' precomputed split if any, else the head on x
+        out = getattr(self, "_fh", {}).pop(name, None)
+        return getattr(self, name)(x) if out is None else out
 
     def flat_loss_ok(self) -> bool:
         # flat_loss applies: plain masked mse (no target curriculum / normalization / fg or gradient terms)
@@ -2191,7 +2214,7 @@ class ViTMAE3D(nn.Module):
                         stats[f"cr_rec_{name}"] = ((pred == c) & sel).sum() / sel.sum().clamp_min(1)
         if self.unified_head is not None and "unified_label" in parts[0]:
             labels = cat("unified_label").flatten()
-            logits = self.unified_head(tokens).float().flatten(0, 1)
+            logits = self._head("unified_head", tokens).float().flatten(0, 1)
             uc_loss = F.cross_entropy(logits, labels)
             loss = loss + self.unified_weight * self.unified_scale * uc_loss
             stats["uc_loss"] = uc_loss.detach()
@@ -2605,6 +2628,21 @@ class LazyTokens:
         v = self.vol.reshape(-1, 1, *self.vol.shape[-3:]).float()
         k = F.avg_pool3d(v, self.patch, stride=self.patch, divisor_override=1)
         return (k.reshape(*lead, -1) / math.prod(self.patch))
+
+
+def _wbce_eager(logits: Tensor, target: Tensor, weight: Tensor) -> tuple[Tensor, Tensor]:
+    # (sum weight * bce(logits, target), sum weight), logits reshaped to target in fp32
+    bce = F.binary_cross_entropy_with_logits(logits.float().reshape(target.shape), target, reduction="none")
+    return (weight * bce).sum(), weight.sum()
+
+
+def _wmse_eager(pred: Tensor, target: Tensor, weight: Tensor) -> tuple[Tensor, Tensor]:
+    return (weight * F.mse_loss(pred, target, reduction="none")).sum(), weight.sum()
+
+
+# compiled_loss (speed): the loss reductions as compiled kernels (the same elementwise math, fused sums)
+_wbce = torch.compile(_wbce_eager, dynamic=False)
+_wmse = torch.compile(_wmse_eager, dynamic=True)
 
 
 def flat_rows(tensors: list[Tensor]) -> Tensor:
