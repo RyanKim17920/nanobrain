@@ -122,7 +122,8 @@ class Muon(torch.optim.Optimizer):
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             self._graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self._graph, stream=stream):
+            # thread_local: the prep threads' cuda calls (other streams) must not invalidate this capture
+            with torch.cuda.graph(self._graph, stream=stream, capture_error_mode="thread_local"):
                 self._fused_step(grads=self._static_grads, grad_scale=self._static_scale, set_coefs=False)
             torch.cuda.current_stream().wait_stream(stream)
         else:

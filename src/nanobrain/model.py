@@ -1829,11 +1829,16 @@ class ViTMAE3D(nn.Module):
                 sparse.tumors(tumors)
                 owners, tumors = set(tumors.get("owners", ())), {}
         parts = []
+        if sparse is not None:
+            # every group's token mask fractions in one kernel (no random draws: the group order below is unchanged)
+            from .sparse import frac_all
+
+            svols = {sp: sparse.group(sp, ids, geoms[sp][0], geoms[sp][2]) for sp, ids in groups.items()}
+            sfrac = dict(zip(svols, frac_all(sparse, list(svols.values()))))
         for sp, ids in groups.items():
             patch, box, grid, _ = geoms[sp]
             if sparse is not None:
-                vols = sparse.group(sp, ids, patch, grid)
-                mask_frac = vols.frac()
+                vols, mask_frac = svols[sp], sfrac[sp]
                 scores = sequence_scores(None, num_samples, self.min_mask_frac, mask_frac=mask_frac)
                 parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols, "grid": grid})
                 parts[-1].update(scores=scores.flatten(0, 1), mask_frac=mask_frac)
@@ -2022,6 +2027,12 @@ class ViTMAE3D(nn.Module):
         # batched_corrupt (speed): the unified corruptions of all groups in one corrupt_apply_batched
         batched = self.training and self.unified_head is not None and getattr(self, "batched_corrupt", False)
         deferred, pending = [], []
+        if sparse is not None:
+            # native_sparse_tokens: every group's sequence rows in one gather (tumour pasted per voxel)
+            sgath = iter(sparse.gather([
+                (p["vols"], o, p["vols"].rimg, num_samples * seq_length, p.pop("sparse_les", False))
+                for p, o in zip(parts, orders)
+            ]))
         for part, order, num in zip(parts, orders, num_tokens):
             sp, patch, vols = part["spacing"], part["patch"], part.pop("vols")
             del part["scores"]
@@ -2029,7 +2040,7 @@ class ViTMAE3D(nn.Module):
             part["order"] = order.unflatten(0, (b, num_samples))
             if sparse is not None:
                 # native_sparse_tokens: the rows straight from the values / bitmap (tumour pasted per voxel)
-                img, msk, les = vols.gather(part["order"], vols.rimg, num_samples * seq_length, part.pop("sparse_les", False))
+                img, msk, les = next(sgath)
                 patches, mask_patches = img.view(b * num_samples, seq_length, -1), msk.view(b * num_samples, seq_length, -1)
                 if les is not None:
                     part["lesion"] = les.view(b, num_samples, seq_length, -1)[:, :, :num_visible].reshape(-1, les.shape[-1])
@@ -2090,10 +2101,10 @@ class ViTMAE3D(nn.Module):
         if batched:
             compact = getattr(self, "corrupt_compact", False)
             if sparse is not None:
-                # native_sparse_tokens: each group's corruptions in one kernel (sparse.corrupt_tokens)
-                from .sparse import corrupt_tokens
+                # native_sparse_tokens: every group's corruptions in one kernel (sparse.corrupt_all)
+                from .sparse import corrupt_all
 
-                done = [corrupt_tokens(*it, max(2, self.patch_size[0] // 2)) for it in pending]
+                done = corrupt_all(pending, max(2, self.patch_size[0] // 2))
             else:
                 done = self.corrupt_apply_batched(pending, compact=compact)
             for item, corrupted in zip(deferred, done):
