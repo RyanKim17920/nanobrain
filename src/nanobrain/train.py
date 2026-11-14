@@ -350,7 +350,10 @@ def main(args: DictConfig):
         pin_memory=True,
         drop_last=True,
         prefetch_factor=args.prefetch_factor if args.num_workers > 0 else None,
-        worker_init_fn=ignore_sigterm,
+        worker_init_fn=(
+            functools.partial(nice_worker, nice=int(args.native_worker_nice)) if args.get("native_worker_nice")
+            else ignore_sigterm
+        ),
     )
     if fast_prep:
         batch_transform = prep.make_batch_transform(
@@ -377,9 +380,19 @@ def main(args: DictConfig):
             return batch
 
     if args.prep_threads:
-        train_loader = misc.prep_thread(train_loader, batch_transform, device, args.prep_threads)
+        train_loader = misc.prep_thread(
+            train_loader, batch_transform, device, args.prep_threads, nice=int(args.get("native_prep_nice") or 0),
+            # speed (off when unset): each batch's record_stream walk in its prep thread (same streams recorded)
+            record_in_thread=bool(args.get("native_prep_record", False)),
+        )
         batch_transform = None
 
+    if args.get("native_switch_interval"):
+        # speed (off when unset): the interpreter's thread switch interval (default 5 ms), so the training thread
+        # gets the gil back from the prep threads sooner
+        import sys
+
+        sys.setswitchinterval(float(args.native_switch_interval))
     # on SIGTERM (e.g. preemption) finish the current step, save and exit. resumes when relaunched
     stop_event = threading.Event()
     signal.signal(signal.SIGTERM, lambda signum, frame: stop_event.set())
@@ -764,6 +777,13 @@ def make_optimizer(args: DictConfig, model: nn.Module):
 def ignore_sigterm(worker_id: int):
     # `timeout` signals the whole process group. workers keep loading until the main process exits
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+
+def nice_worker(worker_id: int, nice: int = 0):
+    # native_worker_nice (speed): ignore_sigterm + a lower os scheduling priority for the loader workers, so the
+    # training process' threads win the cpus they share
+    ignore_sigterm(worker_id)
+    os.nice(nice)
 
 
 def time_keyed_lr(

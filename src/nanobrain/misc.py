@@ -513,7 +513,13 @@ def pre_send_to_cuda_wrapper(generator, batch_transform=None, device=None):
         yield data
 
 
-def prep_thread(loader, batch_transform, device, num_threads: int = 1, depth: int = 1):
+# native ids of the running prep threads (prep_thread), e.g. for their scheduling priority
+PREP_TIDS: list[int] = []
+
+
+def prep_thread(
+    loader, batch_transform, device, num_threads: int = 1, depth: int = 1, nice: int = 0, record_in_thread: bool = False
+):
     # send + transform the next batches in background threads, each on its own side stream, so the
     # gpu prep's ~3.5k small launches per batch overlap the model's cpu work instead of draining the
     # gpu queue. thread k preps batches k, k + n, ..., consumed in loader order
@@ -532,6 +538,10 @@ def prep_thread(loader, batch_transform, device, num_threads: int = 1, depth: in
                 pass
 
     def run(k):
+        PREP_TIDS.append(threading.get_native_id())
+        if nice:
+            # native_prep_nice (speed): a lower os scheduling priority for this thread than the training thread
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), nice)
         stream = torch.cuda.Stream(device)
         try:
             with torch.cuda.device(device), torch.cuda.stream(stream):
@@ -549,7 +559,11 @@ def prep_thread(loader, batch_transform, device, num_threads: int = 1, depth: in
                     batch = batch_transform(send_data(batch, device=device))
                     event = torch.cuda.Event()
                     event.record(stream)
-                    put(queues[k], (batch, event))
+                    main_stream = state.get("main_stream")
+                    if main_stream is not None:
+                        # native_prep_record (speed): the batch's record_stream walk here, off the training thread
+                        record_stream(batch, main_stream)
+                    put(queues[k], (batch, event, main_stream is not None))
         except BaseException as e:  # noqa: BLE001
             put(queues[k], e)
 
@@ -563,10 +577,13 @@ def prep_thread(loader, batch_transform, device, num_threads: int = 1, depth: in
                 return
             if isinstance(item, BaseException):
                 raise item
-            batch, event = item
+            batch, event, recorded = item
             main_stream = torch.cuda.current_stream(device)
             main_stream.wait_event(event)
-            record_stream(batch, main_stream)
+            if not recorded or main_stream != state["main_stream"]:
+                record_stream(batch, main_stream)
+            if record_in_thread and "main_stream" not in state:
+                state["main_stream"] = main_stream
             yield batch
     finally:
         stop.set()
