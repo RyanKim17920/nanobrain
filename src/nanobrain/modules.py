@@ -85,6 +85,10 @@ class Attention(nn.Module):
 
 
 class Mlp(nn.Module):
+    # lt_gelu (training speed, NUMERICS-CHANGING: tanh GELU; set by train.py native_lt_gelu): fc1 + bias + GELU
+    # and fc2's input grad + GELU' as cuBLASLt epilogues (cublaslt.LtMlp)
+    lt_gelu = False
+
     def __init__(
         self,
         dim: int,
@@ -98,6 +102,15 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, dim, bias=bias)
 
     def forward(self, x: Float[Tensor, "... D"]) -> Float[Tensor, "... D"]:
+        if self.lt_gelu and self.training:
+            from nanobrain.cublaslt import LtMlp
+
+            bf = torch.bfloat16
+            fc1, fc2 = self.fc1, self.fc2
+            y = LtMlp.apply(
+                x.reshape(-1, x.shape[-1]).to(bf), fc1.weight.to(bf), fc1.bias.to(bf), fc2.weight.to(bf), fc2.bias.to(bf)
+            )
+            return y.view(*x.shape[:-1], -1)
         x = self.fc1(x)
         x = self.act(x)
         x = self.fc2(x)

@@ -184,6 +184,16 @@ def main(args: DictConfig):
 
     batch_flops = count_batch_flops(args, model, device)
     logger.info(f"flops per batch per gpu (fwd + bwd): {batch_flops / 1e12:.2f} TFLOP")
+    if args.get("native_lt_gelu"):
+        # speed, NUMERICS-CHANGING (off when unset): every block mlp's fc1 + bias + GELU and fc2's input grad + GELU'
+        # as cuBLASLt GEMM epilogues (GELU becomes its tanh approximation, training only). set after the flop count
+        from nanobrain import cublaslt
+        from nanobrain.modules import Mlp
+
+        cublaslt.init(device)
+        for mod in model.modules():
+            if isinstance(mod, Mlp) and mod.fc1.bias is not None:
+                mod.lt_gelu = True
 
     model_without_ddp = model
     if args.distributed:
