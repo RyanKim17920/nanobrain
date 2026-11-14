@@ -3,6 +3,8 @@
 #   handle with rowwise current scaling (one fp32 scale per token row / weight row: cuBLASLt OUTER_VEC_32F). fprop and
 #   dgrad run in e4m3, wgrad stays bf16 (the bf16 path's layouts, no transposed fp8 copies). layer norm + cast is left
 #   to inductor; GELU / GELU' / the qkv grad gather and their row casts are one triton pass each.
+#   BWD_BF16 (train.py native_fp8_lt_bwd=bf16): fprop only in fp8, dgrad in bf16 from the bf16 grads and weights (the
+#   saved bf16 input already feeds wgrad, so nothing extra is kept); the row passes then skip their fp8 casts.
 # - syrk (same math; train.py native_muon_syrk): muon's symmetric newton-schulz products as upper-triangle tile GEMMs
 import ctypes
 
@@ -16,6 +18,7 @@ from nanobrain import cublaslt as C
 
 E4 = torch.float8_e4m3fn
 BIAS = 4  # cuBLASLt epilogue
+BWD_BF16 = False  # native_fp8_lt_bwd=bf16: bf16 dgrad (read at forward / trace time)
 
 
 def _gemm8(P: Tensor, Q: Tensor, sp: Tensor, sq: Tensor, bias: Tensor | None) -> Tensor:
@@ -107,8 +110,9 @@ def _gelu_q_kernel(h_ptr, a_ptr, q_ptr, s_ptr, N: tl.constexpr, BN: tl.constexpr
 
 
 @triton.jit
-def _dgelu_q_kernel(g_ptr, h_ptr, d_ptr, q_ptr, s_ptr, db_ptr, M, N: tl.constexpr, BN: tl.constexpr, RPP: tl.constexpr):
-    # d = g * gelu_tanh'(h) (bf16), its rowwise e4m3 copy, and per program column sums of d (the bias grad partials)
+def _dgelu_q_kernel(g_ptr, h_ptr, d_ptr, q_ptr, s_ptr, db_ptr, M, N: tl.constexpr, BN: tl.constexpr, RPP: tl.constexpr,
+                    Q: tl.constexpr):
+    # d = g * gelu_tanh'(h) (bf16), its rowwise e4m3 copy (if Q), and per program column sums of d (the bias grad partials)
     pid = tl.program_id(0)
     cols = tl.arange(0, BN)
     mask = cols < N
@@ -124,7 +128,8 @@ def _dgelu_q_kernel(g_ptr, h_ptr, d_ptr, q_ptr, s_ptr, db_ptr, M, N: tl.constexp
             tl.store(d_ptr + row * N + cols, d, mask=mask)
             df = d.to(tl.float32)
             acc += df
-            _quant_row(df, s_ptr, q_ptr, row, cols, mask, N)
+            if Q:
+                _quant_row(df, s_ptr, q_ptr, row, cols, mask, N)
     tl.store(db_ptr + pid * N + cols, acc, mask=mask)
 
 
@@ -146,25 +151,25 @@ _RPP = 32
 
 
 @torch.library.custom_op("nanobrain::dgelu_q", mutates_args=())
-def dgelu_q(g: Tensor, h: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    # (d = g gelu_tanh'(h) bf16, its rowwise e4m3, the row scales, d.sum(0) fp32)
+def dgelu_q(g: Tensor, h: Tensor, q8: bool = True) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    # (d = g gelu_tanh'(h) bf16, its rowwise e4m3, the row scales, d.sum(0) fp32); q8=False leaves the e4m3 / scales unset
     M, N = h.shape
     P = triton.cdiv(M, _RPP)
     d, q, s = torch.empty_like(h), torch.empty(M, N, device=h.device, dtype=E4), torch.empty(M, device=h.device)
     db = torch.empty(P, N, device=h.device)
-    _dgelu_q_kernel[(P,)](g.contiguous(), h, d, q, s, db, M, N, triton.next_power_of_2(N), _RPP, num_warps=16)
+    _dgelu_q_kernel[(P,)](g.contiguous(), h, d, q, s, db, M, N, triton.next_power_of_2(N), _RPP, q8, num_warps=16)
     return d, q, s, db.sum(0)
 
 
 @dgelu_q.register_fake
-def _(g, h):
+def _(g, h, q8=True):
     return torch.empty_like(h), torch.empty_like(h, dtype=E4), h.new_empty(h.shape[0], dtype=torch.float32), \
         h.new_empty(h.shape[1], dtype=torch.float32)
 
 
 @triton.jit
 def _qkv_q_kernel(q_ptr, k_ptr, v_ptr, sb, sh, sn, d_ptr, q8_ptr, s_ptr, db_ptr, M, NT, H: tl.constexpr,
-                  HD: tl.constexpr, RPP: tl.constexpr):
+                  HD: tl.constexpr, RPP: tl.constexpr, Q: tl.constexpr):
     # the attention input grads dq / dk / dv ([B, H, N, hd] views with shared strides sb / sh / sn, hd contiguous) as
     # one token-major [M, 3 H hd] bf16 row (the qkv GEMM's output layout), its rowwise e4m3 copy, and per program
     # column sums (the qkv bias grad partials)
@@ -192,13 +197,14 @@ def _qkv_q_kernel(q_ptr, k_ptr, v_ptr, sb, sh, sn, d_ptr, q8_ptr, s_ptr, db_ptr,
             a0 += g0
             a1 += g1
             a2 += g2
-            amax = tl.maximum(tl.maximum(tl.max(tl.max(tl.abs(g0), 1), 0), tl.max(tl.max(tl.abs(g1), 1), 0)),
-                              tl.max(tl.max(tl.abs(g2), 1), 0))
-            sc = tl.maximum(amax / 448.0, 1e-30)
-            tl.store(q8_ptr + out, tl.clamp(g0 / sc, -448.0, 448.0).to(tl.float8e4nv))
-            tl.store(q8_ptr + out + W, tl.clamp(g1 / sc, -448.0, 448.0).to(tl.float8e4nv))
-            tl.store(q8_ptr + out + 2 * W, tl.clamp(g2 / sc, -448.0, 448.0).to(tl.float8e4nv))
-            tl.store(s_ptr + row, sc)
+            if Q:
+                amax = tl.maximum(tl.maximum(tl.max(tl.max(tl.abs(g0), 1), 0), tl.max(tl.max(tl.abs(g1), 1), 0)),
+                                  tl.max(tl.max(tl.abs(g2), 1), 0))
+                sc = tl.maximum(amax / 448.0, 1e-30)
+                tl.store(q8_ptr + out, tl.clamp(g0 / sc, -448.0, 448.0).to(tl.float8e4nv))
+                tl.store(q8_ptr + out + W, tl.clamp(g1 / sc, -448.0, 448.0).to(tl.float8e4nv))
+                tl.store(q8_ptr + out + 2 * W, tl.clamp(g2 / sc, -448.0, 448.0).to(tl.float8e4nv))
+                tl.store(s_ptr + row, sc)
     pb = pid.to(tl.int64) * (3 * W) + off_out
     tl.store(db_ptr + pb, a0)
     tl.store(db_ptr + pb + W, a1)
@@ -206,27 +212,36 @@ def _qkv_q_kernel(q_ptr, k_ptr, v_ptr, sb, sh, sn, d_ptr, q8_ptr, s_ptr, db_ptr,
 
 
 @torch.library.custom_op("nanobrain::qkv_q", mutates_args=())
-def qkv_q(dq: Tensor, dk: Tensor, dv: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    # ([M, 3 D] bf16 token rows of (dq, dk, dv), rowwise e4m3, row scales, column sums fp32) of [B, H, N, hd] grads
+def qkv_q(dq: Tensor, dk: Tensor, dv: Tensor, q8: bool = True) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    # ([M, 3 D] bf16 token rows of (dq, dk, dv), rowwise e4m3, row scales, column sums fp32) of [B, H, N, hd] grads;
+    # q8=False leaves the e4m3 / scales unset
     B, H, N, hd = dq.shape
     if dq.stride(-1) != 1 or dk.stride() != dq.stride() or dv.stride() != dq.stride():
         dq, dk, dv = dq.contiguous(), dk.contiguous(), dv.contiguous()
     M, W = B * N, 3 * H * hd
     P = triton.cdiv(M, 2 * _RPP)
-    d, q8 = torch.empty(M, W, device=dq.device, dtype=torch.bfloat16), torch.empty(M, W, device=dq.device, dtype=E4)
+    d, d8 = torch.empty(M, W, device=dq.device, dtype=torch.bfloat16), torch.empty(M, W, device=dq.device, dtype=E4)
     s = torch.empty(M, device=dq.device)
     db = torch.empty(P, W, device=dq.device)
-    _qkv_q_kernel[(P,)](dq, dk, dv, dq.stride(0), dq.stride(1), dq.stride(2), d, q8, s, db, M, N, H, hd, 2 * _RPP,
-                        num_warps=4)
-    return d, q8, s, db.sum(0)
+    _qkv_q_kernel[(P,)](dq, dk, dv, dq.stride(0), dq.stride(1), dq.stride(2), d, d8, s, db, M, N, H, hd, 2 * _RPP,
+                        q8, num_warps=4)
+    return d, d8, s, db.sum(0)
 
 
 @qkv_q.register_fake
-def _(dq, dk, dv):
+def _(dq, dk, dv, q8=True):
     B, H, N, hd = dq.shape
     M, W = B * N, 3 * H * hd
     return dq.new_empty(M, W), dq.new_empty(M, W, dtype=E4), dq.new_empty(M, dtype=torch.float32), \
         dq.new_empty(W, dtype=torch.float32)
+
+
+def _dgrad8(dy: Tensor, w: Tensor, dy8: Tensor | None = None, sdy: Tensor | None = None) -> Tensor:
+    # fp8 dgrad dy @ w with rowwise e4m3 operands (dy quantised here unless its e4m3 / scales are given)
+    if dy8 is None:
+        dy8, sdy = quant(dy)
+    wt8, swt = quant(w.t())
+    return mm8(dy8, wt8, sdy, swt)
 
 
 class QKV8(torch.autograd.Function):
@@ -237,7 +252,7 @@ class QKV8(torch.autograd.Function):
         x8, sx = quant(x)
         w8, sw = quant(w)
         ctx.save_for_backward(x, w)
-        ctx.has_b = b is not None
+        ctx.has_b, ctx.bf16 = b is not None, BWD_BF16
         y = mm8(x8, w8, sx, sw, None if b is None else b.to(torch.bfloat16))
         y = y.view(B, x.shape[0] // B, 3, H, -1).permute(2, 0, 3, 1, 4)
         return y[0], y[1], y[2]
@@ -245,9 +260,9 @@ class QKV8(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dq, dk, dv):
         x, w = ctx.saved_tensors
-        d, d8, sd, db = qkv_q(dq, dk, dv)
-        wt8, swt = quant(w.t())
-        return mm8(d8, wt8, sd, swt), d.t() @ x, db if ctx.has_b else None, None, None
+        d, d8, sd, db = qkv_q(dq, dk, dv, not ctx.bf16)
+        dx = d @ w.to(torch.bfloat16) if ctx.bf16 else _dgrad8(d, w, d8, sd)
+        return dx, d.t() @ x, db if ctx.has_b else None, None, None
 
 
 class Linear8(torch.autograd.Function):
@@ -257,15 +272,13 @@ class Linear8(torch.autograd.Function):
         x8, sx = quant(x)
         w8, sw = quant(w)
         ctx.save_for_backward(x, w)
-        ctx.has_b = b is not None
+        ctx.has_b, ctx.bf16 = b is not None, BWD_BF16
         return mm8(x8, w8, sx, sw, None if b is None else b.to(torch.bfloat16))
 
     @staticmethod
     def backward(ctx, dy):
         x, w = ctx.saved_tensors
-        dy8, sdy = quant(dy)
-        wt8, swt = quant(w.t())
-        dx = mm8(dy8, wt8, sdy, swt)
+        dx = dy @ w.to(torch.bfloat16) if ctx.bf16 else _dgrad8(dy, w)
         return dx, dy.t() @ x, dy.sum(0) if ctx.has_b else None
 
 
@@ -280,16 +293,19 @@ class Mlp8(torch.autograd.Function):
         a, a8, sa = gelu_q(h)
         w28, s2 = quant(w2)
         ctx.save_for_backward(x, h, a, w1, w2)
+        ctx.bf16 = BWD_BF16
         return mm8(a8, w28, sa, s2, b2.to(torch.bfloat16))
 
     @staticmethod
     def backward(ctx, dy):
         x, h, a, w1, w2 = ctx.saved_tensors
-        dy8, sdy = quant(dy)
-        w2t8, s2t = quant(w2.t())
-        dh, dh8, sdh, db1 = dgelu_q(mm8(dy8, w2t8, sdy, s2t), h)
-        w1t8, s1t = quant(w1.t())
-        dx = mm8(dh8, w1t8, sdh, s1t)
+        bf = torch.bfloat16
+        if ctx.bf16:
+            dh, _, _, db1 = dgelu_q(dy @ w2.to(bf), h, False)
+            dx = dh @ w1.to(bf)
+        else:
+            dh, dh8, sdh, db1 = dgelu_q(_dgrad8(dy, w2), h)
+            dx = _dgrad8(dh, w1, dh8, sdh)
         return dx, dh.t() @ x, db1, dy.t() @ a, dy.sum(0)
 
 

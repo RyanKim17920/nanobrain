@@ -211,14 +211,19 @@ def main(args: DictConfig):
 
     if args.get("native_fp8_lt"):
         # speed, NUMERICS-CHANGING (off when unset): the encoder blocks' linears (training) as in-graph cuBLASLt fp8 GEMMs
-        # (kernels.py: rowwise-scaled e4m3 fprop / dgrad, bf16 wgrad). native_fp8_lt = comma list of mlp | qkv | proj
-        from nanobrain import cublaslt
+        # (kernels.py: rowwise-scaled e4m3 fprop / dgrad, bf16 wgrad). native_fp8_lt = comma list of mlp | qkv | proj.
+        # native_fp8_lt_bwd = fp8 (default) | bf16: bf16 dgrad too (fp8 fprop only; backward errors don't compound)
+        from nanobrain import cublaslt, kernels
+
+        bwd = str(args.get("native_fp8_lt_bwd") or "fp8")
+        assert bwd in ("fp8", "bf16"), f"native_fp8_lt_bwd={bwd}: fp8 | bf16"
+        kernels.BWD_BF16 = bwd == "bf16"
 
         cublaslt.init(device)
         parts = str(args.native_fp8_lt).split(",")
         for block in model.blocks:
             block.mlp.fp8, block.attn.fp8_qkv, block.attn.fp8_proj = "mlp" in parts, "qkv" in parts, "proj" in parts
-        logger.info(f"native_fp8_lt: encoder {parts} as fp8 GEMMs")
+        logger.info(f"native_fp8_lt: encoder {parts} as fp8 GEMMs, {bwd} dgrad")
     if args.get("native_muon_syrk"):
         # speed, same math up to rounding: muon's symmetric newton-schulz products as upper-triangle GEMMs (kernels.py)
         from nanobrain import optim
