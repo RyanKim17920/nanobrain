@@ -161,6 +161,22 @@ def main(args: DictConfig):
 
         apply_natural_init(model, args.natinit)
     model.to(device)
+    if args.get("native_fp8"):
+        # NUMERICS-CHANGING (off when unset): fp8 compute for the encoder / decoder block linears (torchao float8
+        # training, dynamic scaling; native_fp8_recipe tensorwise | rowwise | rowwise_with_gw_hp). the weights stay
+        # fp32 parameters with the same names (state dict, muon, the eval loader unchanged); only the matmuls cast.
+        # heads, embeddings and projections stay bf16. needs torchao (a venv with it: NB_PYTHON)
+        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
+
+        def fp8_filter(mod: nn.Module, fqn: str) -> bool:
+            return (
+                isinstance(mod, nn.Linear) and fqn.startswith(("blocks.", "decoder_blocks."))
+                and mod.in_features % 16 == 0 and mod.out_features % 16 == 0
+            )
+
+        recipe = str(args.get("native_fp8_recipe") or "tensorwise")
+        convert_to_float8_training(model, config=Float8LinearConfig.from_recipe_name(recipe), module_filter_fn=fp8_filter)
+        logger.info(f"native_fp8: {recipe} float8 linears in the encoder / decoder blocks")
     logger.info(f"model:\n{model}")
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"num params: {num_params / 1e6:.1f}M")
@@ -301,6 +317,15 @@ def main(args: DictConfig):
             f"effective subjects {eff_before:.0f} -> {effective_subjects(dataset.paths, sampler.weights):.0f}, "
             f"effective images {n_eff:.0f} of {len(dataset)}"
         )
+    if args.get("native_bucket_window"):
+        # speed, CHANGES BATCH COMPOSITION (off when unset): windows of native_bucket_window batches sorted by
+        # spacing, so a batch has fewer spacing groups (data.BucketSampler)
+        from nanobrain.data import BucketSampler, spacing_keys
+
+        assert args.native and world_size == 1, "native_bucket_window: single gpu native training"
+        keys = spacing_keys(dataset.paths, DATA_ROOT / "fomo300k" / "tables" / "images.parquet")
+        sampler = BucketSampler(sampler, keys, args.batch_size, int(args.native_bucket_window), seed=args.seed)
+        logger.info(f"bucket sampler: windows of {args.native_bucket_window} batches, {len(set(keys.tolist()))} spacing keys")
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
@@ -309,7 +334,10 @@ def main(args: DictConfig):
         num_workers=args.num_workers,
         # no collate (variable shapes); the fast prep plans its numpy part in the workers
         collate_fn=(
-            functools.partial(prep.native_concat, clip_quantiles=tuple(args.clip_quantiles))
+            functools.partial(
+                prep.native_concat, clip_quantiles=tuple(args.clip_quantiles),
+                **({"orient": True} if args.get("native_worker_orient") else {}),
+            )
             if args.get("native_batched_prep")
             else functools.partial(prep.clip_batch, clip_quantiles=tuple(args.clip_quantiles))
             if args.get("native_worker_clip") else list
@@ -724,7 +752,11 @@ def make_optimizer(args: DictConfig, model: nn.Module):
     return CombinedOptimizer(
         [
             torch.optim.AdamW(adamw_groups, betas=betas, fused=args.fused_adamw),
-            Muon(muon_groups, momentum=args.muon_momentum, fused=args.muon_fused),
+            Muon(
+                muon_groups, momentum=args.muon_momentum, fused=args.muon_fused,
+                # speed (off when unset): the fused muon step replayed as one cuda graph (same kernels and values)
+                graph=bool(args.get("native_muon_graph", False)),
+            ),
         ]
     )
 

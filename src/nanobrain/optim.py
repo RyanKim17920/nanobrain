@@ -39,6 +39,7 @@ class Muon(torch.optim.Optimizer):
         nesterov=True,
         ns_steps=5,
         fused=False,
+        graph=False,
     ):
         defaults = dict(
             lr=lr, weight_decay=weight_decay, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps
@@ -53,9 +54,18 @@ class Muon(torch.optim.Optimizer):
         # as grad_scale, which the step applies on the fly
         self.defers_grad_clip = fused
         self.grad_scale: Tensor | None = None
+        # graph (speed, off when unset; with fused): after a few eager fused steps the whole fused step is
+        # captured as one cuda graph and replayed on static copies of the grads / clip scale (the same compiled
+        # kernels on the same values, ~1 launch instead of the per shape compiled calls' python + launches)
+        self.graph = graph and fused
+        self._graph = None
+        self._graph_steps = 0
 
     @torch.no_grad()
     def step(self):
+        if self.graph:
+            self._graph_step()
+            return
         if self.fused:
             self._fused_step()
             return
@@ -88,16 +98,64 @@ class Muon(torch.optim.Optimizer):
                 torch._foreach_mul_(params, 1 - lr * group["weight_decay"])
                 torch._foreach_add_(params, list(update.to(params[0].dtype).unbind(0)), alpha=-lr * scale)
 
-    def _fused_step(self):
-        grad_scale = self.grad_scale
+    def _graph_step(self):
+        params = [p for group in self.param_groups for p in group["params"]]
+        grads = [p.grad for p in params]
+        if self._graph is None and self._graph_steps < 3:
+            # eager fused steps first: compiles, creates the momentum buffers. a tensor clip scale (ones if none)
+            # so the compiled graphs are the ones replayed later
+            if self.grad_scale is None:
+                self.grad_scale = torch.ones((), device=params[0].device)
+            self._graph_steps += 1
+            self._fused_step()
+            return
+        assert all(g is not None for g in grads), "muon graph: every muon matrix needs a grad"
+        scale = self.grad_scale if self.grad_scale is not None else torch.ones((), device=params[0].device)
         self.grad_scale = None
+        if self._graph is None:
+            self._static_grads = [torch.empty_like(g) for g in grads]
+            self._static_scale = torch.empty((), device=scale.device, dtype=scale.dtype)
+            torch._foreach_copy_(self._static_grads, grads)
+            self._static_scale.copy_(scale)
+            self._set_coefs()
+            # capture records without running; the replay below is this step's update
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            self._graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self._graph, stream=stream):
+                self._fused_step(grads=self._static_grads, grad_scale=self._static_scale, set_coefs=False)
+            torch.cuda.current_stream().wait_stream(stream)
+        else:
+            torch._foreach_copy_(self._static_grads, grads)
+            self._static_scale.copy_(scale)
+            self._set_coefs()
+        self._graph.replay()
+
+    def _set_coefs(self):
+        for group in self.param_groups:
+            shapes = {tuple(sorted(p.shape)) for p in group["params"] if p.grad is not None}
+            lr, wd = group["lr"], group["weight_decay"]
+            for shape in shapes:
+                coefs = self._coefs((id(group), shape), group["params"][0].device)
+                coefs[0].fill_(1 - lr * wd)
+                coefs[1].fill_(-lr * 0.2 * max(shape) ** 0.5)
+
+    def _fused_step(self, grads=None, grad_scale=None, set_coefs=True):
+        # grads (graph): the grads to use, in param_groups order (default p.grad); grad_scale likewise
+        if grad_scale is None:
+            grad_scale = self.grad_scale
+        self.grad_scale = None
+        gi = iter(grads) if grads is not None else None
         for group in self.param_groups:
             # batch by the orientation newton-schulz runs in (rows <= cols)
             by_shape = defaultdict(list)
+            grad_of = {}
             for p in group["params"]:
-                if p.grad is not None:
+                g = next(gi) if gi is not None else p.grad
+                if g is not None:
                     assert p.ndim == 2, "muon only takes matrices"
                     by_shape[tuple(sorted(p.shape))].append(p)
+                    grad_of[p] = g
 
             lr, wd = group["lr"], group["weight_decay"]
             for shape, params in by_shape.items():
@@ -108,13 +166,14 @@ class Muon(torch.optim.Optimizer):
                         state["momentum_buffer"] = torch.zeros_like(p.grad)
                     bufs.append(state["momentum_buffer"])
                 # python float scalars would be baked into the compiled graph, so they go in
-                # as 0-d tensors (fill_ doesn't sync)
-                coefs = self._coefs(shape, params[0].device)
-                coefs[0].fill_(1 - lr * wd)
-                coefs[1].fill_(-lr * 0.2 * max(shape) ** 0.5)
+                # as 0-d tensors (fill_ doesn't sync). graph: one pair per (group, shape), filled before replay
+                coefs = self._coefs((id(group), shape) if self.graph else shape, params[0].device)
+                if set_coefs:
+                    coefs[0].fill_(1 - lr * wd)
+                    coefs[1].fill_(-lr * 0.2 * max(shape) ** 0.5)
                 _fused_muon_update(
                     params,
-                    [p.grad for p in params],
+                    [grad_of[p] for p in params],
                     bufs,
                     coefs[0],
                     coefs[1],

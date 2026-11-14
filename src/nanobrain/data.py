@@ -155,6 +155,52 @@ class InfiniteSampler(Sampler[int]):
                 index += 1
 
 
+def spacing_keys(paths: list[str], table: Path) -> np.ndarray:
+    # per image an int code of its (orientation, voxel spacing to 1e-3 mm) from the images table: images
+    # with one code share a native token grid. paths are filelist entries (derivatives/... .npz)
+    import re
+
+    def norm(path: str) -> str:
+        return re.sub(r"\.(nii\.gz|nii|npz)$", "", path.split("/", 1)[1])
+
+    meta = pd.read_parquet(table, columns=["path", "spacing", "orientation"])
+    key = {
+        norm(path): f"{ornt}|{np.round(np.asarray(sp, dtype=np.float64), 3).tolist()}"
+        for path, sp, ornt in zip(meta["path"], meta["spacing"], meta["orientation"])
+    }
+    names = [key.get(norm(path), "?") for path in paths]
+    codes = {name: ii for ii, name in enumerate(sorted(set(names)))}
+    return np.array([codes[name] for name in names], dtype=np.int64)
+
+
+class BucketSampler(Sampler[int]):
+    """native_bucket_window (speed, CHANGES BATCH COMPOSITION; off when unset): the base sampler's stream in windows
+    of `window` batches; each window stably sorted by spacing key and cut into batches, the batches of a window in
+    a random order. Every drawn image is used once and within its window; a batch holds fewer spacing groups
+    (fewer per group passes in the prep and the forward)."""
+
+    def __init__(self, base: Sampler, keys: np.ndarray, batch_size: int, window: int, seed: int = 0):
+        self.base, self.keys, self.batch_size, self.window, self.seed = base, keys, batch_size, window, seed
+
+    def __iter__(self):
+        generator = torch.Generator().manual_seed(self.seed + int(getattr(self.base, "start", 0)))
+        it = iter(self.base)
+        size = self.batch_size * self.window
+        while True:
+            idx = []
+            for ii in it:
+                idx.append(ii)
+                if len(idx) == size:
+                    break
+            if len(idx) < size:
+                yield from idx
+                return
+            order = sorted(range(size), key=lambda jj: self.keys[idx[jj]])
+            for bb in torch.randperm(self.window, generator=generator).tolist():
+                for jj in order[bb * self.batch_size : (bb + 1) * self.batch_size]:
+                    yield idx[jj]
+
+
 def brle_to_dense(mask_rle: torch.Tensor, shape: tuple[int, int, int]) -> torch.Tensor:
     # mask_rle is a binary run length encoding, alternating false and true runs starting
     # with false

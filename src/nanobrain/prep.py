@@ -51,7 +51,7 @@ def clip_batch(batch: list[dict], clip_quantiles=(0.005, 0.995)) -> list[dict]:
     return batch
 
 
-def native_concat(batch: list[dict], clip_quantiles=(0.005, 0.995)) -> dict | list[dict]:
+def native_concat(batch: list[dict], clip_quantiles=(0.005, 0.995), orient: bool = False) -> dict | list[dict]:
     # native loader collate_fn (native_batched_prep): clip_batch, then one int16 values and one run length
     # tensor per batch (+ per sample scale, clip, lengths), so the gpu prep runs batch wide in
     # native_batch_transform. falls back to the per sample list when a sample has no int16 clip
@@ -60,6 +60,10 @@ def native_concat(batch: list[dict], clip_quantiles=(0.005, 0.995)) -> dict | li
         return batch
     for s in batch:
         s["n_values"], s["n_runs"] = len(s["values"]), len(s["mask_rle"])
+        if orient:
+            # native_worker_orient (speed): reorient_to_ras' nibabel orientation (flip axes, order, affine) here in
+            # the worker instead of the prep thread (same numpy call, same values)
+            s["ras"] = ras_orientation(s["affine"], tuple(s["shape"]))
     out = {
         "values": torch.cat([s.pop("values") for s in batch]),
         "mask_rle": torch.cat([s.pop("mask_rle") for s in batch]),
@@ -137,7 +141,12 @@ def native_batch_transform(batch: dict, target_spacing: float = 1.0, index: bool
         mask = torch.repeat_interleave(flags, runs, output_size=sum(vox))
         image = values.new_zeros(mask.shape).masked_scatter_(mask, values)
     for img, msk, sh, s in zip(image.split(vox), mask.split(vox), shapes, samples) if not index else ():
-        img, msk, affine = reorient_to_ras(img.view(sh), msk.view(sh), s["affine"])
+        if "ras" in s:
+            # native_worker_orient: reorient_to_ras with the worker's orientation (the same flip + permute)
+            flip_axes, order, affine = s["ras"]
+            img, msk = img.view(sh).flip(flip_axes).permute(order), msk.view(sh).flip(flip_axes).permute(order)
+        else:
+            img, msk, affine = reorient_to_ras(img.view(sh), msk.view(sh), s["affine"])
         out["image"].append(img)
         out["mask"].append(msk)
         out["spacing"].append(native_spacing(affine, target_spacing))
