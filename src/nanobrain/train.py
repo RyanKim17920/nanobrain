@@ -56,6 +56,8 @@ def main(args: DictConfig):
         # ddp under torchrun, one process per gpu. batch_size is per gpu
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         dist.init_process_group(backend="nccl")
+    if args.get("native_fp8_mlp"):
+        te_preload()
     rank, world_size = misc.get_rank(), misc.get_world_size()
     device = torch.device(args.device)
     # the ranks draw different views; rank 0's model init is broadcast by ddp
@@ -206,6 +208,23 @@ def main(args: DictConfig):
         for mod in model.modules():
             if isinstance(mod, Mlp) and mod.fc1.bias is not None:
                 mod.lt_gelu = True
+
+    if args.get("native_fp8_mlp"):
+        # speed, NUMERICS-CHANGING (off when unset): every block's norm2 + mlp (training) as transformer engine's
+        # LayerNormMLP in fp8 (delayed scaling, HYBRID e4m3 / e5m2, amax history 16) on the same parameters.
+        # native_fp8_mlp = encoder | decoder | all. needs a venv with transformer_engine (NB_PYTHON) and, for TE 2.21's
+        # cu13 core, cuBLASLt >= 13.2 preloaded (LD_PRELOAD the cuda 13.3 libcublasLt / libcublas)
+        from transformer_engine.common.recipe import DelayedScaling, Format
+
+        from nanobrain import modules as M
+
+        M.TE_RECIPE = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16, amax_compute_algo="max")
+        which = str(args.native_fp8_mlp)
+        blocks = [*(model.blocks if which in ("encoder", "all", "True") else []),
+                  *(model.decoder_blocks if which in ("decoder", "all") else [])]
+        for block in blocks:
+            M.te_layernorm_mlp(block)
+        logger.info(f"native_fp8_mlp: {len(blocks)} blocks' norm2 + mlp as fp8 LayerNormMLP")
 
     model_without_ddp = model
     if args.distributed:
@@ -477,6 +496,22 @@ def main(args: DictConfig):
         logger.info(f"done! step {step}, wall time: {wall_time_str}")
     else:
         logger.info(f"stopped by signal at step {step}. wall time: {wall_time_str}")
+
+
+def te_preload() -> None:
+    # transformer engine 2.21's cu13 core needs cuBLASLt >= 13.2 symbols; torch's wheel loads 13.1 first. re-exec once
+    # with the cuda toolkit's cuBLAS(Lt) preloaded (+ the venv's cudnn on the library path), before any cuda call
+    lt = os.environ.get("NB_TE_CUBLAS_DIR", "/usr/local/cuda-13.3/lib64")
+    if "libcublasLt" in os.environ.get("LD_PRELOAD", ""):
+        return
+    import sys
+
+    nv = Path(torch.__file__).parent.parent / "nvidia"
+    env = dict(os.environ, LD_PRELOAD=f"{lt}/libcublasLt.so.13:{lt}/libcublas.so.13",
+               LD_LIBRARY_PATH=":".join(filter(None, [str(nv / "cudnn" / "lib"), str(nv / "cu13" / "lib"),
+                                                       os.environ.get("LD_LIBRARY_PATH")])))
+    logger.info("transformer engine: re-exec with the cuda toolkit cuBLAS preloaded")
+    os.execve(sys.executable, sys.orig_argv, env)
 
 
 def train(

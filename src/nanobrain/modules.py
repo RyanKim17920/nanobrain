@@ -164,8 +164,14 @@ class Block(nn.Module):
     ) -> Float[Tensor, "B N D"]:
         # should the context also be normalized? capi doesn't, so I guess not
         x = x + self.drop_path1(self.attn(self.norm1(x), context=context, vgate=vgate))
-        x = x + self.drop_path2(self.mlp(self.norm2(x)))
-        return x
+        return x + self._mlp_branch(x)
+
+    def _mlp_branch(self, x: Tensor) -> Tensor:
+        te_mlp = self.__dict__.get("te_mlp")
+        if te_mlp is not None and self.training and TE_ON:
+            # native_fp8_mlp (NUMERICS-CHANGING): norm2 + mlp as transformer engine's fp8 LayerNormMLP
+            return _te_mlp(te_mlp, x)
+        return self.drop_path2(self.mlp(self.norm2(x)))
 
     def forward_last_rows(
         self, x: Float[Tensor, "B N D"], num_rows: int, vgate: Float[Tensor, "B N"] | None = None
@@ -173,7 +179,37 @@ class Block(nn.Module):
         # forward(x)[:, -num_rows:]: queries and mlp for those rows only, keys / values from all
         h = self.norm1(x)
         x = x[:, -num_rows:] + self.drop_path1(self.attn(h[:, -num_rows:], context=h, vgate=vgate))
-        return x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x + self._mlp_branch(x)
+
+
+TE_RECIPE = None  # native_fp8_mlp: the transformer engine fp8 recipe (train.py)
+TE_ON = True  # dev in-run A/B switch
+
+
+@torch.compiler.disable
+def _te_mlp(mod: nn.Module, x: Tensor) -> Tensor:
+    # outside the compiled graphs (a graph break per block): transformer engine runs its own fp8 cast / amax kernels
+    import transformer_engine.pytorch as te
+
+    with te.fp8_autocast(enabled=True, fp8_recipe=TE_RECIPE):
+        return mod(x)
+
+
+def te_layernorm_mlp(block: "Block") -> nn.Module:
+    # a transformer engine LayerNormMLP (tanh GELU) on the block's own norm2 / fc1 / fc2 parameters (shared, so the
+    # state dict, the optimizers and the eval path see the same tensors); not registered as a submodule
+    import transformer_engine.pytorch as te
+
+    fc1, fc2, ln = block.mlp.fc1, block.mlp.fc2, block.norm2
+    mod = te.LayerNormMLP(
+        fc1.in_features, fc1.out_features, eps=ln.eps, bias=fc1.bias is not None, activation="gelu",
+        params_dtype=torch.float32, device=fc1.weight.device,
+    )
+    for name, p in [("layer_norm_weight", ln.weight), ("layer_norm_bias", ln.bias), ("fc1_weight", fc1.weight),
+                    ("fc1_bias", fc1.bias), ("fc2_weight", fc2.weight), ("fc2_bias", fc2.bias)]:
+        setattr(mod, name, p)
+    block.__dict__["te_mlp"] = mod
+    return mod
 
 
 # Position embedding
