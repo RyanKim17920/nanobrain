@@ -212,11 +212,22 @@ def _newtonschulz5_poly(X: Tensor, steps: int) -> Tensor:
     a, b, c = (3.4445, -4.7750, 2.0315)
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     eye = torch.eye(X.size(-2), device=X.device, dtype=X.dtype)
+    if NS_SYRK and X.size(-2) % 128 == 0:
+        # native_muon_syrk (speed, same math): the symmetric X X^T and A A (= A A^T) as upper-triangle tile GEMMs
+        from nanobrain.kernels import syrk
+
+        for _ in range(steps):
+            A = syrk(X)
+            X = (a * eye + b * A + c * syrk(A)) @ X
+        return X
     for _ in range(steps):
         A = X @ X.mT
         P = a * eye + b * A + c * (A @ A)
         X = P @ X
     return X
+
+
+NS_SYRK = False  # train.py native_muon_syrk
 
 
 # one graph per distinct matrix shape: models with many shapes (hiera stages) exceed dynamo's

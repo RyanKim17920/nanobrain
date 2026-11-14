@@ -20,6 +20,8 @@ Layer = Type[nn.Module]
 
 
 class Attention(nn.Module):
+    fp8_qkv = fp8_proj = False  # native_fp8_lt (train.py)
+
     def __init__(
         self,
         dim: int,
@@ -68,9 +70,17 @@ class Attention(nn.Module):
         _, M, _ = context.shape
         h = self.num_heads
 
-        q = self.q(x).reshape(B, N, h, D // h).transpose(1, 2)
-        k = self.k(context).reshape(B, M, h, D // h).transpose(1, 2)
-        v = self.v(context).reshape(B, M, h, D // h).transpose(1, 2)
+        if self.fp8_qkv and self.training and context is x:
+            # native_fp8_lt (NUMERICS-CHANGING): q, k, v as one in-graph fp8 GEMM (kernels.QKV8)
+            from nanobrain.kernels import QKV8
+
+            w = torch.cat([self.q.weight, self.k.weight, self.v.weight])
+            b = torch.cat([self.q.bias, self.k.bias, self.v.bias]) if self.q.bias is not None else None
+            q, k, v = QKV8.apply(x.reshape(B * N, D).to(torch.bfloat16), w, b, B, h)
+        else:
+            q = self.q(x).reshape(B, N, h, D // h).transpose(1, 2)
+            k = self.k(context).reshape(B, M, h, D // h).transpose(1, 2)
+            v = self.v(context).reshape(B, M, h, D // h).transpose(1, 2)
         if vgate is not None:
             # per-key value gate (rtd suspicion gating): a gated key still takes attention mass but
             # contributes a shrunk value. None = the plain attention
@@ -80,6 +90,10 @@ class Attention(nn.Module):
             k = self.k_norm(k)
         x = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         x = x.transpose(1, 2).reshape(B, N, D)
+        if self.fp8_proj and self.training:
+            from nanobrain.kernels import linear8
+
+            return linear8(x, self.proj)
         x = self.proj(x)
         return x
 
@@ -88,6 +102,7 @@ class Mlp(nn.Module):
     # lt_gelu (training speed, NUMERICS-CHANGING: tanh GELU; set by train.py native_lt_gelu): fc1 + bias + GELU
     # and fc2's input grad + GELU' as cuBLASLt epilogues (cublaslt.LtMlp)
     lt_gelu = False
+    fp8 = False  # native_fp8_lt (NUMERICS-CHANGING): fc1 / GELU / fc2 as in-graph fp8 GEMMs (kernels.Mlp8), training only
 
     def __init__(
         self,
@@ -102,6 +117,10 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, dim, bias=bias)
 
     def forward(self, x: Float[Tensor, "... D"]) -> Float[Tensor, "... D"]:
+        if self.fp8 and self.training:
+            from nanobrain.kernels import mlp8
+
+            return mlp8(x, self)
         if self.lt_gelu and self.training:
             from nanobrain.cublaslt import LtMlp
 

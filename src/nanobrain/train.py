@@ -209,6 +209,21 @@ def main(args: DictConfig):
             if isinstance(mod, Mlp) and mod.fc1.bias is not None:
                 mod.lt_gelu = True
 
+    if args.get("native_fp8_lt"):
+        # speed, NUMERICS-CHANGING (off when unset): the encoder blocks' linears (training) as in-graph cuBLASLt fp8 GEMMs
+        # (kernels.py: rowwise-scaled e4m3 fprop / dgrad, bf16 wgrad). native_fp8_lt = comma list of mlp | qkv | proj
+        from nanobrain import cublaslt
+
+        cublaslt.init(device)
+        parts = str(args.native_fp8_lt).split(",")
+        for block in model.blocks:
+            block.mlp.fp8, block.attn.fp8_qkv, block.attn.fp8_proj = "mlp" in parts, "qkv" in parts, "proj" in parts
+        logger.info(f"native_fp8_lt: encoder {parts} as fp8 GEMMs")
+    if args.get("native_muon_syrk"):
+        # speed, same math (bitwise equal updates): muon's symmetric newton-schulz products as upper-triangle GEMMs
+        from nanobrain import optim
+
+        optim.NS_SYRK = True
     if args.get("native_fp8_mlp"):
         # speed, NUMERICS-CHANGING (off when unset): every block's norm2 + mlp (training) as transformer engine's
         # LayerNormMLP in fp8 (delayed scaling, HYBRID e4m3 / e5m2, amax history 16) on the same parameters.
