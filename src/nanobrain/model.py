@@ -1832,7 +1832,7 @@ class ViTMAE3D(nn.Module):
         for sp, ids in groups.items():
             patch, box, grid, _ = geoms[sp]
             if sparse is not None:
-                vols = sparse.group(ids, patch, grid)
+                vols = sparse.group(sp, ids, patch, grid)
                 mask_frac = vols.frac()
                 scores = sequence_scores(None, num_samples, self.min_mask_frac, mask_frac=mask_frac)
                 parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols, "grid": grid})

@@ -5,6 +5,7 @@ one triton kernel: ras reorientation, box fit, normalization and the synthetic t
 values as native_batch_transform + native_tokens' dense volumes (the per-image mean / std are fp64 sums, the
 tumour's knot noise a direct trilinear read: float-rounding differences only)."""
 
+import functools
 import math
 
 import numpy as np
@@ -247,6 +248,16 @@ def _pool_kernel(x, m, les, thr, kb, kf, out, R, P, T, BR: tl.constexpr, BK: tl.
     tl.store(out + oo, acc, mask=rm[:, None])
 
 
+@functools.lru_cache(maxsize=1024)
+def _pool_mats(patch, sub: int, device):
+    # model.pool_kron's 0/1 bin indicator as [P, sub^3] fp32 and bf16 (exact), + the bin lengths
+    from .model import _cached, pool_kron
+
+    k, lx, ly, lz = pool_kron(patch, sub, device)
+    kf = k.t().contiguous()
+    return _cached(kf.to(torch.bfloat16)), _cached(kf), lx, ly, lz
+
+
 def pool_targets(x: Tensor, m: Tensor, les: Tensor | None, thr: Tensor, patch, sub: int) -> Tensor:
     # sep_pool over (mask, (x > thr_t) x mask, lesion x mask) of rows [R, P] in one kernel: [R, T + 2, sub^3]
     from .model import pool_kron
@@ -254,12 +265,11 @@ def pool_targets(x: Tensor, m: Tensor, les: Tensor | None, thr: Tensor, patch, s
     P = math.prod(patch)
     x, m = x.reshape(-1, P).contiguous(), m.reshape(-1, P).contiguous()
     R, T = x.shape[0], thr.numel()
-    k, lx, ly, lz = pool_kron(tuple(patch), sub, x.device)
-    kf = k.t().contiguous()
+    kb, kf, lx, ly, lz = _pool_mats(tuple(patch), sub, x.device)
     out = torch.empty(R, T + 2, sub**3, device=x.device, dtype=torch.float32)
     C = T + 2 if les is not None else T + 1
     _pool_kernel[(triton.cdiv(R, 64), C)](
-        x, m, les.reshape(-1, P).contiguous() if les is not None else m, thr.float().contiguous(), kf.to(torch.bfloat16),
+        x, m, les.reshape(-1, P).contiguous() if les is not None else m, thr.float().contiguous(), kb,
         kf, out, R, P, T, BR=64, BK=64, NB=sub**3,
     )
     out = out.view(R, T + 2, sub, sub, sub)
@@ -425,6 +435,17 @@ def _blocks(counts: list[int], block: int, first: list[int] | None = None) -> np
     return np.concatenate(rows).astype(np.int64)
 
 
+def _pack(dev, arrays: list) -> list[Tensor]:
+    # int64 host arrays in one pinned upload, each view 16-byte aligned (triton specializes on pointer alignment)
+    flat = [np.asarray(a, np.int64).ravel() for a in arrays]
+    offs = np.cumsum([0] + [-(-len(f) // 2) * 2 for f in flat])
+    buf = np.zeros(offs[-1], np.int64)
+    for f, o in zip(flat, offs):
+        buf[o : o + len(f)] = f
+    t = _to(dev, buf)
+    return [t[o : o + len(f)].view(np.shape(a)) for a, f, o in zip(arrays, flat, offs)]
+
+
 def _to(dev, a, dtype=None) -> Tensor:
     t = torch.as_tensor(a, dtype=dtype)
     return (t.pin_memory() if dev.type == "cuda" else t).to(dev, non_blocking=True)
@@ -445,7 +466,8 @@ class SparseVolumes:
         vox = [math.prod(sh) for sh in shapes]
         self.vals = vals
         # normalization: (clamp(v * scale, clip) - mean) / std per image, the moments as fp64 sums of block sums
-        blk = _to(dev, _blocks(nv, 4096))
+        first = np.concatenate([[0], np.cumsum(nr)[:-1]]).tolist()
+        blk, rblk = _pack(dev, [_blocks(nv, 4096), _blocks(nr, 1024, first)])
         img_of = blk[:, 0]
         scale, clip = batch["scale"], batch["clip"]
         n = batch["num_values"].double()
@@ -463,8 +485,6 @@ class SparseVolumes:
         words = -(-sum(vox) // 32) + 1
         self.bits = torch.zeros(words, device=dev, dtype=torch.int32)
         cnt = torch.zeros(words, device=dev, dtype=torch.int32)
-        first = np.concatenate([[0], np.cumsum(nr)[:-1]]).tolist()
-        rblk = _to(dev, _blocks(nr, 1024, first))
         _bits_kernel[(len(rblk),)](runs, ends, rblk, self.bits, cnt, BLOCK=1024)
         self.pre = cnt.cumsum(0, dtype=torch.int32) - cnt
         # per image ras geometry: ras shape and the ras voxel -> global voxel map (const + coef . r)
@@ -497,8 +517,9 @@ class SparseVolumes:
                 src, dst = fit_slices(self.ras[ii], box)
                 c = self.const[ii] + sum(cf * (s.start - d.start) for cf, s, d in zip(self.coef[ii], src, dst))
                 rows[ii] = [c, *self.coef[ii], *(v for d in dst for v in (d.start, d.stop))]
-        self.geo = _to(self.device, rows, torch.int64)
-        self.line = _to(self.device, [[abs(c) for c in cf].index(1) for cf in self.coef], torch.int32)
+        line = [[abs(c) for c in cf].index(1) for cf in self.coef]
+        self.geo, self.line, *rimg = _pack(self.device, [np.asarray(rows, np.int64), line, *groups.values()])
+        self.rimg = dict(zip(groups, rimg))
         self.mass = None
 
     def tumors(self, plan: dict | None) -> None:
@@ -512,18 +533,18 @@ class SparseVolumes:
         self.tf = plan["par"].contiguous()
         self.knots = plan["knots"].contiguous()
 
-    def group(self, ids: list[int], patch, grid) -> "SparseGroup":
-        return SparseGroup(self, ids, tuple(patch), tuple(grid))
+    def group(self, sp, ids: list[int], patch, grid) -> "SparseGroup":
+        return SparseGroup(self, sp, ids, tuple(patch), tuple(grid))
 
 
 class SparseGroup:
     """One spacing group's images as LazyTokens stand-in: frac() and the row gathers."""
 
-    def __init__(self, vol: SparseVolumes, ids: list[int], patch, grid):
+    def __init__(self, vol: SparseVolumes, sp, ids: list[int], patch, grid):
         self.vol, self.ids, self.patch, self.grid = vol, ids, patch, grid
         self.num = math.prod(grid)
         self.P = math.prod(patch)
-        self.rimg = _to(vol.device, ids, torch.int64)
+        self.rimg = vol.rimg[sp]
 
     def _args(self):
         (px, py, pz), (_, gy, gz) = self.patch, self.grid

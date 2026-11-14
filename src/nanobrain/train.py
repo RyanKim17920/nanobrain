@@ -337,7 +337,7 @@ def main(args: DictConfig):
         collate_fn=(
             functools.partial(
                 prep.native_concat, clip_quantiles=tuple(args.clip_quantiles),
-                **({"orient": True} if args.get("native_worker_orient") else {}),
+                **({"orient": True} if args.get("native_worker_orient") or args.get("native_sparse_tokens") else {}),
             )
             if args.get("native_batched_prep")
             else functools.partial(prep.clip_batch, clip_quantiles=tuple(args.clip_quantiles))
