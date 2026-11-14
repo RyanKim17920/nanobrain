@@ -157,6 +157,14 @@ def main(args: DictConfig):
     # OPTIMIZATION-CHANGING (off when unset): the encoder / decoder residual streams in bf16 (fp32 now)
     model.bf16_residual = bool(args.get("native_bf16_residual", False))
     assert not args.get("native_sparse_tokens") or (args.get("native_prep_tokens") and args.get("native_batched_prep"))
+    if args.get("native_fast_prep"):
+        # speed (off when unset; with native_sparse_tokens): the prep threads' tokenization as a few batched launches
+        # (sparse.FAST_*: one flat sequence gather / swap / corruption / target pass for all spacing groups, leaner
+        # bitmap / fraction kernels). bit-identical batches, ~5 ms less prep gpu time per batch
+        from nanobrain import sparse
+
+        assert args.get("native_sparse_tokens"), "native_fast_prep: native_sparse_tokens"
+        sparse.FAST_BITS = sparse.FAST_FRAC = sparse.FAST_TOK = sparse.FAST_POOL = sparse.FAST_SCORES = True
     assert not model.batched_unified or (args.get("native_batched_corrupt") and args.get("native_lazy_patchify"))
     assert not model.corrupt_compact or (args.get("native_prep_tokens") and args.get("native_batched_corrupt"))
     if args.get("natinit") and args.natinit.enabled:

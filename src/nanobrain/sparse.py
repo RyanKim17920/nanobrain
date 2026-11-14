@@ -37,7 +37,7 @@ def _moments_kernel(vals, blk, scale, clip, mean, out, BLOCK: tl.constexpr, CENT
 
 
 @triton.jit
-def _bits_kernel(runs, ends, blk, bits, cnt, BLOCK: tl.constexpr):
+def _bits_kernel(runs, ends, blk, bits, cnt, BLOCK: tl.constexpr, FULL: tl.constexpr = False):
     # the true (odd) runs of a block of one image's runs as bits of the global voxel bitmap + per word counts
     pid = tl.program_id(0)
     first = tl.load(blk + pid * 3)
@@ -57,6 +57,12 @@ def _bits_kernel(runs, ends, blk, bits, cnt, BLOCK: tl.constexpr):
         mm = m & (hi > lo)
         n = hi - lo
         word = (((tl.full(n.shape, 1, tl.int64) << n) - 1) << (lo - w * 32)) & 0xFFFFFFFF
+        if FULL:
+            # FAST_BITS: a word the run covers whole is this run's alone: plain stores, atomics at its two ends only
+            full = n == 32
+            tl.store(bits + w, tl.full(n.shape, -1, tl.int32), mask=mm & full)
+            tl.store(cnt + w, tl.full(n.shape, 32, tl.int32), mask=mm & full)
+            mm = mm & (n < 32)
         tl.atomic_or(bits + w, word.to(tl.int32), mask=mm)
         tl.atomic_add(cnt + w, n.to(tl.int32), mask=mm)
 
@@ -111,7 +117,8 @@ def _group_of(row, gtab, G, NC: tl.constexpr, COL: tl.constexpr):
 
 
 @triton.jit(do_not_specialize=["NT", "G"])
-def _frac_kernel(gtab, G, rimg, geo, line, bits, pre, out, NT, TB: tl.constexpr, LB: tl.constexpr):
+def _frac_kernel(gtab, G, rimg, geo, line, bits, pre, out, NT, TB: tl.constexpr, LB: tl.constexpr,
+                 SHORT: tl.constexpr = False):
     # in-mask voxel fraction of every box token of every group (exact count / P), TB tokens per program. group table
     # rows (NC 9): first token, P, PX, PY, PZ, GY, GZ, NUM, first image id. each token's voxel lines along the image's
     # storage-contiguous ras axis (coef +-1) counted as two ranks of the bitmap
@@ -169,21 +176,36 @@ def _frac_kernel(gtab, G, rimg, geo, line, bits, pre, out, NT, TB: tl.constexpr,
         fb = f0 + k0 * b0 + k1 * b1 + k2 * b2 - c * base_l
         fs = fb + c * s
         fe = fb + c * (e - 1)
-        n = _rank(tl.maximum(fs, fe) + 1, bits, pre, ok) - _rank(tl.minimum(fs, fe), bits, pre, ok)
+        if SHORT:
+            # FAST_FRAC: lines of <= 32 voxels span <= 2 words: the count from those words alone (no prefix loads)
+            a = tl.minimum(fs, fe)
+            z = tl.maximum(fs, fe) + 1
+            wa = a >> 5
+            wz = z >> 5
+            ba = tl.load(bits + wa, mask=ok, other=0)
+            bz = tl.load(bits + wz, mask=ok, other=0)
+            one = tl.full(a.shape, 1, tl.int32)
+            n = libdevice.popc(bz & ((one << (z & 31).to(tl.int32)) - 1)) - libdevice.popc(ba & ((one << (a & 31).to(tl.int32)) - 1))
+            n += tl.where(wz != wa, libdevice.popc(ba), 0)
+        else:
+            n = _rank(tl.maximum(fs, fe) + 1, bits, pre, ok) - _rank(tl.minimum(fs, fe), bits, pre, ok)
         acc += tl.where(ok, n, 0)
     tl.store(out + tok, tl.sum(acc, axis=1).to(tl.float32) / tl.reshape(P, [TB]), mask=tm)
 
 
-@triton.jit(do_not_specialize=["G", "NK"])
+@triton.jit(do_not_specialize=["G", "NK", "V", "SEQ"])
 def _gather_kernel(
     gtab, G, tok, rimg, geo, nrm, bits, pre, vals, mass, ti, tf, knots, img_out, msk_out, les_out, NK,
-    TUMOR: tl.constexpr, LES: tl.constexpr, BLOCK: tl.constexpr,
+    t_img, t_w, V, SEQ,
+    TUMOR: tl.constexpr, LES: tl.constexpr, BLOCK: tl.constexpr, SPLIT: tl.constexpr = False, NC: tl.constexpr = 10,
 ):
     # one row of (image, box token) per program, rows of every group: the normalized image / mask voxels (+ the
     # pasted tumour, its soft mask). group table rows (NC 10): first row, P, PX, PY, PZ, GY, GZ, rows per image,
-    # first image id, first output element
+    # first image id, first output element. SPLIT (FAST_TOK, NC 13; rows = sequence rows of SEQ tokens): + first
+    # target element, lesion wanted, 1 / P (fp32 bits); a row's first V tokens go to img / msk / les_out, the rest to
+    # t_img and t_w (the mask / P: flat_loss' weights)
     row = tl.program_id(0)
-    gp = gtab + _group_of(row, gtab, G, 10, 0) * 10
+    gp = gtab + _group_of(row, gtab, G, NC, 0) * NC
     P = tl.load(gp + 1)
     PX = tl.load(gp + 2)
     PY = tl.load(gp + 3)
@@ -194,6 +216,18 @@ def _gather_kernel(
     tid = tl.load(tok + row)
     img = tl.load(rimg + tl.load(gp + 8) + loc // tl.load(gp + 7))
     obase = tl.load(gp + 9) + loc.to(tl.int64) * P
+    o1, o2 = img_out, msk_out
+    if SPLIT:
+        sr = loc // SEQ
+        j = loc % SEQ
+        vis = j < V
+        obase = tl.where(vis, tl.load(gp + 9) + (sr * V + j).to(tl.int64) * P,
+                         tl.load(gp + 10) + (sr * (SEQ - V) + j - V).to(tl.int64) * P)
+        want = vis & (tl.load(gp + 11) != 0)
+        invp = tl.load(gp + 12).to(tl.int32).to(tl.float32, bitcast=True)
+        on = tl.where(vis, 1.0, invp)
+        o1 = tl.where(vis, img_out, t_img)
+        o2 = tl.where(vis, msk_out, t_w)
     k = tl.load(mass + img) if TUMOR else -1
     for q0 in range(0, P, BLOCK):
         q = q0 + tl.arange(0, BLOCK)
@@ -244,10 +278,16 @@ def _gather_kernel(
                 v = tl.where(inside, new, v)
                 les = tl.where(inside, outer, 0.0)
         o = obase + q
-        tl.store(img_out + o, v, mask=qm)
-        tl.store(msk_out + o, inm.to(tl.float32), mask=qm)
-        if LES:
-            tl.store(les_out + o, les, mask=qm)
+        if SPLIT:
+            tl.store(o1 + o, v, mask=qm)
+            tl.store(o2 + o, tl.where(inm, on, 0.0), mask=qm)
+            if LES:
+                tl.store(les_out + o, les, mask=qm & want)
+        else:
+            tl.store(img_out + o, v, mask=qm)
+            tl.store(msk_out + o, inm.to(tl.float32), mask=qm)
+            if LES:
+                tl.store(les_out + o, les, mask=qm)
 
 
 @triton.jit(do_not_specialize=["R", "P", "T"])
@@ -525,6 +565,12 @@ def _to(dev, a, dtype=None) -> Tensor:
     return (t.pin_memory() if dev.type == "cuda" else t).to(dev, non_blocking=True)
 
 
+# FAST_BITS (speed): _bits_kernel's whole words as plain stores, BITS_CFG (runs per block, num_warps) (the same
+# bitmap and counts)
+FAST_BITS = False
+BITS_CFG = (128, 4)
+
+
 class SparseVolumes:
     """A native_concat batch on the gpu as (values, bitmap): ras geometry per image on the host, normalization and
     the bitmap on the device. Stands in for native_batch_transform's dense image / mask lists."""
@@ -541,7 +587,8 @@ class SparseVolumes:
         self.vals = vals
         # normalization: (clamp(v * scale, clip) - mean) / std per image, the moments as fp64 sums of block sums
         first = np.concatenate([[0], np.cumsum(nr)[:-1]]).tolist()
-        blk, rblk = _pack(dev, [_blocks(nv, 4096), _blocks(nr, 1024, first)])
+        bb = BITS_CFG[0] if FAST_BITS else 1024
+        blk, rblk = _pack(dev, [_blocks(nv, 4096), _blocks(nr, bb, first)])
         img_of = blk[:, 0]
         scale, clip = batch["scale"], batch["clip"]
         n = batch["num_values"].double()
@@ -559,7 +606,8 @@ class SparseVolumes:
         words = -(-sum(vox) // 32) + 1
         self.bits = torch.zeros(words, device=dev, dtype=torch.int32)
         cnt = torch.zeros(words, device=dev, dtype=torch.int32)
-        _bits_kernel[(len(rblk),)](runs, ends, rblk, self.bits, cnt, BLOCK=1024)
+        _bits_kernel[(len(rblk),)](runs, ends, rblk, self.bits, cnt, BLOCK=bb, FULL=FAST_BITS,
+                                   num_warps=BITS_CFG[1] if FAST_BITS else 4)
         self.pre = cnt.cumsum(0, dtype=torch.int32) - cnt
         # per image ras geometry: ras shape and the ras voxel -> global voxel map (const + coef . r)
         self.ras, self.const, self.coef, self.spacing = [], [], [], []
@@ -607,7 +655,7 @@ class SparseVolumes:
         self.tf = plan["par"].contiguous()
         self.knots = plan["knots"].contiguous()
 
-    def gather(self, specs: list[tuple]) -> list[tuple]:
+    def gather(self, specs: list[tuple], cfg: tuple = (512, 4)) -> list[tuple]:
         # specs (group, tok, rimg, rows per image, lesion) -> (image, mask, lesion | None) [R, P] each, in one kernel
         tab, rimg_off, toks, rimgs, r0, o0, n_img = [], [], [], [], 0, 0, 0
         for G, tok, rimg, per_img, _ in specs:
@@ -629,7 +677,8 @@ class SparseVolumes:
         _gather_kernel[(r0,)](
             tab, len(specs), tok, rimg, self.geo, self.nrm, self.bits, self.pre, self.vals,
             self.mass if tumor else d, self.ti if tumor else d, self.tf if tumor else d, self.knots if tumor else d,
-            img, msk, les, (self.knots.shape[2] // 5) if tumor else 1, TUMOR=tumor, LES=lesion, BLOCK=512,
+            img, msk, les, (self.knots.shape[2] // 5) if tumor else 1, img, img, 0, 1, TUMOR=tumor, LES=lesion, BLOCK=cfg[0],
+            num_warps=cfg[1],
         )
         out, o0 = [], 0
         for G, tok, _, _, want in specs:
@@ -657,6 +706,12 @@ class SparseGroup:
         return self.vol.gather([(self, tok, rimg, per_img, lesion)])[0]
 
 
+# FAST_FRAC (speed): _frac_kernel's line counts from the line's (<= 2) bitmap words, not two prefix ranks, and its
+# tile / warps FRAC_CFG (TB, LB, num_warps) (the same exact counts)
+FAST_FRAC = False
+FRAC_CFG = (32, 4, 4)
+
+
 def frac_all(vol: "SparseVolumes", groups: list[SparseGroup]) -> list[Tensor]:
     # every group's per token in-mask fraction [n, num] in one kernel
     tab, rimg, t0 = [], [], 0
@@ -667,7 +722,10 @@ def frac_all(vol: "SparseVolumes", groups: list[SparseGroup]) -> list[Tensor]:
         t0 += len(G.ids) * G.num
     tab, rimg = _pack(vol.device, [tab, rimg])
     out = torch.empty(t0, device=vol.device, dtype=torch.float32)
-    _frac_kernel[(triton.cdiv(t0, 32),)](tab, len(groups), rimg, vol.geo, vol.line, vol.bits, vol.pre, out, t0, TB=32, LB=32)
+    short = FAST_FRAC and max(max(G.patch) for G in groups) <= 32
+    tb, lb, nw = FRAC_CFG if FAST_FRAC else (32, 32, 4)
+    _frac_kernel[(triton.cdiv(t0, tb),)](tab, len(groups), rimg, vol.geo, vol.line, vol.bits, vol.pre, out, t0, TB=tb, LB=lb,
+                                         SHORT=short, num_warps=nw)
     return [o.view(len(G.ids), G.num) for o, G in zip(out.split([len(G.ids) * G.num for G in groups]), groups)]
 
 
@@ -682,3 +740,394 @@ def sparse_batch_transform(batch: dict, target_spacing: float = 1.0) -> dict:
     if "subject" in samples[0]:
         out["subject"] = torch.tensor([s["subject"] for s in samples], dtype=torch.int64)
     return out
+
+
+# FAST_TOK (speed, model.native_tokens): after the sequence orders, every spacing group's sequence rows, unified
+# swaps, corruptions and level / lesion targets as a few launches over flat buffers (the per group torch ops of the
+# loop + rtd_replace + corrupt_all + finish + flat_loss before; the same values)
+FAST_TOK = False
+GATHER_CFG = (32, 1)  # the sequence gather's BLOCK, num_warps (any: per voxel math)
+# FAST_POOL (speed, with FAST_TOK): the level targets' 0/1 channels in one batched dot per row block (exact sums)
+FAST_POOL = False
+POOL_CFG = (8, 64, 4)  # its rows per program, k block, num_warps
+
+
+# IEEE fp32 ops as their own ptx instructions (round to nearest, subnormals kept, no fma contraction): torch's
+# elementwise kernels' results bit for bit (libdevice's *_rn flush subnormals under triton's ftz reflect)
+@triton.jit
+def _add(a, b):
+    return tl.inline_asm_elementwise("add.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _sub(a, b):
+    return tl.inline_asm_elementwise("sub.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _mul(a, b):
+    return tl.inline_asm_elementwise("mul.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _div(a, b):
+    return tl.inline_asm_elementwise("div.rn.f32 $0, $1, $2;", "=r,r,r", [a, b], dtype=tl.float32, is_pure=True, pack=1)
+
+
+@triton.jit
+def _qkeys_kernel(vb, koff, lens, vis, msk, keys, cnt, BLOCK: tl.constexpr):
+    # rtd_replace's row_quantiles sort keys: a row's visible values in its brain mask (> 0.5), +inf elsewhere, at
+    # koff (rows of a length one after another: each length class a [rows, length] view), and its in-mask count
+    r = tl.program_id(0)
+    i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    ok = i < tl.load(lens + r)
+    o = tl.load(vb + r) + i
+    x = tl.load(vis + o, mask=ok, other=0.0)
+    m = tl.load(msk + o, mask=ok, other=0.0) > 0.5
+    tl.store(keys + tl.load(koff + r) + i, tl.where(m, x, float("inf")), mask=ok)
+    tl.atomic_add(cnt + r, tl.sum((m & ok).to(tl.int32), axis=0))
+
+
+@triton.jit(do_not_specialize=["V"])
+def _tokmin_kernel(rbase, rp, vis, msk, tmin, V, BLOCK: tl.constexpr):
+    # each visible token's minimum over its in-mask voxels (+inf without one): their row minimum is corrupt_all's lo
+    t = tl.program_id(0)
+    r = t // V
+    P = tl.load(rp + r)
+    base = tl.load(rbase + r) + (t % V).to(tl.int64) * P
+    mn = tl.full([BLOCK], float("inf"), tl.float32)
+    for q0 in range(0, P, BLOCK):
+        q = q0 + tl.arange(0, BLOCK)
+        qm = q < P
+        x = tl.load(vis + base + q, mask=qm, other=0.0)
+        m = tl.load(msk + base + q, mask=qm, other=0.0)
+        mn = tl.minimum(mn, tl.where(qm & (m > 0), x, float("inf")))
+    tl.store(tmin + t, tl.min(mn, axis=0))
+
+
+@triton.jit(do_not_specialize=["K", "V"])
+def _rtd_kernel(grow, vb, prs, pb, prow, cand, labels, q, p_img, p_msk, vis, msk, done, K, V,
+                NQ: tl.constexpr, BLOCK: tl.constexpr):
+    # rtd_replace (unified swap) of candidate c of row r2: the partner patch (>= 50% brain) quantile mapped to the
+    # host row's quantiles into the visible row in place where the label selects it, and done
+    pid = tl.program_id(0)
+    r2 = pid // K
+    c = pid % K
+    r = tl.load(grow + r2)
+    P = tl.load(prs + r2)
+    cd = tl.load(cand + r * K + c)
+    sel = tl.load(labels + r * V + cd) == 1
+    pbase = tl.load(pb + r2) + c.to(tl.int64) * P
+    n = tl.zeros([BLOCK], dtype=tl.int32)
+    for q0 in range(0, P, BLOCK):
+        qq = q0 + tl.arange(0, BLOCK)
+        n += (tl.load(p_msk + pbase + qq, mask=qq < P, other=0.0) > 0).to(tl.int32)
+    rep = sel & (2 * tl.sum(n, axis=0) >= P)
+    tl.store(done + r * V + cd, rep.to(tl.int8))
+    if rep:
+        qp = q + tl.load(prow + r2) * NQ
+        qh = q + r2 * NQ
+        vbase = tl.load(vb + r2) + cd * P
+        for q0 in range(0, P, BLOCK):
+            qq = q0 + tl.arange(0, BLOCK)
+            qm = qq < P
+            x = tl.load(p_img + pbase + qq, mask=qm, other=0.0)
+            pm = tl.load(p_msk + pbase + qq, mask=qm, other=0.0)
+            pos = tl.zeros([BLOCK], dtype=tl.int32)
+            for i in tl.static_range(NQ):
+                pos += (tl.load(qp + i) < x).to(tl.int32)
+            pos = tl.minimum(tl.maximum(pos, 1), NQ - 1)
+            lo = tl.load(qp + pos - 1)
+            hi = tl.load(qp + pos)
+            hl = tl.load(qh + pos - 1)
+            hh = tl.load(qh + pos)
+            t = _div(_sub(x, lo), _sub(hi, lo))
+            t = tl.where(t != t, t, tl.minimum(tl.maximum(t, 0.0), 1.0))
+            y = _add(hl, _mul(t, _sub(hh, hl)))
+            tl.store(vis + vbase + qq, y, mask=qm)
+            tl.store(msk + vbase + qq, pm, mask=qm)
+
+
+@triton.jit(do_not_specialize=["G", "T", "C0"])
+def _pool_all_kernel(gtab, G, x, m, les, thr, out, T, C0, BR: tl.constexpr, BK: tl.constexpr, NB: tl.constexpr,
+                     SUB: tl.constexpr, NC: tl.constexpr):
+    # _pool_kernel over every group's token rows (the same per row block math) + pool_targets' bin length divisions.
+    # group table rows (NC 8 + 3 SUB): first row block, rows, P, kb / kf pointers, first voxel, first output row,
+    # lesion (0 / 1), the bin lengths along x, y, z
+    rb = tl.program_id(0)
+    c = tl.program_id(1) + C0
+    gp = gtab + _group_of(rb, gtab, G, NC, 0) * NC
+    R = tl.load(gp + 1)
+    P = tl.load(gp + 2)
+    kb = tl.load(gp + 3).to(tl.pointer_type(tl.bfloat16))
+    kf = tl.load(gp + 4).to(tl.pointer_type(tl.float32))
+    x0 = tl.load(gp + 5)
+    rows = (rb - tl.load(gp)) * BR + tl.arange(0, BR)
+    rm = rows < R
+    acc = tl.zeros([BR, NB], dtype=tl.float32)
+    t = tl.load(thr + tl.maximum(c - 1, 0), mask=(c >= 1) & (c <= T), other=0.0)
+    if (c <= T) | (tl.load(gp + 7) != 0):
+        for k0 in range(0, P, BK):
+            ks = k0 + tl.arange(0, BK)
+            km = ks < P
+            o = x0 + rows[:, None] * P + ks[None, :]
+            lm = rm[:, None] & km[None, :]
+            mv = tl.load(m + o, mask=lm, other=0.0)
+            if c == T + 1:
+                a = tl.load(les + o, mask=lm, other=0.0) * mv
+                kf_ = tl.load(kf + ks[:, None] * NB + tl.arange(0, NB)[None, :], mask=km[:, None], other=0.0)
+                acc += tl.dot(a, kf_, input_precision="tf32x3")
+            else:
+                if c > 0:
+                    mv = tl.where(tl.load(x + o, mask=lm, other=0.0) > t, mv, 0.0)
+                kb_ = tl.load(kb + ks[:, None] * NB + tl.arange(0, NB)[None, :], mask=km[:, None], other=0.0)
+                acc += tl.dot(mv.to(tl.bfloat16), kb_)
+    nb = tl.arange(0, NB)
+    lx = tl.load(gp + 8 + nb // (SUB * SUB)).to(tl.float32)
+    ly = tl.load(gp + 8 + SUB + (nb // SUB) % SUB).to(tl.float32)
+    lz = tl.load(gp + 8 + 2 * SUB + nb % SUB).to(tl.float32)
+    acc = _div(_div(_div(acc, lx[None, :] + tl.zeros_like(acc)), ly[None, :] + tl.zeros_like(acc)), lz[None, :] + tl.zeros_like(acc))
+    oo = ((tl.load(gp + 6) + rows[:, None]) * (T + 2) + c) * NB + nb[None, :]
+    tl.store(out + oo, acc, mask=rm[:, None])
+
+
+@triton.jit(do_not_specialize=["G", "T"])
+def _pool_exact_kernel(gtab, G, x, m, thr, out, T, BR: tl.constexpr, BK: tl.constexpr, NB: tl.constexpr,
+                       SUB: tl.constexpr, NC: tl.constexpr, TC: tl.constexpr):
+    # FAST_POOL: _pool_all_kernel's 0/1 channels (mask, (x > thr_t) x mask; exact integer bin sums) of BR rows in one
+    # dot of the channels stacked along the rows (x and the mask read once, not once per channel); the table's row
+    # blocks are of 64 rows
+    pid = tl.program_id(0)
+    rb = pid // (64 // BR)
+    gp = gtab + _group_of(rb, gtab, G, NC, 0) * NC
+    R = tl.load(gp + 1)
+    P = tl.load(gp + 2)
+    kb = tl.load(gp + 3).to(tl.pointer_type(tl.bfloat16))
+    x0 = tl.load(gp + 5)
+    rows = (rb - tl.load(gp)) * 64 + (pid % (64 // BR)) * BR + tl.arange(0, BR)
+    rm = rows < R
+    ch = tl.arange(0, TC)
+    t = tl.load(thr + tl.maximum(ch - 1, 0), mask=(ch >= 1) & (ch <= T), other=0.0)
+    acc = tl.zeros([TC * BR, NB], dtype=tl.float32)
+    for k0 in range(0, P, BK):
+        ks = k0 + tl.arange(0, BK)
+        km = ks < P
+        o = x0 + rows[:, None] * P + ks[None, :]
+        lm = rm[:, None] & km[None, :]
+        mv = tl.load(m + o, mask=lm, other=0.0)
+        xv = tl.load(x + o, mask=lm, other=0.0)
+        a = tl.where((ch[:, None, None] == 0) | (xv[None, :, :] > t[:, None, None]), mv[None, :, :], 0.0)
+        kb_ = tl.load(kb + ks[:, None] * NB + tl.arange(0, NB)[None, :], mask=km[:, None], other=0.0)
+        acc += tl.dot(tl.reshape(a.to(tl.bfloat16), (TC * BR, BK)), kb_)
+    acc = tl.reshape(acc, (TC, BR, NB))
+    nb = tl.arange(0, NB)
+    lx = tl.load(gp + 8 + nb // (SUB * SUB)).to(tl.float32)
+    ly = tl.load(gp + 8 + SUB + (nb // SUB) % SUB).to(tl.float32)
+    lz = tl.load(gp + 8 + 2 * SUB + nb % SUB).to(tl.float32)
+    z = tl.zeros_like(acc)
+    acc = _div(_div(_div(acc, lx[None, None, :] + z), ly[None, None, :] + z), lz[None, None, :] + z)
+    oo = ((tl.load(gp + 6) + rows[None, :, None]) * (T + 2) + ch[:, None, None]) * NB + nb[None, None, :]
+    tl.store(out + oo, acc, mask=rm[None, :, None] & (ch[:, None, None] <= T))
+
+
+def _bins(size: int, sub: int) -> list[int]:
+    # pool_kron's adaptive bin lengths along one axis
+    return [-((-(i + 1) * size) // sub) - (i * size) // sub for i in range(sub)]
+
+
+def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tensor, uni: tuple, geoms: dict,
+                S: int, V: int, NP: int) -> list[dict]:
+    # native_tokens' sparse loop + corrupt_all + finish + flat_loss for the unified / level / lesion setup, batched
+    dev = vol.device
+    seq = V + NP
+    cand, labels, kind = uni
+    K = cand.shape[1]
+    T = model.level_thresholds.numel()
+    sub = model.patch_size[0] // model.level_pool
+    NB = sub**3
+    nq = model.rtd_quantiles + 1
+    min_vox = max(2, model.patch_size[0] // 2)
+    gs, r0, vb, tb = [], 0, 0, 0
+    for p in parts:
+        G = p["vols"]
+        b = len(p["ids"])
+        rows = b * S
+        gs.append(dict(G=G, b=b, rows=rows, r0=r0, vb=vb, tb=tb, P=G.P, les=p.pop("sparse_les", False)))
+        r0, vb, tb = r0 + rows, vb + rows * V * G.P, tb + rows * NP * G.P
+    R = r0
+    tumor = vol.mass is not None
+    lesion = tumor and any(g["les"] for g in gs)
+    f32 = dict(device=dev, dtype=torch.float32)
+    vimg, vmsk = torch.empty(vb, **f32), torch.empty(vb, **f32)
+    vles = torch.empty(vb, **f32) if lesion else vimg
+    timg, tw = torch.empty(tb, **f32), torch.empty(tb, **f32)
+    tmin = torch.empty(R * V, **f32)
+    out = torch.empty(vb, **f32)
+    pooled = torch.empty(R * V, T + 2, NB, **f32)
+    # host tables: sequence gather, coord row offsets, pool, corrupt; rtd ones below
+    gtab, rimg, coff, ptab, ctab, n0, nimg, blk, rbase, rp = [], [], [], [], [], 0, 0, 0, [], []
+    kb_kf = {}
+    for g in gs:
+        G = g["G"]
+        (_, gy, gz) = G.grid
+        gtab.append([g["r0"] * seq, G.P, *G.patch, gy, gz, S * seq, nimg, g["vb"], g["tb"], int(g["les"]),
+                     int((np.float32(1.0) / np.float32(G.P)).view(np.int32))])
+        rbase += [g["vb"] + i * V * G.P for i in range(g["rows"])]
+        rp += [G.P] * g["rows"]
+        rimg += G.ids
+        nimg += len(G.ids)
+        coff += [n0] * g["rows"]
+        n0 += G.num
+        if G.patch not in kb_kf:
+            kb_kf[G.patch] = _pool_mats(G.patch, sub, dev)[:2]
+        kb, kf = kb_kf[G.patch]
+        lens = [v for size in G.patch for v in _bins(size, sub)]
+        ptab.append([blk, g["rows"] * V, G.P, kb.data_ptr(), kf.data_ptr(), g["vb"], g["r0"] * V,
+                     int(g["les"] and lesion), *lens])
+        blk += triton.cdiv(g["rows"] * V, 64)
+        ks = [2 if p_ >= min_vox else 1 for p_ in G.patch]
+        o = 4 * g["vb"]
+        ctab.append([g["r0"] * K, V, K, G.P, *G.patch, *ks, vimg.data_ptr() + o, vmsk.data_ptr() + o, out.data_ptr() + o,
+                     g["r0"]])
+    # rtd rows (groups of >= 2 images): partner rows of the next image, same sample index
+    two = sorted((g for g in gs if g["b"] >= 2), key=lambda g: g["P"])
+    grow, rvb, rps, rpb, prow, rlen, pspecs, pb, s2 = [], [], [], [], [], [], [], 0, 0
+    for g in two:
+        b, P = g["b"], g["P"]
+        for rl in range(g["rows"]):
+            grow.append(g["r0"] + rl)
+            rvb.append(g["vb"] + rl * V * P)
+            rps.append(P)
+            rpb.append(pb + rl * K * P)
+            prow.append(s2 + (rl // S + 1) % b * S + rl % S)
+            rlen.append(V * P)
+        s2 += g["rows"]
+        pb += g["rows"] * K * P
+        ids = g["G"].ids
+        pspecs.append(ids[1:] + ids[:1])
+    rlen_ = rlen
+    koff_ = np.cumsum([0] + rlen[:-1]).tolist() if rlen else []
+    tabs = _pack(dev, [gtab, rimg, coff, ptab, ctab, rbase, rp, grow, rvb, rps, rpb, prow, rlen, koff_, *pspecs])
+    gtab, rimg, coff, ptab, ctab, rbase, rp, grow, rvb, rps, rpb, prow, rlen, koff, *prims = tabs
+    d = vol.bits
+    _gather_kernel[(R * seq,)](
+        gtab, len(gs), order_all.reshape(-1) if order_all.is_contiguous() else order_all.contiguous().view(-1),
+        rimg, vol.geo, vol.nrm, vol.bits, vol.pre, vol.vals,
+        vol.mass if tumor else d, vol.ti if tumor else d, vol.tf if tumor else d, vol.knots if tumor else d,
+        vimg, vmsk, vles, (vol.knots.shape[2] // 5) if tumor else 1, timg, tw, V, seq,
+        TUMOR=tumor, LES=lesion, BLOCK=GATHER_CFG[0], SPLIT=True, NC=13, num_warps=GATHER_CFG[1],
+    )
+    # token centres: every group's table in one gather
+    ctr = geoms[parts[0]["spacing"]][3][0] if len(parts) == 1 else torch.cat([geoms[p["spacing"]][3][0] for p in parts])
+    coord = ctr[order_all + coff[:, None]]
+    if two:
+        # partner rows, quantile keys + one sort, the mapping in place
+        vo = order_all[:, :V].gather(1, cand)
+        pg = vol.gather([(g["G"], vo[g["r0"] : g["r0"] + g["rows"]], pr, S * K, False) for g, pr in zip(two, prims)],
+                        GATHER_CFG)
+        # (gather's outputs are views of one buffer each, groups in order)
+        p_img, p_msk = (torch.as_strided(t, (pb,), (1,)) for t in pg[0][:2])
+        # (rows of one patch size are adjacent here (two by P), and so are their sort keys)
+        qs = torch.linspace(0, 1, nq, device=dev)
+        keys = torch.empty(sum(rlen_), **f32)
+        cnt = torch.zeros(s2, device=dev, dtype=torch.int32)
+        _qkeys_kernel[(s2, triton.cdiv(max(rlen_), 4096))](rvb, koff, rlen, vimg, vmsk, keys, cnt, BLOCK=4096)
+        cnt = cnt.long().clamp_min(1)
+        idx = (qs[None] * (cnt[:, None] - 1).float()).round().long()
+        qv, a = [], 0
+        for P in sorted({g["P"] for g in two}):
+            n = sum(g["rows"] for g in two if g["P"] == P)
+            k0 = koff_[a]
+            qv.append(keys[k0 : k0 + n * V * P].view(n, V * P).sort(dim=1).values.gather(1, idx[a : a + n]))
+            a += n
+        qv = qv[0] if len(qv) == 1 else torch.cat(qv)
+        qv = torch.where(torch.isfinite(qv), qv, torch.zeros_like(qv))
+        qv = (qv + 1e-5 * torch.arange(nq, device=dev)[None]).contiguous()
+        done = torch.zeros(R, V, device=dev, dtype=torch.int8)
+        _rtd_kernel[(s2 * K,)](grow, rvb, rps, rpb, prow, cand, labels.contiguous(), qv, p_img, p_msk, vimg, vmsk, done,
+                               K, V, NQ=nq, BLOCK=512)
+        labels = torch.where((labels == 1) & ~done.bool(), 0, labels)
+    else:
+        labels = torch.where(labels == 1, 0, labels)
+    # corruptions (corrupt_all's kernel, the row minima from the token minima)
+    out.copy_(vimg)
+    _tokmin_kernel[(R * V,)](rbase, rp, vimg, vmsk, tmin, V, BLOCK=512)
+    lo = tmin.view(R, V).amin(1)
+    lo = torch.where(lo < float("inf"), lo, 0.0)
+    bf16 = torch.is_autocast_enabled(dev.type) and torch.get_autocast_dtype(dev.type) == torch.bfloat16
+    seed = int(torch.randint(0, 2**30, (1,)).item())
+    _corrupt_kernel[(R * K,)](ctab, len(gs), cand, kind, lo, seed, CB=512, BF16=bf16)
+    # level + lesion targets (pool_targets), the token weights
+    thr = model.level_thresholds.float().contiguous()
+    if FAST_POOL:
+        br, bk, nw = POOL_CFG
+        _pool_exact_kernel[(blk * (64 // br),)](ptab, len(gs), out, vmsk, thr, pooled, T, BR=br, BK=bk, NB=NB, SUB=sub,
+                                                NC=8 + 3 * sub, TC=triton.next_power_of_2(T + 1), num_warps=nw)
+    _pool_all_kernel[(blk, 1 if FAST_POOL else T + 2)](ptab, len(gs), out, vmsk, vles, thr, pooled, T,
+                                                       T + 1 if FAST_POOL else 0, BR=64, BK=64, NB=NB, SUB=sub,
+                                                       NC=8 + 3 * sub)
+    pooled = pooled.view(R * V, T + 2, sub, sub, sub)
+    w = pooled[:, :1]
+    lvl_t = pooled[:, 1 : 1 + T] / w.clamp_min(1e-6)
+    w = w.flatten(1)
+    altered = (labels > 0).bool()
+    keep = ~altered.reshape(-1, 1)
+    les_w = torch.where(keep, w, 0.0)
+    les_t = torch.where(keep, pooled[:, 1 + T].flatten(1) / w.clamp_min(1e-6), 0.0)
+    syn = ~altered
+    for p, g, order in zip(parts, gs, order_all.split([g["rows"] for g in gs])):
+        a, z, P = g["r0"], g["r0"] + g["rows"], g["P"]
+        del p["vols"], p["scores"]
+        p.pop("lesion", None)
+        p["order"] = order.unflatten(0, (g["b"], S))
+        p["unified_label"] = labels[a:z]
+        p["vis_coord"], p["target_coord"] = coord[a:z].split([V, NP], 1)
+        p["vis_tok"] = out[g["vb"] : g["vb"] + g["rows"] * V * P].view(g["rows"], V, P)
+        p["lvl_w"], p["lvl_t"] = pooled[a * V : z * V, :1], lvl_t[a * V : z * V]
+        p["syn_clean"] = syn[a:z]
+        p["les_w"], p["les_t"] = les_w[a * V : z * V], les_t[a * V : z * V]
+    parts[0]["flat_w"], parts[0]["flat_t"] = tw, timg
+    return parts
+
+
+
+# FAST_SCORES (speed, model.native_tokens): sequence_scores' masking (>= min_mask_frac else 2.0) and the 3.0 / 0.0
+# padded scores / mask fraction rows of every group in one launch (per group where + copies before; the same values)
+FAST_SCORES = False
+
+
+@triton.jit(do_not_specialize=["G", "N", "S"])
+def _scores_kernel(tab, G, frac, sc, fr, N, S, lo, BLOCK: tl.constexpr):
+    # group table rows (NC 5): first sequence row, tokens, rand pointer, first fraction element, first image
+    row = tl.program_id(0)
+    gp = tab + _group_of(row, tab, G, 5, 0) * 5
+    loc = row - tl.load(gp)
+    n = tl.load(gp + 1)
+    rnd = tl.load(gp + 2).to(tl.pointer_type(tl.float32))
+    img = loc // S
+    c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    cm = c < N
+    inb = c < n
+    f = tl.load(frac + tl.load(gp + 3) + img * n + c, mask=inb, other=0.0)
+    r = tl.load(rnd + loc.to(tl.int64) * n + c, mask=inb, other=0.0)
+    tl.store(sc + row.to(tl.int64) * N + c, tl.where(inb, tl.where(f >= lo, r, 2.0), 3.0), mask=cm)
+    if loc % S == 0:
+        tl.store(fr + (tl.load(gp + 4) + img).to(tl.int64) * N + c, tl.where(inb, f, 0.0), mask=cm)
+
+
+def pad_scores(parts: list[dict], S: int, min_frac: float) -> tuple[Tensor, Tensor]:
+    # parts' "rand" [b, S, n] + mask_frac [b, n] (views of frac_all's buffer) -> scores [rows, N], frac [B, N]
+    tab, r0, f0, i0 = [], 0, 0, 0
+    fr0 = parts[0]["mask_frac"]
+    N = max(p["mask_frac"].shape[1] for p in parts)
+    for p in parts:
+        b, n = p["mask_frac"].shape
+        tab.append([r0, n, p["rand"].data_ptr(), p["mask_frac"].data_ptr() // 4 - fr0.data_ptr() // 4, i0])
+        r0, i0 = r0 + b * S, i0 + b
+    (tab,) = _pack(fr0.device, [tab])
+    sc = torch.empty(r0, N, device=fr0.device, dtype=torch.float32)
+    fr = torch.empty(i0, N, device=fr0.device, dtype=torch.float32)
+    _scores_kernel[(r0, triton.cdiv(N, 1024))](tab, len(parts), fr0, sc, fr, N, S, min_frac, BLOCK=1024)
+    for p in parts:
+        p.pop("rand")
+    return sc, fr

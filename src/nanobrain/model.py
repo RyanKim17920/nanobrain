@@ -1858,12 +1858,20 @@ class ViTMAE3D(nn.Module):
 
             svols = {sp: sparse.group(sp, ids, geoms[sp][0], geoms[sp][2]) for sp, ids in groups.items()}
             sfrac = dict(zip(svols, frac_all(sparse, list(svols.values()))))
+        from . import sparse as sparse_mod
+
+        fast_scores = sparse is not None and sparse_mod.FAST_SCORES
         for sp, ids in groups.items():
             patch, box, grid, _ = geoms[sp]
             if sparse is not None:
                 vols, mask_frac = svols[sp], sfrac[sp]
-                scores = sequence_scores(None, num_samples, self.min_mask_frac, mask_frac=mask_frac)
                 parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols, "grid": grid})
+                if fast_scores:
+                    # FAST_SCORES: sequence_scores' draws here, its masking + the padding below in one launch
+                    scores = torch.rand(len(ids), num_samples, mask_frac.shape[1], device=mask_frac.device)
+                    parts[-1]["rand"] = scores
+                else:
+                    scores = sequence_scores(None, num_samples, self.min_mask_frac, mask_frac=mask_frac)
                 parts[-1].update(scores=scores.flatten(0, 1), mask_frac=mask_frac)
                 if self.lesion_head is not None and self.training:
                     parts[-1]["lesion"] = None
@@ -1925,7 +1933,10 @@ class ViTMAE3D(nn.Module):
         num_tokens = [part["scores"].shape[1] for part in parts]
         num_rows = [part["scores"].shape[0] for part in parts]
         assert min(num_tokens) >= seq_length
-        if len(parts) == 1:
+        fpad = None
+        if fast_scores:
+            scores, fpad = sparse_mod.pad_scores(parts, num_samples, self.min_mask_frac)
+        elif len(parts) == 1:
             scores = parts[0]["scores"]
         else:
             scores = parts[0]["scores"].new_full((sum(num_rows), max(num_tokens)), 3.0)
@@ -1944,11 +1955,13 @@ class ViTMAE3D(nn.Module):
         ):
             # batched_unified (speed): unified_transform's candidate / class draws for every group's rows at once
             # (the eligibility from the lazy mask fractions = the visible mask rows' means); rtd swaps stay per group
-            frac = parts[0]["mask_frac"].new_zeros((sum(len(part["ids"]) for part in parts), max(num_tokens)))
-            img = 0
-            for part, num in zip(parts, num_tokens):
-                frac[img : img + len(part["ids"]), :num] = part.pop("mask_frac")
-                img += len(part["ids"])
+            frac = fpad
+            if frac is None:
+                frac = parts[0]["mask_frac"].new_zeros((sum(len(part["ids"]) for part in parts), max(num_tokens)))
+                img = 0
+                for part, num in zip(parts, num_tokens):
+                    frac[img : img + len(part["ids"]), :num] = part.pop("mask_frac")
+                    img += len(part["ids"])
             vis_order = order_all[:, :num_visible]
             row_img = torch.arange(order_all.shape[0], device=device) // num_samples
             ok = frac[row_img].gather(1, vis_order) >= 0.5
@@ -1959,6 +1972,15 @@ class ViTMAE3D(nn.Module):
             uni = [t.split(num_rows) for t in (cand, labels, kind)]
         for part in parts:
             part.pop("mask_frac", None)
+        if (
+            sparse is not None and uni is not None and sparse_mod.FAST_TOK and self.flat_loss_ok()
+            and getattr(self, "batched_level", False) and self.level_head is not None and self.lesion_head is not None
+            and self.corrupt_head is None and self.orient_head is None and self.edgelvl_head is None
+        ):
+            # FAST_TOK (speed): the rest below as a few batched launches over flat buffers (sparse.fast_tokens)
+            return sparse_mod.fast_tokens(
+                self, sparse, parts, order_all, (cand, labels, kind), geoms, num_samples, num_visible, num_predict
+            )
 
         def finish(part, order, num, vols, coord, b, vis_patches, vis_mask):
             # a group's tokenization after its unified corruption (split out so batched_corrupt can apply
