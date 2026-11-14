@@ -986,7 +986,7 @@ class ViTMAE3D(nn.Module):
     @torch.no_grad()
     def rtd_replace(
         self, vis_patches: Tensor, vis_mask: Tensor, order: Tensor, vols: Tensor, b: int, num: int,
-        num_samples: int, num_visible: int, select: Tensor | None = None,
+        num_samples: int, num_visible: int, select: Tensor | None = None, cand: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Swap a rtd_ratio share of the visible patches of every row for the patch at the same
         token coordinate of the next image of the group (rolled by one), quantile matched to the
@@ -996,9 +996,18 @@ class ViTMAE3D(nn.Module):
         vis_order = order[:, :num_visible]  # [rows, V], token ids of the host
         partner_img = (torch.arange(b, device=order.device) + 1) % b
         partner_img = partner_img.repeat_interleave(num_samples)  # [rows]
-        flat = vis_order + (partner_img * num)[:, None]
-        p_patches = vols[0].flatten(0, 1).index_select(0, flat.flatten()).view_as(vis_patches)
-        p_mask = vols[1].flatten(0, 1).index_select(0, flat.flatten()).view_as(vis_patches)
+        sub = type(vols).__name__ == "SparseGroup" and cand is not None and select is not None
+        if sub:
+            # native_sparse_tokens: select is False off the candidates cand [rows, k]: only those partners
+            full, vis_order, select = select, vis_order.gather(1, cand), select.gather(1, cand)
+        if type(vols).__name__ == "SparseGroup":
+            # native_sparse_tokens: the partner rows gathered from the values / bitmap
+            p_patches, p_mask, _ = vols.gather(vis_order, vols.rimg.roll(-1), num_samples * vis_order.shape[1])
+            p_patches, p_mask = p_patches.view(rows, vis_order.shape[1], -1), p_mask.view(rows, vis_order.shape[1], -1)
+        else:
+            flat = vis_order + (partner_img * num)[:, None]
+            p_patches = vols[0].flatten(0, 1).index_select(0, flat.flatten()).view_as(vis_patches)
+            p_mask = vols[1].flatten(0, 1).index_select(0, flat.flatten()).view_as(vis_patches)
         # the partner patch must be brain tissue too (half its voxels in its brain mask)
         ok = p_mask.float().mean(-1) >= 0.5
         if select is None:
@@ -1031,6 +1040,13 @@ class ViTMAE3D(nn.Module):
         mapped = q_host.gather(1, pos - 1) + t * (q_host.gather(1, pos) - q_host.gather(1, pos - 1))
         mapped = mapped.view_as(p_patches).to(vis_patches.dtype)
         sel = replaced[..., None]
+        if sub:
+            idx = cand[..., None].expand(-1, -1, p_patches.shape[-1])
+            return (
+                vis_patches.scatter(1, idx, torch.where(sel, mapped, vis_patches.gather(1, idx))),
+                vis_mask.scatter(1, idx, torch.where(sel, p_mask, vis_mask.gather(1, idx))),
+                torch.zeros_like(full).scatter(1, cand, replaced),
+            )
         return (
             torch.where(sel, mapped, vis_patches),
             torch.where(sel, p_mask, vis_mask),
@@ -1781,7 +1797,7 @@ class ViTMAE3D(nn.Module):
         # native_prep_tokens: forward_native's weight-free tokenization of a batch (run in a prep thread,
         # under the training autocast), passed back as forward(prepared=...). lims: per image in-mask
         # (min, max) if known (native_worker_clip), else plan_tumors computes them
-        groups, geoms = self.native_groups(spacing, images[0].device)
+        groups, geoms = self.native_groups(spacing, images.device if type(images).__name__ == "SparseVolumes" else images[0].device)
         parts = self.native_tokens(images, mask, groups, geoms, num_visible, num_predict, num_samples, lims=lims)
         return {"groups": groups, "geoms": geoms, "parts": parts}
 
@@ -1792,16 +1808,39 @@ class ViTMAE3D(nn.Module):
         # forward_native's tokenization (no weights): tumour paste, patchify, sequences, token corruptions,
         # per group; each part keeps its visible patches as "vis_tok" for the patch embedding
         seq_length = num_visible + num_predict
-        device = images[0].device
+        # native_sparse_tokens (speed): images is a sparse.SparseVolumes (no dense volumes); the same token values
+        sparse = images if type(images).__name__ == "SparseVolumes" else None
+        if sparse is not None:
+            assert (
+                self.level_mirror_head is None and self.brainpos_head is None and self.hemiswap_head is None
+                and not self.blob_prob > 0 and not self.tumor_one_view and not self.mask_cube and self.corrupt_kinds <= 5
+            ), "native_sparse_tokens: no mirror / brainpos / hemiswap / blob / one view / cube / extended2 corruptions"
+            sparse.geometry(groups, geoms)
+            images, mask = [torch.empty(sh, device="meta") for sh in sparse.ras], None
+        device = images[0].device if sparse is None else sparse.device
         tumors = {}
         if self.training and self.tumor_prob * self.tumor_scale > 0:
             tumors = plan_tumors(
-                images, mask, groups, geoms, self.tumor_prob * self.tumor_scale, self.tumor_radius, self.tumor_ring,
-                self.tumor_contrast, self.tumor_edge, self.tumor_nodule, neg=self.tumor_neg_prob, lims=lims,
+                images, mask if sparse is None else images, groups, geoms, self.tumor_prob * self.tumor_scale,
+                self.tumor_radius, self.tumor_ring, self.tumor_contrast, self.tumor_edge, self.tumor_nodule,
+                neg=self.tumor_neg_prob, lims=lims, sparse=sparse,
             )
+            if sparse is not None:
+                sparse.tumors(tumors)
+                owners, tumors = set(tumors.get("owners", ())), {}
         parts = []
         for sp, ids in groups.items():
             patch, box, grid, _ = geoms[sp]
+            if sparse is not None:
+                vols = sparse.group(ids, patch, grid)
+                mask_frac = vols.frac()
+                scores = sequence_scores(None, num_samples, self.min_mask_frac, mask_frac=mask_frac)
+                parts.append({"spacing": sp, "patch": patch, "ids": ids, "vols": vols, "grid": grid})
+                parts[-1].update(scores=scores.flatten(0, 1), mask_frac=mask_frac)
+                if self.lesion_head is not None and self.training:
+                    parts[-1]["lesion"] = None
+                    parts[-1]["sparse_les"] = bool(owners & set(ids))
+                continue
             # images and masks fit to the box (fit_to_shape) and padded up to whole patches, tiling
             # the box from its low corner, in one buffer
             padded = tuple(num * p for num, p in zip(grid, patch))
@@ -1927,7 +1966,9 @@ class ViTMAE3D(nn.Module):
             part["vis_coord"], part["target_coord"] = coord.split([num_visible, num_predict], 1)
             part["vis_tok"] = vis_patches
             lvl_pre = self.level_head is not None and self.training and getattr(self, "batched_level", False)
-            if lvl_pre:
+            # native_sparse_tokens: the level + lesion targets in one pooling kernel (sparse.pool_targets, below)
+            fused = lvl_pre and sparse is not None and self.level_mirror_head is None
+            if lvl_pre and not fused:
                 # batched_level: the level targets here (weight-free), one level head pass over all groups
                 part["lvl_w"], part["lvl_t"] = self.level_targets(vis_patches, vis_mask, patch)
             if (self.level_head is not None and not (lvl_pre and self.level_mirror_head is None)) or (
@@ -1942,7 +1983,7 @@ class ViTMAE3D(nn.Module):
                 altered = self.altered_tokens(part) if self.training else None
                 part["syn_clean"] = None if altered is None else ~altered
                 if "lesion" in part:
-                    if part["lesion"] is not None:
+                    if part["lesion"] is not None and not part.pop("lesion_vis", False):
                         part["lesion"] = part["lesion"].flatten(0, 1).index_select(0, vis_ids)
                         if self.tumor_one_view:
                             # views 1.. saw the clean volume: no lesion there (blobs are off with this flag)
@@ -1952,7 +1993,23 @@ class ViTMAE3D(nn.Module):
                     if altered is not None:
                         lm = vis_mask * ~altered[..., None]
                     part["lesion_mask"] = lm
-                    if lvl_pre:
+                    if fused:
+                        from .sparse import pool_targets
+
+                        les = part.pop("lesion")
+                        pooled = pool_targets(vis_patches, vis_mask, les, self.level_thresholds, patch, self.patch_size[0] // self.level_pool)
+                        T = self.level_thresholds.numel()
+                        w = pooled[:, :1]
+                        part["lvl_w"], part["lvl_t"] = w, pooled[:, 1 : 1 + T] / w.clamp_min(1e-6)
+                        w = w.flatten(1)
+                        keep = torch.ones_like(w[:, :1], dtype=torch.bool) if altered is None else ~altered.reshape(-1, 1)
+                        part.pop("lesion_mask")
+                        part["les_w"] = torch.where(keep, w, 0.0)
+                        part["les_t"] = (
+                            torch.zeros_like(w) if les is None
+                            else torch.where(keep, pooled[:, 1 + T].flatten(1) / w.clamp_min(1e-6), 0.0)
+                        )
+                    elif lvl_pre:
                         part["les_w"], part["les_t"] = self.lesion_targets(
                             part.pop("lesion"), part.pop("lesion_mask"), patch, pool=sep_pool
                         )
@@ -1970,10 +2027,18 @@ class ViTMAE3D(nn.Module):
             del part["scores"]
             b = len(part["ids"])
             part["order"] = order.unflatten(0, (b, num_samples))
-            # images and masks gathered together by flat token ids
-            flat_ids = part["order"] + gather_offsets(b, num, device)
-            patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
-            patches, mask_patches = patches.view(2, b * num_samples, seq_length, -1)
+            if sparse is not None:
+                # native_sparse_tokens: the rows straight from the values / bitmap (tumour pasted per voxel)
+                img, msk, les = vols.gather(part["order"], vols.rimg, num_samples * seq_length, part.pop("sparse_les", False))
+                patches, mask_patches = img.view(b * num_samples, seq_length, -1), msk.view(b * num_samples, seq_length, -1)
+                if les is not None:
+                    part["lesion"] = les.view(b, num_samples, seq_length, -1)[:, :, :num_visible].reshape(-1, les.shape[-1])
+                    part["lesion_vis"] = True
+            else:
+                # images and masks gathered together by flat token ids
+                flat_ids = part["order"] + gather_offsets(b, num, device)
+                patches = vols.flatten(0, 2).index_select(0, flat_ids.flatten())
+                patches, mask_patches = patches.view(2, b * num_samples, seq_length, -1)
             if "clean_img" in part:
                 # tumor_one_view: views 1.. of every image read the clean (pre-paste) volume
                 # flat_ids [2, b, S, seq] (image | mask rows): the image half indexes the [b * num] clean rows
@@ -2005,7 +2070,8 @@ class ViTMAE3D(nn.Module):
                 cand, labels, kind = (t[gi] for t in uni)
                 if b >= 2:
                     vis_patches, vis_mask, done = self.rtd_replace(
-                        vis_patches, vis_mask, order, vols, b, num, num_samples, num_visible, select=labels == 1
+                        vis_patches, vis_mask, order, vols, b, num, num_samples, num_visible, select=labels == 1,
+                        cand=cand,
                     )
                     labels = torch.where((labels == 1) & ~done, 0, labels)
                 else:
@@ -2023,7 +2089,14 @@ class ViTMAE3D(nn.Module):
             finish(part, order, num, vols, coord, b, vis_patches, vis_mask)
         if batched:
             compact = getattr(self, "corrupt_compact", False)
-            for item, corrupted in zip(deferred, self.corrupt_apply_batched(pending, compact=compact)):
+            if sparse is not None:
+                # native_sparse_tokens: each group's corruptions in one kernel (sparse.corrupt_tokens)
+                from .sparse import corrupt_tokens
+
+                done = [corrupt_tokens(*it, max(2, self.patch_size[0] // 2)) for it in pending]
+            else:
+                done = self.corrupt_apply_batched(pending, compact=compact)
+            for item, corrupted in zip(deferred, done):
                 finish(*item[:6], corrupted, item[7])
         if self.flat_loss_ok():
             # flat_loss: the reconstruction loss' weights (in-mask fraction / voxels) and targets of every group,
@@ -2332,13 +2405,16 @@ def plan_tumors(
     nodule: float,
     neg: float = 0.0,
     lims: list | None = None,
+    sparse=None,
 ) -> dict[tuple, tuple[Tensor, Tensor, Tensor, Tensor]]:
     # one lobulated mass sized in mm in a prob share of the batch, centred >= 6 mm inside the mask: a
     # solid bright 3-10 mm nodule (share nodule), else a bright 3-8 mm rim of uneven thickness on a
     # mildly darker core (share ring) or a diffuse bright mass. all spacing groups in one pass over
     # the masses' own boxes; per spacing: flat voxel indices into its padded [B, X, Y, Z] volumes, the
     # value to add, the soft lesion mask and the image's in-mask (min, max) there
-    dev = masks[0].device
+    # sparse (native_sparse_tokens): masks are shape-only (meta) stand-ins; the mask reads go to its bitmap and the
+    # masses come back as their parameters (sparse.SparseVolumes.tumors), pasted per gathered voxel
+    dev = masks[0].device if sparse is None else sparse.device
     k = min(len(masks), int(prob * len(masks) + torch.rand(()).item()))
     if k == 0:
         return {}
@@ -2395,8 +2471,11 @@ def plan_tumors(
     )
     pts = (cand - shift[:, None])[:, :, None] + star * probe[:, None, None]
     pts = torch.minimum(pts.clamp_min(0), shape[:, None, None] - 1)
-    pts = (pts[..., 0] * shape[:, 1, None, None] + pts[..., 1]) * shape[:, 2, None, None] + pts[..., 2]
-    hits = torch.stack([masks[ii].reshape(-1)[pts[t].reshape(-1)] for t, ii in enumerate(owners)])
+    if sparse is not None:
+        hits = sparse.mask_at(owners, pts).view(k, -1)
+    else:
+        pts = (pts[..., 0] * shape[:, 1, None, None] + pts[..., 1]) * shape[:, 2, None, None] + pts[..., 2]
+        hits = torch.stack([masks[ii].reshape(-1)[pts[t].reshape(-1)] for t, ii in enumerate(owners)])
     best = hits.view(k, 64, 7).sum(-1).argmax(1)
     centre = torch.take_along_dim(cand, best.view(k, 1, 1).expand(k, 1, 3), 1)[:, 0] + torch.rand(k, 3, device=dev)
     lo = torch.minimum((centre.long() - num // 2).clamp_min(0), dims - num)
@@ -2408,6 +2487,9 @@ def plan_tumors(
         ])
         for ii in owners
     ]).float()
+    if sparse is not None:
+        knots = (0.15 * torch.randn(1, 2, 5 * k, 5, 5, device=dev)).clamp(-0.25, 0.25)
+        return {"owners": owners, "lo": lo, "num": num, "par": torch.cat([cols, centre - lo, lim], 1), "knots": knots}
 
     # every box voxel of every mass in one ragged row: owner, then its box and volume indices
     owner = torch.zeros(total, dtype=torch.int32, device=dev)

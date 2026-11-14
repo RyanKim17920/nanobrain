@@ -152,6 +152,7 @@ def main(args: DictConfig):
     model.batched_unified = bool(args.get("native_batched_unified", False))
     # OPTIMIZATION-CHANGING (off when unset): the encoder / decoder residual streams in bf16 (fp32 now)
     model.bf16_residual = bool(args.get("native_bf16_residual", False))
+    assert not args.get("native_sparse_tokens") or (args.get("native_prep_tokens") and args.get("native_batched_prep"))
     assert not model.batched_unified or (args.get("native_batched_corrupt") and args.get("native_lazy_patchify"))
     assert not model.corrupt_compact or (args.get("native_prep_tokens") and args.get("native_batched_corrupt"))
     if args.get("natinit") and args.natinit.enabled:
@@ -377,6 +378,9 @@ def main(args: DictConfig):
                     batch["image"], batch["mask"], batch["spacing"], args.num_visible, args.num_predict,
                     args.num_samples, lims=batch.get("lim"),
                 )
+            if batch["mask"] is None:
+                # native_sparse_tokens: the SparseVolumes stays in this thread (the model reads only the tokens)
+                batch["image"], batch["mask"] = [], []
             return batch
 
     if args.prep_threads:
@@ -814,6 +818,12 @@ def make_lr_schedule(
 def make_batch_transform(args: DictConfig):
     def fn(batch: list[dict[str, Tensor]]) -> dict[str, Tensor]:
         if isinstance(batch, dict) and "samples" in batch:
+            if args.get("native_sparse_tokens"):
+                # speed (off when unset; with native_prep_tokens): no dense volumes, the tokens read straight from
+                # the values and a mask bitmap (sparse.py; the same values up to float rounding)
+                from nanobrain.sparse import sparse_batch_transform
+
+                return sparse_batch_transform(batch, args.target_spacing)
             # native_batched_prep: a native_concat batch
             return prep.native_batch_transform(batch, args.target_spacing, index=bool(args.get("native_index_prep")))
         raw = batch
