@@ -213,12 +213,12 @@ def _newtonschulz5_poly(X: Tensor, steps: int) -> Tensor:
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     eye = torch.eye(X.size(-2), device=X.device, dtype=X.dtype)
     if NS_SYRK and X.size(-2) % 128 == 0:
-        # native_muon_syrk (speed, same math): the symmetric X X^T and A A (= A A^T) as upper-triangle tile GEMMs
-        from nanobrain.kernels import syrk
+        # native_muon_syrk (speed, same math up to rounding): the symmetric X X^T and P = a I + b A + c A A^T as
+        # upper-triangle tile GEMMs, P straight from the fp32 accumulator (one rounding: closer to fp64)
+        from nanobrain.kernels import syrk, syrk_poly
 
         for _ in range(steps):
-            A = syrk(X)
-            X = (a * eye + b * A + c * syrk(A)) @ X
+            X = syrk_poly(syrk(X), a, b, c) @ X
         return X
     for _ in range(steps):
         A = X @ X.mT

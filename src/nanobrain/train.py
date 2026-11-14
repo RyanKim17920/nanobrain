@@ -220,7 +220,7 @@ def main(args: DictConfig):
             block.mlp.fp8, block.attn.fp8_qkv, block.attn.fp8_proj = "mlp" in parts, "qkv" in parts, "proj" in parts
         logger.info(f"native_fp8_lt: encoder {parts} as fp8 GEMMs")
     if args.get("native_muon_syrk"):
-        # speed, same math (bitwise equal updates): muon's symmetric newton-schulz products as upper-triangle GEMMs
+        # speed, same math up to rounding: muon's symmetric newton-schulz products as upper-triangle GEMMs (kernels.py)
         from nanobrain import optim
 
         optim.NS_SYRK = True
