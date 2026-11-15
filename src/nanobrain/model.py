@@ -209,6 +209,16 @@ class ViTMAE3D(nn.Module):
         # volume in view 0 and the clean (pre-paste) volume in every other view, whose lesion
         # targets are 0 (training only; False = every view sees the paste)
         tumor_one_view: bool = False,
+        # ---- objective round (native training only; 0 = off: no params, the flags-off path unchanged) ----
+        # cross-sample latent prediction (data2vec / iBOT-style target, online stop-grad teacher): a zero-init
+        # Linear(decoder dim, D) on the decoder's mask-token features regresses the layer-normed, stop-grad encoder
+        # output of the same token where the image's next sequence saw it as a clean visible token (MSE)
+        xlat_weight: float = 0.0,
+        # global self-distillation (SimSiam, no negatives): an MLP predictor maps each sequence's batch-centred mean
+        # visible token to its partner's stop-grad one, 1 - cos. gdist_pairs: sample = the image's other sequence;
+        # subject = batch images 2k <-> 2k+1 (one subject, train.py's subject-pair sampler)
+        gdist_weight: float = 0.0,
+        gdist_pairs: str = "sample",
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -474,6 +484,20 @@ class ViTMAE3D(nn.Module):
                 # zero init: the decoder input equals the unfused one at step 0
                 nn.init.zeros_(proj.weight)
                 nn.init.zeros_(proj.bias)
+        # objective round heads (under fork_rng: every other weight and the rng stream as with them off)
+        self.xlat_weight, self.gdist_weight, self.gdist_pairs = float(xlat_weight), float(gdist_weight), gdist_pairs
+        assert gdist_pairs in ("sample", "subject"), "gdist_pairs: sample | subject"
+        self.xlat_head = self.gdist_pred = None
+        with torch.random.fork_rng(devices=[]):
+            if self.xlat_weight:
+                assert native, "xlat: native path only"
+                self.xlat_head = nn.Linear(decoder_embed_dim, embed_dim)
+                nn.init.zeros_(self.xlat_head.weight)
+                nn.init.zeros_(self.xlat_head.bias)
+            if self.gdist_weight:
+                assert native, "gdist: native path only"
+                self.gdist_pred = nn.Sequential(nn.Linear(embed_dim, 256), nn.GELU(), nn.Linear(256, embed_dim))
+                self.gdist_pred.apply(_init_weights)
 
     @torch.no_grad()
     def brain_frame(
@@ -1592,6 +1616,7 @@ class ViTMAE3D(nn.Module):
             feats = self.decode_features(embeds, cat("target_coord"), vis_gate)
         else:
             feats = self.decode_features(embeds, cat("target_coord"), vis_gate, fuse_skip)
+        dfeats = feats
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
         # z-scores each token's voxels (spacing groups differ in patch size), the fg mask
@@ -1784,6 +1809,8 @@ class ViTMAE3D(nn.Module):
         )
         if self.training and any(h is not None for h in aux_on):
             loss = loss + self.aux_losses(parts, embeds, num_samples, subject_ids, device)
+        if self.training and (self.xlat_head is not None or self.gdist_pred is not None):
+            loss = loss + self.obj_losses(parts, dfeats, embeds, geoms, num_samples, num_visible)
         for part in parts:
             part.pop("vis_patches", None)
             part.pop("vis_mask", None)
@@ -2267,6 +2294,52 @@ class ViTMAE3D(nn.Module):
             stats["el_loss"] = el_loss.detach()
             stats["el_mae"] = (err / den.clamp_min(1e-6)).detach()
         self.aux_stats = stats
+        return loss
+
+    def obj_losses(
+        self, parts: list[dict], feats: Tensor, embeds: Tensor, geoms: dict, S: int, V: int
+    ) -> Tensor:
+        # the objective-round losses (training only); stats merged into self.aux_stats
+        loss, stats = embeds.new_zeros((), dtype=torch.float32), {}
+        tokens = embeds[:, self.class_tokens :]
+        if self.xlat_head is not None:
+            assert S == 2, "xlat: num_samples 2"
+            # every group at once: batch-unique token ids (image offsets in row order), one lookup table per
+            # sample index, so each target token finds its slot among the OTHER sequence's visible tokens
+            ns = [geoms[p["spacing"]][3][0].shape[0] for p in parts for _ in p["ids"]]
+            off = torch.tensor([0] + ns[:-1]).cumsum(0).repeat_interleave(S).to(tokens.device, non_blocking=True)
+            order = torch.cat([p["order"].flatten(0, 1) for p in parts]) + off[:, None]  # [R, V + P]
+            R, total = order.shape[0], sum(ns)
+            half = (torch.arange(R, device=order.device) % 2)[:, None] * total
+            slot = torch.arange(R * V, device=order.device).view(R, V)
+            pos = order.new_full((2 * total,), -1).scatter_(0, (order[:, :V] + half).flatten(), slot.flatten())
+            pos = pos[order[:, V:] + (total - half)]  # [R, P]
+            ok = pos >= 0
+            pos = pos.clamp_min(0)
+            if "unified_label" in parts[0]:
+                # a corrupted visible token shows a donor / transform, not the host: no target
+                ok = ok & (torch.cat([p["unified_label"] for p in parts]).flatten()[pos] == 0)
+            t = F.layer_norm(tokens.reshape(R * V, -1)[pos].detach().float(), tokens.shape[-1:])
+            w = ok.float()
+            xl = ((self.xlat_head(feats).float() - t).pow(2).mean(-1) * w).sum() / w.sum().clamp_min(1.0)
+            loss = loss + self.xlat_weight * xl
+            stats["xlat_loss"], stats["xlat_frac"] = xl.detach(), w.mean().detach()
+        if self.gdist_pred is not None:
+            z = tokens.float().mean(1)
+            z = z - z.mean(0, keepdim=True).detach()
+            if self.gdist_pairs == "sample":
+                assert S == 2, "gdist_pairs=sample: num_samples 2"
+                partner = torch.arange(z.shape[0], device=z.device) ^ 1
+            else:
+                # rows are part by part, image-major; the partner row: image i ^ 1, same sample index
+                img = [ii for p in parts for ii in p["ids"]]
+                row = {(ii, s): r for r, (ii, s) in enumerate((ii, s) for ii in img for s in range(S))}
+                partner = torch.tensor([row[(ii ^ 1, s)] for ii in img for s in range(S)]).to(z.device, non_blocking=True)
+            gd = 1.0 - F.cosine_similarity(self.gdist_pred(z).float(), z[partner].detach(), dim=-1).mean()
+            loss = loss + self.gdist_weight * gd
+            stats["gdist_loss"] = gd.detach()
+            stats["gdist_cos"] = F.cosine_similarity(z, z[partner], dim=-1).mean().detach()
+        self.aux_stats = {**getattr(self, "aux_stats", {}), **stats}
         return loss
 
     def set_aux_progress(self, t: float) -> dict[str, float]:

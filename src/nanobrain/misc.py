@@ -305,12 +305,13 @@ def init_distributed_mode(args):
 # checkpoint saving utils adapted from beit3
 
 
-def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=0.0):
+def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=0.0, model_state=None, extra=None):
+    # model_state: the "model" weights to save instead of the live ones (weight_avg); extra: more checkpoint keys
     output_dir = Path(args.output_dir)
     last_checkpoint_path = output_dir / "checkpoint-last.pth"
 
     to_save = {
-        "model": model_without_ddp.state_dict(),
+        "model": model_without_ddp.state_dict() if model_state is None else model_state,
         "optimizer": optimizer.state_dict(),
         "step": step,
         "wall_time": wall_time,
@@ -318,6 +319,7 @@ def save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time=
         "args": OmegaConf.to_container(args),
         "model_class": f"{type(model_without_ddp).__module__}:{type(model_without_ddp).__name__}",
         "git": git_info(),
+        **(extra or {}),
     }
 
     logger.info(f"saving checkpoint {last_checkpoint_path}")

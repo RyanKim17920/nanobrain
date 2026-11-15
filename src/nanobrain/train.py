@@ -388,6 +388,14 @@ def main(args: DictConfig):
         keys = spacing_keys(dataset.paths, DATA_ROOT / "fomo300k" / "tables" / "images.parquet")
         sampler = BucketSampler(sampler, keys, args.batch_size, int(args.native_bucket_window), seed=args.seed)
         logger.info(f"bucket sampler: windows of {args.native_bucket_window} batches, {len(set(keys.tolist()))} spacing keys")
+    if args.model_kwargs.get("gdist_weight") and args.model_kwargs.get("gdist_pairs") == "subject":
+        # objective round: batch images 2k, 2k + 1 from one subject (data.SubjectPairSampler); the base draws half
+        from nanobrain.data import SubjectPairSampler, subject_counts
+
+        assert args.batch_size % 2 == 0 and world_size == 1 and not args.get("native_bucket_window"), "subject pairs"
+        sampler.start //= 2
+        sampler = SubjectPairSampler(sampler, subject_counts(dataset.paths)[0], seed=args.seed)
+        logger.info("gdist subject pairs: batch images 2k, 2k + 1 share a subject")
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
@@ -607,6 +615,21 @@ def train(
 
     optimizer.zero_grad()
 
+    # weight_avg (objective round, off when unset): ema = an exponential moving average (weight_avg_decay) of the
+    # parameters, updated every step; swa = their uniform average over the lr decay phase. the final checkpoint's
+    # "model" holds the average (the eval loads it unchanged); an interrupted save keeps the live weights + the average
+    wavg, avg_n, avg_p = args.get("weight_avg"), 0, None
+    if wavg:
+        assert wavg in ("ema", "swa"), f"weight_avg: ema | swa, got {wavg}"
+        names, params = zip(*[(n, p) for n, p in model_without_ddp.named_parameters()])
+        avg_p = [p.detach().float().clone() for p in params]
+        saved = torch.load(args.ckpt, map_location="cpu", weights_only=True, mmap=True).get("weight_avg") if start_step and args.ckpt else None
+        if saved:
+            avg_n = int(saved["n"])
+            for a, n in zip(avg_p, names):
+                a.copy_(saved["params"][n])
+        logger.info(f"weight_avg {wavg}: {len(avg_p)} tensors, resumed n={avg_n}")
+
     if args.high_priority_stream and device.type == "cuda":
         # model work on a high priority stream: the prep threads' kernels (priority 0 side streams)
         # only take the sms it leaves free. autograd runs the backward on the forward's stream
@@ -744,6 +767,15 @@ def train(
         if not need_update:
             continue
         step += 1
+        if avg_p is not None:
+            live = [p.detach() for p in params]
+            if wavg == "ema":
+                avg_n += 1
+                d = min(float(args.get("weight_avg_decay", 0.9998)), (1 + step) / (10 + step))
+                torch._foreach_lerp_(avg_p, live, 1.0 - d)
+            elif step > args.warmup_steps and lr < args.lr:
+                avg_n += 1
+                torch._foreach_lerp_(avg_p, live, 1.0 / avg_n)
         if args.gc_freeze and step == start_step + 1:
             # compile is done: later gen 2 collections skip the startup objects
             gc.collect()
@@ -777,7 +809,16 @@ def train(
 
         is_save_step = step % args.checkpoint_period == 0 or step in (args.checkpoint_steps or [])
         if is_save_step or is_last:
-            misc.save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time)
+            state = extra = None
+            if avg_p is not None and done and avg_n:
+                state = model_without_ddp.state_dict()
+                for a, n in zip(avg_p, names):
+                    state[n] = a.to(state[n].dtype)
+                extra = {"weight_avg": {"mode": wavg, "n": avg_n}}
+                logger.info(f"weight_avg {wavg}: the checkpoint model is the average of {avg_n} steps")
+            elif avg_p is not None:
+                extra = {"weight_avg": {"mode": wavg, "n": avg_n, "params": dict(zip(names, avg_p))}}
+            misc.save_model(args, step, model_without_ddp, optimizer, loss_scaler, wall_time, state, extra)
 
         if is_last:
             break

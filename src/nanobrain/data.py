@@ -155,6 +155,30 @@ class InfiniteSampler(Sampler[int]):
                 index += 1
 
 
+class SubjectPairSampler(Sampler[int]):
+    """gdist_pairs=subject (objective round): each draw of the base sampler is followed by a uniform OTHER image of
+    its subject (itself if it has none), so batch positions 2k, 2k + 1 hold one subject. Set base.start to half."""
+
+    def __init__(self, base: Sampler, keys: list[str], seed: int = 0):
+        self.base, self.seed = base, seed
+        groups: dict[str, list[int]] = {}
+        for ii, key in enumerate(keys):
+            groups.setdefault(key, []).append(ii)
+        arrays = {k: np.array(v) for k, v in groups.items()}
+        self.members = [arrays[k] for k in keys]
+
+    def __iter__(self):
+        rng = np.random.default_rng(self.seed + 7919 * int(getattr(self.base, "start", 0)))
+        for ii in self.base:
+            m = self.members[ii]
+            jj = ii
+            if len(m) > 1:
+                jj = int(m[rng.integers(len(m) - 1)])
+                jj = int(m[-1]) if jj == ii else jj
+            yield ii
+            yield jj
+
+
 def spacing_keys(paths: list[str], table: Path) -> np.ndarray:
     # per image an int code of its (orientation, voxel spacing to 1e-3 mm) from the images table: images
     # with one code share a native token grid. paths are filelist entries (derivatives/... .npz)
