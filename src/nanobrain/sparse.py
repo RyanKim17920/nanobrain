@@ -12,6 +12,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+import torch.nn.functional as F
 from torch import Tensor
 from triton.language.extra.cuda import libdevice
 
@@ -193,11 +194,134 @@ def _frac_kernel(gtab, G, rimg, geo, line, bits, pre, out, NT, TB: tl.constexpr,
     tl.store(out + tok, tl.sum(acc, axis=1).to(tl.float32) / tl.reshape(P, [TB]), mask=tm)
 
 
+# o-deform / o-path (objective round 2, off unless the model plans them): per image warp table rows (wtab, 12 floats:
+# field gain, mm per voxel (3), atrophy centre in box voxels (3), atrophy 1 / (2 sigma^2) per mm^2, atrophy amplitude)
+# and the displacement knots (wk [B, 3, KN0, KN1, KN2], mm, KNOT_MM apart from the box's low corner)
+KNOT_MM = 24.0
+WARP_CFG = (32, 1)  # the sequence gather's BLOCK, num_warps when warping
+DEFORM_PROB = 0.5
+
+
+@triton.jit
+def _field(wk, img, u0, u1, u2, KN0: tl.constexpr, KN1: tl.constexpr, KN2: tl.constexpr):
+    # the knot field (mm, 3 channels) trilinear at knot coordinates u (clamped to the knot box)
+    u0 = tl.minimum(tl.maximum(u0, 0.0), KN0 - 1.0)
+    u1 = tl.minimum(tl.maximum(u1, 0.0), KN1 - 1.0)
+    u2 = tl.minimum(tl.maximum(u2, 0.0), KN2 - 1.0)
+    i0 = tl.minimum(u0.to(tl.int32), KN0 - 2)
+    i1 = tl.minimum(u1.to(tl.int32), KN1 - 2)
+    i2 = tl.minimum(u2.to(tl.int32), KN2 - 2)
+    f0 = u0 - i0.to(tl.float32)
+    f1 = u1 - i1.to(tl.float32)
+    f2 = u2 - i2.to(tl.float32)
+    KK = KN0 * KN1 * KN2
+    base = wk + img.to(tl.int64) * (3 * KK) + (i0 * KN1 + i1) * KN2 + i2
+    d0 = tl.zeros(u0.shape, dtype=tl.float32)
+    d1 = tl.zeros(u0.shape, dtype=tl.float32)
+    d2 = tl.zeros(u0.shape, dtype=tl.float32)
+    for c in tl.static_range(8):
+        w = (f0 if c & 4 else 1.0 - f0) * (f1 if c & 2 else 1.0 - f1) * (f2 if c & 1 else 1.0 - f2)
+        oc = (KN1 * KN2 if c & 4 else 0) + (KN2 if c & 2 else 0) + (1 if c & 1 else 0)
+        d0 += w * tl.load(base + oc)
+        d1 += w * tl.load(base + KK + oc)
+        d2 += w * tl.load(base + 2 * KK + oc)
+    return d0, d1, d2
+
+
+@triton.jit
+def _warp_lookup(b0, b1, b2, qm, img, gain, geo, wtab, wk, bits, pre, vals, nrm, KN0: tl.constexpr, KN1: tl.constexpr,
+                 KN2: tl.constexpr):
+    # the box voxels b displaced by the image's smooth field + its atrophy (radial magnification about the centre):
+    # (value: trilinear over the in-mask corners, in mask: their weight >= 1/2, the nearest displaced voxel)
+    w = wtab + img * 12
+    s0 = tl.load(w + 1)
+    s1 = tl.load(w + 2)
+    s2 = tl.load(w + 3)
+    x0 = b0.to(tl.float32)
+    x1 = b1.to(tl.float32)
+    x2 = b2.to(tl.float32)
+    d0, d1, d2 = _field(wk, img, x0 * s0 / 24.0, x1 * s1 / 24.0, x2 * s2 / 24.0, KN0, KN1, KN2)
+    r0 = x0 - tl.load(w + 4)
+    r1 = x1 - tl.load(w + 5)
+    r2 = x2 - tl.load(w + 6)
+    g = tl.exp(-((r0 * s0) * (r0 * s0) + (r1 * s1) * (r1 * s1) + (r2 * s2) * (r2 * s2)) * tl.load(w + 7)) * tl.load(w + 8)
+    y0 = x0 + gain * d0 / s0 - g * r0
+    y1 = x1 + gain * d1 / s1 - g * r1
+    y2 = x2 + gain * d2 / s2 - g * r2
+    i0 = tl.floor(y0)
+    i1 = tl.floor(y1)
+    i2 = tl.floor(y2)
+    f0 = y0 - i0
+    f1 = y1 - i1
+    f2 = y2 - i2
+    i0 = i0.to(tl.int32)
+    i1 = i1.to(tl.int32)
+    i2 = i2.to(tl.int32)
+    gg = geo + img * 10
+    g1 = tl.load(gg + 1)
+    g2 = tl.load(gg + 2)
+    g3 = tl.load(gg + 3)
+    fb = tl.load(gg) + g1 * i0 + g2 * i1 + g3 * i2
+    lo0, hi0, lo1, hi1, lo2, hi2 = (tl.load(gg + 4), tl.load(gg + 5), tl.load(gg + 6), tl.load(gg + 7), tl.load(gg + 8),
+                                    tl.load(gg + 9))
+    a0, b0_ = (i0 >= lo0) & (i0 < hi0), (i0 + 1 >= lo0) & (i0 + 1 < hi0)
+    a1, b1_ = (i1 >= lo1) & (i1 < hi1), (i1 + 1 >= lo1) & (i1 + 1 < hi1)
+    a2, b2_ = (i2 >= lo2) & (i2 < hi2), (i2 + 1 >= lo2) & (i2 + 1 < hi2)
+    sc, c_lo, c_hi = tl.load(nrm + img * 5), tl.load(nrm + img * 5 + 1), tl.load(nrm + img * 5 + 2)
+    vs = tl.zeros(y0.shape, dtype=tl.float32)
+    ws = tl.zeros(y0.shape, dtype=tl.float32)
+    for c in tl.static_range(8):
+        ok = qm & (b0_ if c & 4 else a0) & (b1_ if c & 2 else a1) & (b2_ if c & 1 else a2)
+        f = fb + (g1 if c & 4 else 0) + (g2 if c & 2 else 0) + (g3 if c & 1 else 0)
+        wd = f >> 5
+        word = tl.load(bits + wd, mask=ok, other=0)
+        bit = (f & 31).to(tl.int32)
+        inm = ok & (((word >> bit) & 1) == 1)
+        below = word & ((tl.full(bit.shape, 1, tl.int32) << bit) - 1)
+        raw = tl.load(vals + tl.load(pre + wd, mask=inm, other=0) + libdevice.popc(below), mask=inm, other=0)
+        v = tl.minimum(tl.maximum(raw.to(tl.float32) * sc, c_lo), c_hi)
+        wt = (f0 if c & 4 else 1.0 - f0) * (f1 if c & 2 else 1.0 - f1) * (f2 if c & 1 else 1.0 - f2)
+        wt = tl.where(inm, wt, 0.0)
+        vs += wt * v
+        ws += wt
+    inm = ws >= 0.5
+    v = tl.where(inm, (vs / tl.maximum(ws, 1e-6) - tl.load(nrm + img * 5 + 3)) / tl.load(nrm + img * 5 + 4), 0.0)
+    return v, inm, tl.floor(y0 + 0.5).to(tl.int32), tl.floor(y1 + 0.5).to(tl.int32), tl.floor(y2 + 0.5).to(tl.int32)
+
+
+@triton.jit
+def _spots(v, les, inm, b0, b1, b2, img, nrm, spt, spp):
+    # o-path: the image's small ellipsoid lesions (spt [B, 2]: first, count; spp rows of 12: centre (box voxels),
+    # the quadratic form (a00 a11 a22 a01 a02 a12, per voxel^2), sharpness, signed contrast) added in the mask,
+    # clipped to the image's in-mask range; their soft masks into the lesion target
+    first = tl.load(spt + img * 2)
+    n = tl.load(spt + img * 2 + 1)
+    lo = (tl.load(nrm + img * 5 + 1) - tl.load(nrm + img * 5 + 3)) / tl.load(nrm + img * 5 + 4)
+    hi = (tl.load(nrm + img * 5 + 2) - tl.load(nrm + img * 5 + 3)) / tl.load(nrm + img * 5 + 4)
+    x0 = b0.to(tl.float32)
+    x1 = b1.to(tl.float32)
+    x2 = b2.to(tl.float32)
+    for j in range(n):
+        p = spp + (first + j) * 12
+        e0 = x0 - tl.load(p)
+        e1 = x1 - tl.load(p + 1)
+        e2 = x2 - tl.load(p + 2)
+        q = tl.load(p + 3) * e0 * e0 + tl.load(p + 4) * e1 * e1 + tl.load(p + 5) * e2 * e2
+        q += 2.0 * (tl.load(p + 6) * e0 * e1 + tl.load(p + 7) * e0 * e2 + tl.load(p + 8) * e1 * e2)
+        d = tl.sqrt(tl.maximum(q, 0.0))
+        soft = tl.where(inm & (d < 3.0), tl.sigmoid((1.0 - d) * tl.load(p + 9)), 0.0)
+        v = tl.where(soft > 0.0, tl.minimum(tl.maximum(v + tl.load(p + 10) * soft, lo), hi), v)
+        les = tl.maximum(les, soft)
+    return v, les
+
+
 @triton.jit(do_not_specialize=["G", "NK", "V", "SEQ"])
 def _gather_kernel(
     gtab, G, tok, rimg, geo, nrm, bits, pre, vals, mass, ti, tf, knots, img_out, msk_out, les_out, NK,
     t_img, t_w, V, SEQ,
     TUMOR: tl.constexpr, LES: tl.constexpr, BLOCK: tl.constexpr, SPLIT: tl.constexpr = False, NC: tl.constexpr = 10,
+    WARP: tl.constexpr = False, SPOTS: tl.constexpr = False, KN0: tl.constexpr = 1, KN1: tl.constexpr = 1,
+    KN2: tl.constexpr = 1, wtab=None, wk=None, spt=None, spp=None,
 ):
     # one row of (image, box token) per program, rows of every group: the normalized image / mask voxels (+ the
     # pasted tumour, its soft mask). group table rows (NC 10): first row, P, PX, PY, PZ, GY, GZ, rows per image,
@@ -229,11 +353,29 @@ def _gather_kernel(
         o1 = tl.where(vis, img_out, t_img)
         o2 = tl.where(vis, msk_out, t_w)
     k = tl.load(mass + img) if TUMOR else -1
+    if WARP:
+        # the field on views >= wtab col 9 only (o-deform: view 0 stays the reference; swap donors: none); rows with
+        # neither field nor atrophy read plainly
+        gain = tl.load(wtab + img * 12)
+        if SPLIT:
+            gain = tl.where((loc % tl.load(gp + 7)) // SEQ >= tl.load(wtab + img * 12 + 9), gain, 0.0)
+        else:
+            gain = tl.where(tl.load(wtab + img * 12 + 9) > 0.0, 0.0, gain)
+        warp_on = (gain != 0.0) | (tl.load(wtab + img * 12 + 8) != 0.0)
     for q0 in range(0, P, BLOCK):
         q = q0 + tl.arange(0, BLOCK)
         qm = q < P
         f, valid, b0, b1, b2 = _token_voxels(tid, q, geo, img, PX, PY, PZ, GY, GZ)
-        v, inm = _lookup(f, valid & qm, bits, pre, vals, img, nrm)
+        if not WARP:
+            v, inm = _lookup(f, valid & qm, bits, pre, vals, img, nrm)
+        elif not warp_on:
+            v, inm = _lookup(f, valid & qm, bits, pre, vals, img, nrm)
+        else:
+            # o-deform / o-path atrophy: the voxel reads the image at its displaced position (trilinear over the
+            # in-mask neighbours); the pastes below sit at the nearest displaced voxel (they move with the anatomy)
+            v, inm, n0, n1, n2 = _warp_lookup(b0, b1, b2, qm, img, gain, geo, wtab, wk, bits, pre, vals, nrm, KN0, KN1,
+                                              KN2)
+            b0, b1, b2 = n0.to(b0.dtype), n1.to(b1.dtype), n2.to(b2.dtype)
         les = tl.zeros([BLOCK], dtype=tl.float32)
         if TUMOR:
             if k >= 0:
@@ -277,6 +419,8 @@ def _gather_kernel(
                 new = tl.minimum(tl.maximum(v + val, tl.load(fp + 17)), tl.load(fp + 18))
                 v = tl.where(inside, new, v)
                 les = tl.where(inside, outer, 0.0)
+        if SPOTS:
+            v, les = _spots(v, les, inm, b0, b1, b2, img, nrm, spt, spp)
         o = obase + q
         if SPLIT:
             tl.store(o1 + o, v, mask=qm)
@@ -620,6 +764,8 @@ class SparseVolumes:
             self.const.append(off + sum((sh[k] - 1) * stride[k] for k in flip_axes))
             self.spacing.append(affine)
             off += nvox
+        self.contrast = [contrast_of(s.get("path", "")) for s in samples]
+        self.syn = self.wtab = self.wk = self.spt = self.spp = None
 
     def mask_at(self, owners: list[int], ras: Tensor) -> Tensor:
         # bool mask at ras voxels ras [k, ..., 3] (long) of the images owners (len k)
@@ -671,14 +817,14 @@ class SparseVolumes:
         img = torch.empty(o0, device=self.device, dtype=torch.float32)
         msk = torch.empty_like(img)
         tumor = self.mass is not None
-        lesion = tumor and any(s[4] for s in specs)
+        lesion = (tumor or self.syn_spots) and any(s[4] for s in specs)
         les = torch.empty_like(img) if lesion else img
         d = self.bits
         _gather_kernel[(r0,)](
             tab, len(specs), tok, rimg, self.geo, self.nrm, self.bits, self.pre, self.vals,
             self.mass if tumor else d, self.ti if tumor else d, self.tf if tumor else d, self.knots if tumor else d,
-            img, msk, les, (self.knots.shape[2] // 5) if tumor else 1, img, img, 0, 1, TUMOR=tumor, LES=lesion, BLOCK=cfg[0],
-            num_warps=cfg[1],
+            img, msk, les, (self.knots.shape[2] // 5) if tumor else 1, img, img, 0, 1, TUMOR=tumor,
+            LES=lesion, BLOCK=cfg[0], num_warps=cfg[1], **self.syn_flags(),
         )
         out, o0 = [], 0
         for G, tok, _, _, want in specs:
@@ -687,6 +833,141 @@ class SparseVolumes:
             out.append((img[sl].view(-1, G.P), msk[sl].view(-1, G.P), les[sl].view(-1, G.P) if want and lesion else None))
             o0 += n
         return out
+
+    @property
+    def syn_spots(self) -> bool:
+        return self.syn is not None and self.spt is not None
+
+    def syn_flags(self) -> dict:
+        if self.syn is None:
+            return {}
+        # the gather kernel's warp / spot arguments
+        kn = tuple(self.wk.shape[2:]) if self.wk is not None else (1, 1, 1)
+        ptrs = {k: self.bits if t is None else t for k, t in zip(("wtab", "wk", "spt", "spp"), (self.wtab, self.wk, self.spt, self.spp))}
+        return dict(WARP=self.wk is not None, SPOTS=self.spt is not None, KN0=kn[0], KN1=kn[1], KN2=kn[2], **ptrs)
+
+    def value_at(self, f: Tensor, img: Tensor) -> tuple[Tensor, Tensor]:
+        # (normalized value, in mask) at global voxels f (long) of images img (as _lookup)
+        word = self.bits[f >> 5].long() & 0xFFFFFFFF
+        bit = f & 31
+        inm = ((word >> bit) & 1).bool()
+        x = word & ((torch.ones_like(bit) << bit) - 1)
+        x = x - ((x >> 1) & 0x55555555)
+        x = (x & 0x33333333) + ((x >> 2) & 0x33333333)
+        x = (x + (x >> 4)) & 0x0F0F0F0F
+        x = ((x * 0x01010101) & 0xFFFFFFFF) >> 24
+        n = self.nrm[img]
+        v = self.vals[(self.pre[f >> 5].long() + x).clamp_max(self.vals.numel() - 1)].float() * n[..., 0]
+        v = (torch.minimum(torch.maximum(v, n[..., 1]), n[..., 2]) - n[..., 3]) / n[..., 4]
+        return torch.where(inm, v, 0.0), inm
+
+    def syn_plan(self, model, groups: dict, geoms: dict, sfrac: dict) -> set:
+        # o-deform / o-path / o-res draws for this batch (training only): the deformation knots, the atrophy warps,
+        # the small lesions. returns the images given lesions (their lesion targets are wanted)
+        dev, B = self.device, self.B
+        self.syn = {"res": bool(model.res_weight)}
+        self.wtab = self.wk = self.spt = self.spp = None
+        sp_img = [None] * B
+        for sp, ids in groups.items():
+            for ii in ids:
+                sp_img[ii] = sp
+        spt = torch.tensor(sp_img, dtype=torch.float32)
+        if model.deform_weight or model.path_syn:
+            wtab = torch.zeros(B, 12)
+            wtab[:, 1:4] = spt
+            wtab = _to(dev, wtab)
+            kn = [int(round(m / KNOT_MM)) + 1 for m in model.grid_size]
+            wk = torch.zeros(B, 3, *kn, device=dev)
+            if model.deform_weight:
+                # a smooth random field: iid knots 24 mm apart, [1 2 1] / 4 smoothed per axis (a cubic-b-spline-like
+                # field), zero mean (no translation), rms deform_mm x U(0.3, 1) per image
+                k = _smooth121(dev)
+                wk = F.conv3d(F.pad(torch.randn(B * 3, 1, *kn, device=dev), [1] * 6, mode="replicate"), k).view(B, 3, *kn)
+                wk = wk - wk.mean((2, 3, 4), keepdim=True)
+                rms = wk.square().mean((1, 2, 3, 4), keepdim=True).sqrt().clamp_min(1e-6)
+                wk = wk * (model.deform_mm * (0.3 + 0.7 * torch.rand(B, 1, 1, 1, 1, device=dev)) / rms)
+                wtab[:, 0] = (torch.rand(B, device=dev) < DEFORM_PROB).float()  # the rest: identity pairs (target 0)
+                wtab[:, 9] = 1.0  # views 1.. deformed, view 0 the reference
+            if model.path_syn:
+                # atrophy (share PATH_ATROPHY): ventricular enlargement ex vacuo as a radial magnification about the
+                # brain centroid + 8 mm superior (+- 4 mm): voxel x reads c + (x - c)(1 - a g), g gaussian (sigma
+                # 18-28 mm), a 0.1-0.25: the central csf grows (1.4-2.4x volume at the centre), the tissue round it thins
+                on = torch.rand(B, device=dev) < PATH_ATROPHY
+                cen = torch.zeros(B, 3, device=dev)
+                for sp, ids in groups.items():
+                    patch, _, grid, _ = geoms[sp]
+                    ctr = torch.stack(torch.meshgrid(*[torch.arange(n, device=dev) * p + (p - 1) / 2
+                                                       for n, p in zip(grid, patch)], indexing="ij"), -1).view(-1, 3)
+                    fr = sfrac[sp]
+                    cen[ids] = (fr @ ctr.float()) / fr.sum(1, keepdim=True).clamp_min(1e-6)
+                cen = cen + (torch.tensor([0.0, 0.0, 8.0], device=dev) + 4.0 * torch.randn(B, 3, device=dev)) / wtab[:, 1:4]
+                sig = 18.0 + 10.0 * torch.rand(B, device=dev)
+                wtab[:, 4:7] = cen
+                wtab[:, 7] = 1.0 / (2.0 * sig.square())
+                wtab[:, 8] = torch.where(on, 0.1 + 0.15 * torch.rand(B, device=dev), 0.0)
+            self.wtab, self.wk = wtab.contiguous(), wk.contiguous()
+        return self.plan_spots(spt) if model.path_syn else set()
+
+    def plan_spots(self, spt: Tensor) -> set:
+        # o-path: MS / WMH-like ovoids in the deep white matter (share PATH_MS of the images, 2-10 each) and
+        # microbleed-like dark foci (share PATH_MB, 1-6 each); signs / contrasts by the image's sequence (SPOT_POL).
+        # shapes / contrasts drawn on the host, the centres on the gpu (one upload each way, no sync)
+        dev, B = self.device, self.B
+        kinds, owner = [], []
+        u = torch.rand(B, 2).tolist()
+        for ii in range(B):
+            for kind, lo, hi in ((0, 2, 10), (1, 1, 6)):
+                if u[ii][kind] < (PATH_MS, PATH_MB)[kind]:
+                    n = int(torch.randint(lo, hi + 1, ()).item())
+                    kinds += [kind] * n
+                    owner += [ii] * n
+        if not owner:
+            return set()
+        N = len(owner)
+        con = torch.tensor([self.contrast[ii] for ii in owner])
+        kind = torch.tensor(kinds)
+        sp = spt[owner]
+        # shapes: ms ovoids semi-major 1.5-5 mm, elongation 1.2-2 along a random direction; bleeds round, radius
+        # 1-2.5 mm (x1.5 blooming on susceptibility); 10-90% edges ~1 mm (bleeds 0.7)
+        ms = kind == 0
+        r = torch.where(ms, 1.5 * (5.0 / 1.5) ** torch.rand(N), 1.0 + 1.5 * torch.rand(N))
+        r = torch.where(~ms & (con == 4), 1.5 * r, r)
+        rm = r / torch.where(ms, 1.2 + 0.8 * torch.rand(N), 1.0)
+        d = F.normalize(torch.randn(N, 3), dim=-1)
+        A = torch.eye(3) / rm.square().view(N, 1, 1) + (1 / r.square() - 1 / rm.square()).view(N, 1, 1) * (
+            d[:, :, None] * d[:, None])
+        A = A * sp[:, :, None] * sp[:, None]  # per voxel^2
+        pol = torch.tensor(SPOT_POL)[kind, con]  # sign (0 = either), contrast lo, hi
+        sign = torch.where(pol[:, 0] == 0, torch.where(torch.rand(N) < 0.5, -1.0, 1.0), pol[:, 0])
+        amp = sign * (pol[:, 1] + (pol[:, 2] - pol[:, 1]) * torch.rand(N))
+        reach = torch.where(ms, 10.0, 5.0)[:, None] / sp
+        star = torch.tensor([[0, 0, 0], [1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]])
+        host = torch.cat([A[:, 0, 0, None], A[:, 1, 1, None], A[:, 2, 2, None], A[:, 0, 1, None], A[:, 0, 2, None],
+                          A[:, 1, 2, None], (4.4 * rm / torch.where(ms, 1.0, 0.7))[:, None], amp[:, None],
+                          kind[:, None].float(), torch.tensor(WM_WIN)[con], ~ms[:, None], torch.tensor(owner)[:, None],
+                          (star[None] * reach[:, None]).round().view(N, 21)], 1).float()
+        host = _to(dev, host)
+        par, wm, bleed, own, off = host[:, :9], host[:, 9:11], host[:, 11:12] > 0, host[:, 12].long(), host[:, 13:]
+        g = self.geo[own]  # const, coef (3), box lo / hi per axis
+        lo, hi = g[:, 4:10:2], g[:, 5:10:2]
+        # centre: of 32 voxels in the image box, the best by (itself + its 6 axis neighbours at 10 mm (ms) / 5 mm
+        # (bleed) in the mask) + 2 (ms: its value in the sequence's white matter window)
+        cand = lo[:, None] + (torch.rand(N, 32, 3, device=dev) * (hi - lo)[:, None]).long()
+        pts = torch.minimum(torch.maximum(cand[:, :, None] + off.long().view(N, 1, 7, 3), lo[:, None, None]), hi[:, None, None] - 1)
+        v, inm = self.value_at(g[:, None, None, 0] + (pts * g[:, None, None, 1:4]).sum(-1), own.view(-1, 1, 1).expand(N, 32, 7))
+        ok = ((v[:, :, 0] >= wm[:, :1]) & (v[:, :, 0] <= wm[:, 1:])) | bleed
+        best = (inm.sum(-1) + 2.0 * ok + torch.rand(N, 32, device=dev)).argmax(1)
+        c = cand.gather(1, best.view(N, 1, 1).expand(N, 1, 3))[:, 0].float() + torch.rand(N, 3, device=dev) - 0.5
+        cnt = torch.bincount(torch.tensor(owner), minlength=B)
+        self.spt, self.spp = _to(dev, torch.stack([cnt.cumsum(0) - cnt, cnt], 1).int()), torch.cat([c, par], 1)
+        return set(owner)
+
+    def tumor_polarity(self, plan: dict) -> None:
+        # o-path: the pasted masses' sign by sequence (TUMOR_POL): hypointense on t1 / susceptibility, bright on
+        # t1c / t2 / flair, either on the rest (weakens the bright-blob-on-every-contrast shortcut)
+        sg = torch.tensor([TUMOR_POL[self.contrast[ii]] for ii in plan["owners"]], dtype=torch.float32)
+        sg = torch.where(sg == 0, torch.where(torch.rand(len(sg)) < 0.5, -1.0, 1.0), sg)
+        plan["par"][:, 11:13] *= _to(plan["par"].device, sg)[:, None]
 
     def group(self, sp, ids: list[int], patch, grid) -> "SparseGroup":
         return SparseGroup(self, sp, ids, tuple(patch), tuple(grid))
@@ -704,6 +985,118 @@ class SparseGroup:
     def gather(self, tok: Tensor, rimg: Tensor, per_img: int, lesion: bool = False):
         # rows (rimg[row // per_img], tok[row]) -> image, mask (float 0 / 1) [R, P] (+ the soft lesion mask)
         return self.vol.gather([(self, tok, rimg, per_img, lesion)])[0]
+
+
+# o-path tables. contrast classes from the BIDS suffix: 0 t1 (T1w / MP2RAGE / UNIT1 / T1map), 1 t1c, 2 t2 / pd / b0 /
+# MESE, 3 FLAIR, 4 susceptibility (gre / swi / FLASH / T2*), 5 other (dwi b > 0, asl, angio, ...)
+_CONTRAST = {"T1w": 0, "MP2RAGE": 0, "UNIT1": 0, "T1map": 0, "T1c": 1, "T2w": 2, "PDw": 2, "bval0": 2, "MESE": 2,
+             "FLAIR": 3, "gre": 4, "swi": 4, "FLASH": 4, "T2starw": 4}
+PATH_MS, PATH_MB, PATH_ATROPHY = 0.3, 0.2, 0.3
+# per kind (ms, bleed), per contrast: (sign (0 = either), contrast z lo, hi). ms: dark on t1 (t1 holes), bright on
+# t2 / flair; bleeds dark everywhere, strongest on susceptibility
+SPOT_POL = (
+    ((-1, 0.6, 1.5), (-1, 0.6, 1.5), (1, 1.0, 2.5), (1, 1.5, 3.0), (1, 0.5, 1.5), (0, 0.5, 2.0)),
+    ((-1, 0.3, 0.8), (-1, 0.3, 0.8), (-1, 1.0, 2.0), (-1, 0.6, 1.5), (-1, 2.0, 4.0), (-1, 0.5, 1.5)),
+)
+TUMOR_POL = (-1.0, 1.0, 1.0, 1.0, -1.0, 0.0)
+# the white matter z window per contrast (the brightest tissue on t1, darker than grey matter on t2 / flair)
+WM_WIN = ((0.2, 3.0), (0.2, 3.0), (-1.5, 0.3), (-1.0, 0.5), (-9.0, 9.0), (-9.0, 9.0))
+
+
+@functools.lru_cache(maxsize=8)
+def _smooth121(device) -> Tensor:
+    k = torch.tensor([0.25, 0.5, 0.25])
+    return torch.einsum("a,b,c->abc", k, k, k).view(1, 1, 3, 3, 3).to(device)
+
+
+def contrast_of(path: str) -> int:
+    return _CONTRAST.get(path.rsplit("_", 1)[-1].split(".")[0], 5)
+
+
+def warp_targets(model, vol: "SparseVolumes", gs: list[dict], order_all: Tensor, les_w: Tensor, labels: Tensor,
+                 S: int, V: int) -> tuple[Tensor, tuple | None]:
+    # every group's visible tokens at once. o-deform: each token's displacement (the field trilinear at its centre, as
+    # _field: grid_sample, border = the clamp; / deform_mm) and weight (its in-mask fraction; corrupted tokens 0).
+    # o-path: clean tokens in the atrophy warp's |log det J| > 0.15 zone (in mask) get the unified atrophy class
+    dev = order_all.device
+    rows = [[*g["G"].grid[1:], *g["G"].patch, g["G"].P] for g in gs for _ in range(g["rows"])]
+    tab = _to(dev, np.asarray(rows, np.float32))  # [R, 6]: gy, gz, px, py, pz, P
+    img = torch.cat([g["G"].rimg.repeat_interleave(S) for g in gs])  # [R]
+    t = order_all[:, :V].float()
+    gy, gz, px, py, pz, P = tab.unbind(1)
+    x = torch.stack([torch.div(t, (gy * gz)[:, None], rounding_mode="floor") * px[:, None] + ((px - 1) / 2)[:, None],
+                     torch.remainder(torch.div(t, gz[:, None], rounding_mode="floor"), gy[:, None]) * py[:, None]
+                     + ((py - 1) / 2)[:, None],
+                     torch.remainder(t, gz[:, None]) * pz[:, None] + ((pz - 1) / 2)[:, None]], -1)  # [R, V, 3]
+    w = vol.wtab[img]
+    sp = w[:, None, 1:4]
+    frac = les_w.view(len(img), V, -1).sum(-1) / P[:, None]
+    dfm = None
+    if model.deform_weight:
+        # rows are group-major: image-major [B, S V] for grid_sample, then back
+        perm = torch.argsort(img * S + torch.arange(len(img), device=dev) % S)
+        K = torch.tensor(vol.wk.shape[2:], device=dev, dtype=torch.float32)
+        u = (x * sp / KNOT_MM / (K - 1) * 2 - 1).flip(-1)[perm].view(vol.B, 1, S, V, 3)
+        d = F.grid_sample(vol.wk, u, mode="bilinear", padding_mode="border", align_corners=True)  # [B, 3, 1, S, V]
+        d = d.permute(0, 2, 3, 4, 1).reshape(-1, V, 3)[torch.argsort(perm)]
+        dfm = ((d / model.deform_mm).reshape(-1, 3), frac.reshape(-1))
+    if model.path_syn:
+        r2 = ((x - w[:, None, 4:7]) * sp).square().sum(-1)
+        gg = torch.exp(-r2 * w[:, None, 7]) * w[:, None, 8]
+        s_ = 1 - gg
+        jac = s_.square() * (s_ + gg * r2 * 2 * w[:, None, 7])
+        atr = (jac.clamp_min(1e-6).log().abs() > 0.15) & (frac > 0.5) & (labels == 0)
+        labels = torch.where(atr, model.unified_classes, labels)
+    return labels, dfm
+
+
+@functools.lru_cache(maxsize=64)
+def _lowres_bank(p: int, device) -> Tensor:
+    # [p + 1, p, p]: row n (1..p) = area downsampling of p voxels to n, then linear upsampling back (align_corners
+    # False, edges clamped), as one matrix
+    bank = torch.zeros(p + 1, p, p, dtype=torch.float64)
+    for n in range(1, p + 1):
+        D = torch.zeros(n, p, dtype=torch.float64)
+        for j in range(n):
+            a, b = j * p / n, (j + 1) * p / n
+            for i in range(p):
+                D[j, i] = max(0.0, min(b, i + 1) - max(a, i)) * n / p
+        U = torch.zeros(p, n, dtype=torch.float64)
+        for i in range(p):
+            c = min(max((i + 0.5) * n / p - 0.5, 0.0), n - 1.0)
+            j0 = min(int(c), n - 1)
+            U[i, j0] += 1 - (c - j0)
+            U[i, min(j0 + 1, n - 1)] += c - j0
+        bank[n] = U @ D
+    return bank.float().to(device)
+
+
+@functools.lru_cache(maxsize=256)
+def _lowres_map(patch: tuple, ns: tuple, device) -> Tensor:
+    # the [P, P] map of one image's low-res token (area down to ns voxels per axis, linear back up)
+    m = [_lowres_bank(p, device)[n] for p, n in zip(patch, ns)]
+    return torch.einsum("ax,cy,dz->acdxyz", *m).reshape(math.prod(patch), math.prod(patch)).T.contiguous()
+
+
+def lowres_views(gs: list[dict], vimg: Tensor, vmsk: Tensor, timg: Tensor, tw: Tensor, S: int, V: int, NP: int) -> None:
+    # o-res, in place: views 1.. of each image (visible + target rows) at 1.5-2x coarser voxels (all three axes, or
+    # one random axis = thick slices; half each): each token's voxels area-averaged onto the coarser grid and linearly
+    # re-interpolated (one [P, P] map per image); off-mask voxels stay 0 (the background enters by partial volume)
+    B = sum(g["b"] for g in gs)
+    rng = np.random.default_rng(int(torch.randint(0, 2**31, ())))
+    one = np.arange(3)[None] == rng.integers(0, 3, (B, 1))
+    fac = np.where((rng.random((B, 1)) < 0.5) | one, 1.5 + 0.5 * rng.random((B, 3)), 1.0)  # half all 3 axes, half one
+    k = 0
+    for g in gs:
+        G, b = g["G"], g["b"]
+        ns = [tuple(max(1, min(p, round(p / f))) for p, f in zip(G.patch, fac[k + i])) for i in range(b)]
+        k += b
+        M = torch.stack([_lowres_map(G.patch, n, vimg.device) for n in ns])  # [b, P, P]
+        for buf, mb, base, L, sc in ((vimg, vmsk, g["vb"], V, 1.0), (timg, tw, g["tb"], NP, float(G.P))):
+            x = buf[base : base + b * S * L * G.P].view(b, S, L, G.P)[:, 1:]
+            m = mb[base : base + b * S * L * G.P].view(b, S, L, G.P)[:, 1:]
+            y = torch.bmm(x.reshape(b, -1, G.P), M).view_as(x)
+            x.copy_(y * (m * sc if sc != 1.0 else m))
 
 
 # FAST_FRAC (speed): _frac_kernel's line counts from the line's (<= 2) bitmap words, not two prefix ranks, and its
@@ -956,7 +1349,7 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
         r0, vb, tb = r0 + rows, vb + rows * V * G.P, tb + rows * NP * G.P
     R = r0
     tumor = vol.mass is not None
-    lesion = tumor and any(g["les"] for g in gs)
+    lesion = (tumor or vol.syn_spots) and any(g["les"] for g in gs)
     f32 = dict(device=dev, dtype=torch.float32)
     vimg, vmsk = torch.empty(vb, **f32), torch.empty(vb, **f32)
     vles = torch.empty(vb, **f32) if lesion else vimg
@@ -1015,8 +1408,12 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
         rimg, vol.geo, vol.nrm, vol.bits, vol.pre, vol.vals,
         vol.mass if tumor else d, vol.ti if tumor else d, vol.tf if tumor else d, vol.knots if tumor else d,
         vimg, vmsk, vles, (vol.knots.shape[2] // 5) if tumor else 1, timg, tw, V, seq,
-        TUMOR=tumor, LES=lesion, BLOCK=GATHER_CFG[0], SPLIT=True, NC=13, num_warps=GATHER_CFG[1],
+        TUMOR=tumor, LES=lesion, SPLIT=True, NC=13, **vol.syn_flags(),
+        **dict(zip(("BLOCK", "num_warps"), WARP_CFG if vol.wk is not None else GATHER_CFG)),
     )
+    if vol.syn is not None and vol.syn["res"]:
+        # o-res: views 1.. of every image at a lower resolution (before the swaps / corruptions / targets)
+        lowres_views(gs, vimg, vmsk, timg, tw, S, V, NP)
     # token centres: every group's table in one gather
     ctr = geoms[parts[0]["spacing"]][3][0] if len(parts) == 1 else torch.cat([geoms[p["spacing"]][3][0] for p in parts])
     coord = ctr[order_all + coff[:, None]]
@@ -1075,6 +1472,9 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     les_w = torch.where(keep, w, 0.0)
     les_t = torch.where(keep, pooled[:, 1 + T].flatten(1) / w.clamp_min(1e-6), 0.0)
     syn = ~altered
+    dfm = None
+    if vol.wk is not None:
+        labels, dfm = warp_targets(model, vol, gs, order_all, les_w, labels, S, V)
     for p, g, order in zip(parts, gs, order_all.split([g["rows"] for g in gs])):
         a, z, P = g["r0"], g["r0"] + g["rows"], g["P"]
         del p["vols"], p["scores"]
@@ -1087,6 +1487,8 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
         p["syn_clean"] = syn[a:z]
         p["les_w"], p["les_t"] = les_w[a * V : z * V], les_t[a * V : z * V]
     parts[0]["flat_w"], parts[0]["flat_t"] = tw, timg
+    if dfm is not None:
+        parts[0]["dfm_t"], parts[0]["dfm_w"] = dfm
     return parts
 
 
