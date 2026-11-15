@@ -135,6 +135,22 @@ def main(args: DictConfig):
             DATA_ROOT / "fomo300k" / "tables" / "images.parquet",
         )
 
+    if args.model_kwargs.get("siteadv_weight") or (fino_meta is not None and args.fino3d.get("site")):
+        # obj3 siteadv / finosite (fino3d.site): the training collection index as the metadata's last column
+        # (siteadv_classes / fino3d.site_classes size the heads)
+        from nanobrain.obj3 import site_codes
+
+        assert fino_meta is not None, "siteadv: needs fino3d (the per-image metadata rows)"
+        codes, names = site_codes(Path(args.train_filelist).read_text().split(), DATA_ROOT / "fomo300k" / "tables" / "images.parquet",
+                                  int(args.model_kwargs.get("siteadv_min_count", 300)), list(args.fino3d.get("exclude_collections") or []))
+        args.model_kwargs.pop("siteadv_min_count", None)
+        if args.model_kwargs.get("siteadv_weight"):
+            args.model_kwargs.siteadv_classes = len(names)
+        if args.fino3d.get("site"):
+            args.fino3d.site_classes = names
+        fino_meta = torch.cat([fino_meta, codes[:, None]], 1)
+        logger.info(f"siteadv: {len(names)} collections, {float((~codes.isnan()).float().mean()):.3f} of images labelled")
+
     # model
     model = ViTMAE3D.from_config(args)
     model.decoder_prune_last = args.decoder_prune_last
@@ -396,6 +412,18 @@ def main(args: DictConfig):
         sampler.start //= 2
         sampler = SubjectPairSampler(sampler, subject_counts(dataset.paths)[0], seed=args.seed)
         logger.info("gdist subject pairs: batch images 2k, 2k + 1 share a subject")
+    if args.model_kwargs.get("xcon_pairs") or args.model_kwargs.get("travel_pairs"):
+        # obj3 xcon / travel: batch images 2k, 2k + 1 (k < n) are one session's two contrasts on one grid (xcon) /
+        # one subject's same-contrast scans from two scanners (travel)
+        from nanobrain.obj3 import PairMixSampler, pair_partners
+
+        kind = "xcon" if args.model_kwargs.get("xcon_pairs") else "travel"
+        n = int(args.model_kwargs.get(f"{kind}_pairs"))
+        assert world_size == 1 and not args.get("native_bucket_window") and not args.model_kwargs.get("gdist_weight"), "obj3 pairs"
+        partners = pair_partners(dataset.paths, DATA_ROOT / "fomo300k" / "tables" / "images.parquet", kind)
+        sampler.start = sampler.start * (args.batch_size - n) // args.batch_size
+        sampler = PairMixSampler(sampler, partners, n, args.batch_size, seed=args.seed)
+        logger.info(f"{kind}: {n} pairs per batch, {sum(len(x) > 0 for x in partners)} images with a partner")
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,

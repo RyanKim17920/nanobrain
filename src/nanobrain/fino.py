@@ -30,13 +30,17 @@ T1_SUFFIXES = {"T1w", "T1c", "MP2RAGE", "UNIT1"}
 CONTROL = {"control", "controls", "normal", "hc", "cn", "healthy", "healthy control",
            "healthy controls", "typically developing", "td", "nc"}
 MANUFACTURERS = ("siemens", "ge", "philips")
+# obj3 (off unless fino3d.site / fino3d.tissue): metadata column 7 = the training collection index (train.py), columns
+# 8.. = the sequence's 5 tissue level fractions (model.py, from the level targets); the site head also reads the
+# biological covariates (obj3.bio_cov), so it predicts only the site information biology does not explain
+SITE_COL, TISSUE, NCOV = len(COLUMNS), slice(len(COLUMNS) + 1, len(COLUMNS) + 6), 9
 
 
 def head_dims(cfg) -> dict[str, int]:
     # output width of each enabled head (multiplier != 0)
     dims = {"age": 1, "sex": 1, "group": len(cfg["group_classes"] or []),
             "field_strength": 3, "manufacturer": len(MANUFACTURERS) + 1, "brain_volume": 1,
-            "seqtype": len(SEQTYPES)}
+            "seqtype": len(SEQTYPES), "site": len(cfg.get("site_classes") or []), "tissue": 5}
     return {k: d for k, d in dims.items() if float(cfg.get(k) or 0.0) != 0.0}
 
 
@@ -149,21 +153,30 @@ class FinoHeads(nn.Module):
                              nn.Linear(embed_dim, hidden), nn.GELU(), nn.Linear(hidden, d))
             for k, d in self.dims.items()
         })
+        if "site" in self.dims:
+            self.site_cov = nn.Linear(NCOV, hidden)
 
-    def forward(self, pooled: Tensor, meta: Tensor, gamma: float) -> tuple[Tensor, dict]:
+    def forward(self, pooled: Tensor, meta: Tensor, gamma: float, cov: Tensor | None = None) -> tuple[Tensor, dict]:
         # pooled [R, D] global embeddings, meta [R, 6] (NaN = masked)
         pooled = pooled.float()
         loss = pooled.new_zeros(())
         stats = {}
         with torch.autocast(device_type=pooled.device.type, enabled=False):
             for k, head in self.heads.items():
-                target = meta[:, COLUMNS.index(k)]
+                target = meta[:, COLUMNS.index(k) if k in COLUMNS else SITE_COL if k == "site" else TISSUE]
                 keep = ~torch.isnan(target)
                 # every head runs on every row so the graph (and ddp) sees all params
-                out = head(GradScale.apply(pooled, self.signs[k] * gamma))
+                x = GradScale.apply(pooled, self.signs[k] * gamma)
+                if k == "site":
+                    out = head[3](head[2](head[1](head[0](x)) + self.site_cov(cov.float())))
+                else:
+                    out = head(x)
                 n = keep.sum().clamp_min(1)
                 t = torch.where(keep, target, torch.zeros_like(target))
-                if k in ("age", "brain_volume"):
+                if k == "tissue":
+                    term = F.mse_loss(out.float(), t).mul(10.0)
+                    keep = n = None
+                elif k in ("age", "brain_volume"):
                     term = (F.mse_loss(out[:, 0], t, reduction="none") * keep).sum() / n
                 elif k == "sex":
                     term = (F.binary_cross_entropy_with_logits(out[:, 0], t, reduction="none") * keep).sum() / n
@@ -171,7 +184,7 @@ class FinoHeads(nn.Module):
                     term = (F.cross_entropy(out, t.long(), reduction="none") * keep).sum() / n
                 loss = loss + self.weight * term
                 stats[k] = term.detach()
-                if k not in ("age", "brain_volume"):
+                if k not in ("age", "brain_volume", "tissue"):
                     with torch.no_grad():
                         pred = (out[:, 0] > 0).float() if k == "sex" else out.argmax(-1).float()
                         stats[f"{k}_acc"] = ((pred == t) & keep).sum() / n

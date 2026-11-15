@@ -12,6 +12,8 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
 from .fino import FinoHeads
+from .fino import SITE_COL
+from .obj3 import Obj3, bio_cov, level_fractions, token_mse
 from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
 from .data import (
     crop_to_mask,
@@ -235,6 +237,22 @@ class ViTMAE3D(nn.Module):
         # o-kspace: MSE between the 3d fft magnitudes (ortho, dc out) of the masked-in predicted and target patches
         # (the ~1 mm groups' 8^3 tokens)
         kspace_weight: float = 0.0,
+        # ---- objective round 3 (obj3.py; native training only, 0 = off: no params, the flags-off path unchanged) ----
+        # siteadv: gradient-reversal (siteadv_grl) collection classifier on the pooled embedding (train.py sets
+        # siteadv_classes from the training collections); vicreg: variance hinge (vicreg_gamma) + vicreg_cov x
+        # off-diagonal covariance on it; diffmae: that fraction of mask tokens get a noised target hint;
+        # xcon: batch images 2k, 2k + 1 (k < xcon_pairs, same-session other contrast) swap sequence 1's targets;
+        # travel: SimSiam (travel_weight) between batch images 2k, 2k + 1 (k < travel_pairs: one subject, 2 scanners)
+        siteadv_weight: float = 0.0,
+        siteadv_classes: int = 0,
+        siteadv_grl: float = 0.1,
+        vicreg_weight: float = 0.0,
+        vicreg_cov: float = 0.04,
+        vicreg_gamma: float = 1.0,
+        diffmae_frac: float = 0.0,
+        xcon_pairs: int = 0,
+        travel_weight: float = 0.0,
+        travel_pairs: int = 0,
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -525,6 +543,17 @@ class ViTMAE3D(nn.Module):
             if self.path_syn:
                 assert self.unified_head is not None and self.lesion_head is not None, "path_syn: unified + lesion heads"
                 self.unified_head = zero_linear(self.unified_classes + 1)
+
+        self.obj3 = None
+        if siteadv_weight or vicreg_weight or diffmae_frac or xcon_pairs or travel_weight:
+            assert native, "obj3: native path only"
+            with torch.random.fork_rng(devices=[]):
+                self.obj3 = Obj3(embed_dim, decoder_embed_dim, siteadv_weight, siteadv_classes, siteadv_grl,
+                                 vicreg_weight, vicreg_cov, vicreg_gamma, diffmae_frac, xcon_pairs, travel_weight, travel_pairs)
+        # obj3 biological covariates (site arms: the conditional discriminators + the tissue anchor) from the level targets
+        self.fino_tissue = bool(fino3d and fino3d.get("tissue"))
+        self.bio_on = bool(siteadv_weight or self.fino_tissue or (fino3d and fino3d.get("site")))
+        assert not self.bio_on or level_weight, "obj3 site arms: need the level targets (level_weight)"
 
     @torch.no_grad()
     def brain_frame(
@@ -1216,6 +1245,7 @@ class ViTMAE3D(nn.Module):
         target_coord: Float[Tensor, "B M 3"],
         vis_gate: Float[Tensor, "B N"] | None = None,
         skip: Float[Tensor, "B R+N E"] | None = None,
+        hint: Float[Tensor, "B M E"] | None = None,
     ) -> Float[Tensor, "B M D"]:
         # forward_decoder before the head. vis_gate (rtd suspicion gating, training only): a per
         # visible token value gate in every decoder attention; class and mask tokens stay at 1
@@ -1242,6 +1272,8 @@ class ViTMAE3D(nn.Module):
         mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
         if self.global_proj is not None:
             mask_tokens = mask_tokens + pooled
+        if hint is not None:
+            mask_tokens = mask_tokens + hint
 
         x = torch.cat([embeds, mask_tokens], dim=1)
         if getattr(self, "bf16_residual", False) and self.training:
@@ -1640,10 +1672,28 @@ class ViTMAE3D(nn.Module):
             if self.rtd_gate_scale > 0.0:
                 vis_gate = (2.0 * torch.sigmoid(-self.rtd_gate_scale * rtd_logits)).clamp(max=1.0)
                 vis_gate = vis_gate.to(embeds.dtype)
-        if fuse_skip is None:
-            feats = self.decode_features(embeds, cat("target_coord"), vis_gate)
+        o3 = self.obj3 if self.training else None
+        o3_perm = o3_hint = o3_keep = None
+        if o3 is not None:
+            o3.stats = {}
+            o3_perm = o3.xcon_perm(parts, num_samples, device)
+            if o3.diffmae_frac:
+                NP = parts[0]["target_coord"].shape[1]
+                tg = ([t.view(len(p["ids"]) * num_samples, NP, -1) for p, t in zip(parts, torch.split(
+                    parts[0]["flat_t"], [len(p["ids"]) * num_samples * NP * int(np.prod(p["patch"])) for p in parts]))]
+                      if "flat_t" in parts[0] else [p["target_patches"] for p in parts])
+                o3_hint, o3_keep = o3.diffmae_hint(
+                    parts, tg, lambda x, p: self.patch_embed.native(x, p["spacing"], p["patch"], embed_ws.get(p["spacing"])))
+        tcoord = cat("target_coord") if o3_perm is None else cat("target_coord")[o3_perm]
+        if o3_hint is not None and o3_perm is not None:
+            o3_hint = o3_hint[o3_perm]
+        if fuse_skip is None and o3_hint is None:
+            feats = self.decode_features(embeds, tcoord, vis_gate)
         else:
-            feats = self.decode_features(embeds, cat("target_coord"), vis_gate, fuse_skip)
+            feats = self.decode_features(embeds, tcoord, vis_gate, fuse_skip, o3_hint)
+        if o3_perm is not None:
+            # row r decoded row perm[r]'s targets: back to the target's row (perm is an involution)
+            feats = feats[o3_perm]
         dfeats = feats
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
@@ -1659,6 +1709,8 @@ class ViTMAE3D(nn.Module):
                 sp = part["spacing"]
                 part["pred_patches"] = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
                 preds.append(part["pred_patches"].flatten())
+            if o3 is not None and getattr(self, "want_stats", True):
+                o3.flat = (flat_rows(preds), parts[0]["flat_t"], parts[0]["flat_w"])
             w, t = parts[0].pop("flat_w"), parts[0].pop("flat_t")
             if getattr(self, "compiled_loss", False):
                 # compiled_loss: the masked mse sums as one compiled reduction (dynamic length)
@@ -1708,6 +1760,18 @@ class ViTMAE3D(nn.Module):
                 grad_num += [(mx * dx).sum(), (my * dy).sum(), (mz * dz).sum()]
                 grad_den += [mx.sum(), my.sum(), mz.sum()]
         loss = flat_cat(losses).sum() / flat_cat(wts).sum()
+        if o3 is not None:
+            o3.stats["pix_loss"] = loss.detach()
+            if getattr(o3, "flat", None) is not None:
+                num, den = token_mse(parts, *o3.flat, num_samples, parts[0]["target_coord"].shape[1])
+                o3.flat = None
+                if o3_keep is not None:
+                    o3.stats["diff_hint_mse"] = (num * o3_keep).sum() / (den * o3_keep).sum().clamp_min(1e-6)
+                    o3.stats["diff_plain_mse"] = (num * ~o3_keep).sum() / (den * ~o3_keep).sum().clamp_min(1e-6)
+                if o3_perm is not None:
+                    xr = (o3_perm != torch.arange(len(o3_perm), device=device))[:, None]
+                    o3.stats["xcon_mse"] = (num * xr).sum() / (den * xr).sum().clamp_min(1e-6)
+                    o3.stats["xcon_own_mse"] = (num * ~xr).sum() / (den * ~xr).sum().clamp_min(1e-6)
         if self.grad_loss_weight > 0.0:
             # per axis over every spacing group (grad_num holds x, y, z per group; only the first
             # group's three terms were used before)
@@ -1728,6 +1792,8 @@ class ViTMAE3D(nn.Module):
                 logits = self._head("level_head", embeds[:, self.class_tokens :])
                 num, den = _wbce(logits, target, weight) if getattr(self, "compiled_loss", False) else _wbce_eager(logits, target, weight)
                 den = den * target.shape[1]
+                if self.bio_on and self.training:
+                    self._bio_frac = level_fractions(weight, target, embeds.shape[0])
             else:
                 for part, tokens in zip(parts, rows):
                     n, d = self.level_terms(
@@ -1782,8 +1848,19 @@ class ViTMAE3D(nn.Module):
             meta = fino_meta.cpu()[rows]
             if device.type == "cuda":
                 meta = meta.pin_memory().to(device, non_blocking=True)
-            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
+            cov = None
+            if self.bio_on and self.training:
+                frac = self.__dict__.pop("_bio_frac")
+                assert meta.shape[1] == SITE_COL + 1, "obj3 site arms: train.py appends the site column"
+                cov = bio_cov(meta, frac)
+                if self.fino_tissue:
+                    meta = torch.cat([meta, frac], 1)
+            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma, cov)
             loss = loss + fino_loss
+        if o3 is not None and (o3.site_head is not None or o3.vicreg_weight or o3.travel_weight):
+            has = self.fino_heads is not None and fino_meta is not None
+            pairs = o3.pair_rows(parts, num_samples, o3.travel_pairs, False) if o3.travel_weight else None
+            loss = loss + o3.global_losses(embeds[:, self.class_tokens :].mean(dim=1), meta if has else None, cov if has else None, pairs)
         if rtd_on:
             labels = cat("rtd_label").float()
             logits = rtd_logits
@@ -1844,6 +1921,8 @@ class ViTMAE3D(nn.Module):
         if self.training and (self.deform_weight or self.res_weight or self.kspace_weight or self.path_syn):
             rec = flat_cat(losses).sum() / flat_cat(wts).sum()
             loss = loss + self.obj2_losses(parts, embeds, num_samples, num_visible, rec)
+        if o3 is not None:
+            self.aux_stats = {**getattr(self, "aux_stats", {}), **o3.stats}
         for part in parts:
             part.pop("vis_patches", None)
             part.pop("vis_mask", None)
