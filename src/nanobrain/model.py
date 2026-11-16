@@ -222,7 +222,7 @@ class ViTMAE3D(nn.Module):
         # ---- gap round (native sparse training only; 0 = off: no params, the flags-off path unchanged) ----
         # tumour description from the GLOBAL embedding: an MLP on each sequence's mean visible token predicts whether
         # a synthetic tumour was pasted (BCE, every row) and, for pasted rows, its kind (nodule / ring / diffuse, CE),
-        # log radius, contrast, log edge width and centre in the box (MSE on fixed-scale targets)
+        # log radius, contrast and log edge width (MSE on fixed-scale targets; all cpu draws, no gpu reads)
         tumor_desc_weight: float = 0.0,
         # lesion-pool distillation: an MLP maps each sequence's batch-centred mean visible token to the stop-grad,
         # batch-centred lesion-head-weighted pool of its own visible tokens (weights sigmoid(lesion head), detached),
@@ -538,7 +538,7 @@ class ViTMAE3D(nn.Module):
             if self.tumor_desc_weight:
                 assert native and tumor_prob, "tumor_desc: native path, tumours on"
                 self.tumor_desc_head = nn.Sequential(
-                    nn.LayerNorm(embed_dim, elementwise_affine=False), nn.Linear(embed_dim, 256), nn.GELU(), nn.Linear(256, 10)
+                    nn.LayerNorm(embed_dim, elementwise_affine=False), nn.Linear(embed_dim, 256), nn.GELU(), nn.Linear(256, 7)
                 )
                 self.tumor_desc_head.apply(_init_weights)
 
@@ -1824,13 +1824,12 @@ class ViTMAE3D(nn.Module):
             st = {"td_bce": td.detach()}
             if tdesc is not None:
                 rows = idx.clamp_min(0).to(device, non_blocking=True)
-                flags, cen = tdesc[1][0].to(device, non_blocking=True)[rows], tdesc[1][1].float()[rows]
+                flags = tdesc[1].to(device, non_blocking=True)[rows]
                 kind = torch.where(flags[:, 0] > 0.5, 0, torch.where(flags[:, 1] > 0.5, 1, 2))
                 w = has.float()
                 n = w.sum().clamp_min(1.0)
                 ce = (F.cross_entropy(out[:, 1:4], kind, reduction="none") * w).sum() / n
-                reg = torch.cat([flags[:, 2:], cen], 1)
-                mse = ((out[:, 4:] - reg).square().mean(1) * w).sum() / n
+                mse = ((out[:, 4:].float() - flags[:, 2:]).square().mean(1) * w).sum() / n
                 td = td + ce + mse
                 st["td_ce"], st["td_mse"] = ce.detach(), mse.detach()
             loss = loss + self.tumor_desc_weight * td
@@ -2099,9 +2098,9 @@ class ViTMAE3D(nn.Module):
             and self.corrupt_head is None and self.orient_head is None and self.edgelvl_head is None
         ):
             # FAST_TOK (speed): the rest below as a few batched launches over flat buffers (sparse.fast_tokens)
-            return sparse_mod.fast_tokens(
+            return self._attach_tdesc(sparse_mod.fast_tokens(
                 self, sparse, parts, order_all, (cand, labels, kind), geoms, num_samples, num_visible, num_predict
-            )
+            ), tdesc, num_samples)
 
         def finish(part, order, num, vols, coord, b, vis_patches, vis_mask):
             # a group's tokenization after its unified corruption (split out so batched_corrupt can apply
@@ -2280,6 +2279,9 @@ class ViTMAE3D(nn.Module):
             # flat in group order, so forward_native's loss is one pass over the cat of the predictions
             parts[0]["flat_w"] = flat_rows([(p.pop("target_mask_patches") / p["target_patches"].shape[-1]).flatten() for p in parts])
             parts[0]["flat_t"] = flat_rows([p.pop("target_patches").flatten() for p in parts])
+        return self._attach_tdesc(parts, tdesc, num_samples)
+
+    def _attach_tdesc(self, parts: list[dict], tdesc, num_samples: int) -> list[dict]:
         if getattr(self, "tumor_desc_head", None) is not None and self.training:
             # rows part by part, image-major, num_samples each (as embeds): the paste index of each row's image, -1 none
             img = torch.tensor([ii for p in parts for ii in p["ids"]]).repeat_interleave(num_samples)
@@ -2739,9 +2741,9 @@ def plan_tumors(
         knots = (0.15 * torch.randn(1, 2, 5 * k, 5, 5, device=dev)).clamp(-0.25, 0.25)
         out = {"owners": owners, "lo": lo, "num": num, "par": torch.cat([cols, centre - lo, lim], 1), "knots": knots}
         if desc:
-            # tumor_desc targets: kind flags, log radius, contrast, log edge width (cpu draws), centre in [-1, 1]
-            out["desc"] = (torch.stack([is_nodule.double(), is_ring.double(), (r.log() - 2.5) / 0.5, (amp - 2.5) / 1.0,
-                                        (width.log() - 1.0) / 0.5], 1).float(), centre / dims * 2 - 1)
+            # tumor_desc targets (cpu draws): kind flags, log radius, contrast, log edge width
+            out["desc"] = torch.stack([is_nodule.double(), is_ring.double(), (r.log() - 2.5) / 0.5, (amp - 2.5) / 1.0,
+                                       (width.log() - 1.0) / 0.5], 1).float()
         return out
 
     # every box voxel of every mass in one ragged row: owner, then its box and volume indices
