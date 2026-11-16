@@ -160,19 +160,48 @@ def _block_tensors(sd: dict, family: str, ii: int) -> dict[str, torch.Tensor]:
     }
 
 
-def inflate_patch_kernel(w2: torch.Tensor, p: int) -> torch.Tensor:
+def inflate_patch_kernel(w2: torch.Tensor, p: int, mode: str = "avg") -> torch.Tensor:
     """[D, C, k, k] 2D patch kernel -> [D, p*p*p] canonical 1 mm kernel (px py pz flattened).
 
     RGB summed into one channel (a grey image fed as R=G=B gives the same response), the k x k
     kernel sum-pooled to p x p in-plane cells (x <- kernel rows, y <- columns; each 1 mm voxel
     gathers the weights of the pixels it covers, so a smooth input keeps its response), then
-    replicated along z and divided by p: an input constant along z gives the 2D response."""
+    replicated along z and divided by p: an input constant along z gives the 2D response.
+    mode triplanar (natinit.embed_mode, ms-cur B): the mean of the pooled kernel laid in the three orthogonal planes
+    (xy constant along z, xz constant along y, yz constant along x), each / p: a constant input keeps the 2D response
+    and each anatomical plane (axial / coronal / sagittal) sees the 2D filter, not only the axial one."""
     D, _, k, _ = w2.shape
     w = w2.float().sum(dim=1, keepdim=True)
     # adaptive average pooling handles k not a multiple of p (14 -> 8); x (k/p)^2 keeps the sum
     w = F.adaptive_avg_pool2d(w, (p, p)) * (k * k) / (p * p)
+    if mode == "triplanar":
+        w = w[:, 0]
+        w = (w[:, :, :, None] + w[:, :, None, :] + w[:, None, :, :]) / (3 * p)
+        return w.reshape(D, p * p * p).contiguous()
+    assert mode == "avg", f"natinit.embed_mode={mode}: avg | triplanar"
     w = w[:, 0, :, :, None].expand(D, p, p, p) / p
     return w.reshape(D, p * p * p).contiguous()
+
+
+_POS_KEYS = {"mae": "vit.embeddings.position_embeddings", "dinov2": "pos_embed", "mmpretrain": "backbone.pos_embed"}
+
+
+@torch.no_grad()
+def transfer_pos(model, sd: dict, family: str) -> str:
+    """natinit.pos=2d (ms-cur B): the pretrained 2D position table (cls row dropped) as its best additive
+    row + column split (exact for MAE's per-dim sin-cos), linearly resampled (corners aligned) onto the encoder's
+    x (<- image columns) and y (<- image rows) tables: the axial plane gets the pretrained 2D code; z stays random."""
+    pe = sd[_POS_KEYS[family]].float()[0]
+    n = int(round((pe.shape[0] - 1) ** 0.5))
+    pe = pe[-n * n :].view(n, n, -1)
+    rows = pe.mean(1)
+    cols = pe.mean(0) - pe.mean((0, 1))
+    pos = model.pos_embed
+    for wt, src in ((pos.weight_x, cols), (pos.weight_y, rows)):
+        if wt.shape[1] != src.shape[1]:
+            return f"pos 2d: width {src.shape[1]} vs {wt.shape[1]}, kept random"
+        wt.copy_(F.interpolate(src.t()[None], size=wt.shape[0], mode="linear", align_corners=True)[0].t())
+    return f"pos 2d: {n}x{n} table -> x {tuple(pos.weight_x.shape)}, y {tuple(pos.weight_y.shape)} (z random)"
 
 
 @torch.no_grad()
@@ -215,14 +244,16 @@ def apply_natural_init(model, cfg) -> dict:
     if cfg.embed:
         w2, b2 = sd[pprefix + "weight"], sd[pprefix + "bias"]
         p = model.patch_embed.patch_size if hasattr(model.patch_embed, "patch_size") else model.patch_size[0]
-        w3 = inflate_patch_kernel(w2, p)
+        mode = str(cfg.get("embed_mode") or "avg")
+        w3 = inflate_patch_kernel(w2, p, mode)
         if w3.shape != model.patch_embed.weight.shape:
             report["mismatch"].append(f"patch embed {tuple(w3.shape)} vs {tuple(model.patch_embed.weight.shape)}")
         else:
             model.patch_embed.weight.copy_(w3)
             model.patch_embed.bias.copy_(b2)
             report["copied"].append(
-                f"patch embed inflated {tuple(w2.shape)} -> {tuple(w3.shape)} (rgb sum, pool to {p}x{p}, /{p} along z)"
+                f"patch embed inflated {tuple(w2.shape)} -> {tuple(w3.shape)} (rgb sum, pool to {p}x{p}, "
+                + (f"/{p} along z)" if mode == "avg" else f"{mode}, /{3 * p})")
             )
     else:
         report["skipped"].append("patch embed kept random")
@@ -230,6 +261,8 @@ def apply_natural_init(model, cfg) -> dict:
     if cfg.pos_scale != 1.0:
         for wt in (model.pos_embed.weight_x, model.pos_embed.weight_y, model.pos_embed.weight_z):
             wt.mul_(cfg.pos_scale)
+    if str(cfg.get("pos") or "random") == "2d":
+        report["copied"].append(transfer_pos(model, sd, family))
     report["skipped"].append(f"pos embed random (x{cfg.pos_scale}), decoder / heads random")
     if family == "mmpretrain":
         n_used = min(n_src, len(model.blocks))

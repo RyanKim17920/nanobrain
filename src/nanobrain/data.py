@@ -27,6 +27,8 @@ class Fomo300kDataset(Dataset):
         self.meta = None
         # per-image subject index (subject_counts keys), for same-subject negative masking; None = off
         self.subject_ids = None
+        # cur_* sampling (cur.py): each sample carries its dataset index as "didx"; False = off
+        self.with_index = False
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -50,6 +52,8 @@ class Fomo300kDataset(Dataset):
             sample["fino"] = self.meta[index].numpy()
         if self.subject_ids is not None:
             sample["subject"] = int(self.subject_ids[index])
+        if self.with_index:
+            sample["didx"] = int(index)
         return sample
 
 
@@ -129,8 +133,23 @@ class InfiniteSampler(Sampler[int]):
         # optional per-image sampling weights (subject tempering): passes of num_samples draws
         # with replacement instead of permutations (None = uniform permutations, the default)
         self.weights = None
+        # cur_* sampling (cur.Curator): adaptive = each pass drawn in chunks of 4096 with weights x mult (per image,
+        # swapped in by the training loop; None = x 1). False = the passes above, unchanged
+        self.adaptive = False
+        self.mult = None
+
+    def _chunks(self, generator):
+        base = self.weights if self.weights is not None else torch.ones(self.num_samples, dtype=torch.float64)
+        for start in range(0, self.num_samples, 4096):
+            mult = self.mult
+            w = base if mult is None else base * mult
+            yield from torch.multinomial(
+                w, min(4096, self.num_samples - start), replacement=True, generator=generator
+            ).tolist()
 
     def _pass(self, generator):
+        if self.adaptive:
+            return self._chunks(generator)
         if self.weights is None:
             return torch.randperm(self.num_samples, generator=generator).tolist()
         return torch.multinomial(

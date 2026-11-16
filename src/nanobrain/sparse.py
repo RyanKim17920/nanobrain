@@ -1132,6 +1132,9 @@ def sparse_batch_transform(batch: dict, target_spacing: float = 1.0) -> dict:
         out["fino"] = torch.from_numpy(np.stack([s["fino"] for s in samples]))
     if "subject" in samples[0]:
         out["subject"] = torch.tensor([s["subject"] for s in samples], dtype=torch.int64)
+    if "didx" in samples[0]:
+        # cur_* sampling: dataset indices (pinned, for a non-blocking copy in the training loop)
+        out["didx"] = torch.tensor([s["didx"] for s in samples], dtype=torch.int64).pin_memory()
     return out
 
 

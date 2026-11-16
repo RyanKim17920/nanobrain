@@ -166,6 +166,17 @@ natinit:
   # layer-wise lr decay over the pretrained blocks: block i gets block_lr_mult * layer_decay ** (depth - 1 - i)
   layer_decay: 1.0
   pos_scale: 1.0
+  # ms-cur B (off by default): embed_mode avg | triplanar (natinit.inflate_patch_kernel); pos random | 2d (the
+  # pretrained 2D position table onto the x / y tables, natinit.transfer_pos); freeze_steps: pretrained blocks at lr 0
+  # for that many steps, then ramped back over as many (train.train)
+  embed_mode: avg
+  pos: random
+  freeze_steps: 0
+# ms-cur A (off by default; cur.py, native_sparse_tokens + native_flat_loss): online loss-driven sampling over
+# collection x contrast domains (cur_dom_alpha) and images (cur_img_alpha), hard-token loss weighting (cur_focal)
+cur_dom_alpha: 0.0
+cur_img_alpha: 0.0
+cur_focal: 0.0
 
 wandb: false
 wandb_entity: null

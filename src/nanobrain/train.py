@@ -174,6 +174,11 @@ def main(args: DictConfig):
     model.compiled_loss = bool(args.get("native_compiled_loss", False))
     # OPTIMIZATION-CHANGING (off when unset): the encoder / decoder residual streams in bf16 (fp32 now)
     model.bf16_residual = bool(args.get("native_bf16_residual", False))
+    if args.get("cur_focal"):
+        # ms-cur A (off when unset): hard-token reconstruction weighting (cur.token_stats), flat loss only
+        assert args.get("native_flat_loss"), "cur_focal: native_flat_loss"
+        model.cur_focal = float(args.cur_focal)
+        model.cur_focal_max = float(args.get("cur_focal_max") or 4.0)
     assert not args.get("native_sparse_tokens") or (args.get("native_prep_tokens") and args.get("native_batched_prep"))
     if args.get("native_fast_prep"):
         # speed (off when unset; with native_sparse_tokens): the prep threads' tokenization as a few batched launches
@@ -395,6 +400,15 @@ def main(args: DictConfig):
             f"effective subjects {eff_before:.0f} -> {effective_subjects(dataset.paths, sampler.weights):.0f}, "
             f"effective images {n_eff:.0f} of {len(dataset)}"
         )
+    curator = None
+    if args.get("cur_dom_alpha") or args.get("cur_img_alpha"):
+        # ms-cur A (off when unset): online loss-driven sampling weights (cur.Curator), on the base sampler
+        from nanobrain.cur import Curator
+
+        assert args.get("native_sparse_tokens") and args.get("native_flat_loss"), "cur: sparse path + flat loss"
+        dataset.with_index = True
+        curator = Curator(args, dataset.paths, sampler, device)
+        model_without_ddp.cur_track = True
     if args.get("native_bucket_window"):
         # speed, CHANGES BATCH COMPOSITION (off when unset): windows of native_bucket_window batches sorted by
         # spacing, so a batch has fewer spacing groups (data.BucketSampler)
@@ -514,6 +528,7 @@ def main(args: DictConfig):
         batch_flops,
         stop_event,
         native_cudagraphs,
+        curator=curator,
     )
 
     if args.distributed:
@@ -586,8 +601,23 @@ def train(
     batch_flops: float,
     stop_event: threading.Event,
     native_cudagraphs: bool = False,
+    curator=None,
 ) -> dict:
     model.train()
+    # ms-cur B (off when unset): natinit.freeze_steps F: the pretrained blocks + final norm at lr 0 for F steps, then
+    # their lr multiplier ramps linearly back to 1 over the next F (the rest trains from step 0: an LP-FT warm start)
+    freeze = int(args.natinit.get("freeze_steps") or 0) if args.get("natinit") and args.natinit.enabled else 0
+    nat_groups = []
+    if freeze:
+        from nanobrain.natinit import is_natinit_param
+
+        nat = {id(p) for n, p in model_without_ddp.named_parameters() if is_natinit_param(n)}
+        for group in optimizer.param_groups:
+            ins = [id(p) in nat for p in group["params"]]
+            assert all(ins) or not any(ins), "natinit.freeze_steps: a param group mixes pretrained and new params"
+            if all(ins):
+                nat_groups.append(group)
+        logger.info(f"natinit freeze_steps {freeze}: {len(nat_groups)} pretrained param groups")
 
     metric_logger = misc.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", misc.SmoothedValue(window_size=1, fmt="{value:.6f}"))
@@ -683,6 +713,9 @@ def train(
             lr = float(lr_schedule[step])
         if need_update:
             misc.update_lr(optimizer.param_groups, lr)
+            if nat_groups and step < 2 * freeze:
+                for group in nat_groups:
+                    group["lr"] *= min(max((step - freeze) / freeze, 0.0), 1.0)
 
         # run volume processing on gpu, not cpu workers, ~25x faster (prep threads: already done)
         if batch_transform is not None:
@@ -756,6 +789,9 @@ def train(
             need_update=need_update,
             max_norm=args.clip_grad,
         )
+
+        if curator is not None and "didx" in batch:
+            curator.observe(model_without_ddp, batch["didx"], step)
 
         # log tensors without syncing, values are only read on log steps
         metric_logger.update(loss=loss_for_log)

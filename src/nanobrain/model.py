@@ -1712,6 +1712,12 @@ class ViTMAE3D(nn.Module):
             if o3 is not None and getattr(self, "want_stats", True):
                 o3.flat = (flat_rows(preds), parts[0]["flat_t"], parts[0]["flat_w"])
             w, t = parts[0].pop("flat_w"), parts[0].pop("flat_t")
+            if getattr(self, "cur_track", False) or getattr(self, "cur_focal", 0.0):
+                # cur.py (off when unset): per image loss for the curation sampler; focal token weights
+                from .cur import token_stats
+
+                fw = token_stats(self, parts, flat_rows(preds), t, w, num_samples)
+                w = w if fw is None else fw
             if getattr(self, "compiled_loss", False):
                 # compiled_loss: the masked mse sums as one compiled reduction (dynamic length)
                 num, den = _wmse(flat_rows(preds), t, w)
