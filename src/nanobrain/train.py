@@ -56,8 +56,6 @@ def main(args: DictConfig):
         # ddp under torchrun, one process per gpu. batch_size is per gpu
         torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
         dist.init_process_group(backend="nccl")
-    if args.get("native_fp8_mlp"):
-        te_preload()
     rank, world_size = misc.get_rank(), misc.get_world_size()
     device = torch.device(args.device)
     # the ranks draw different views; rank 0's model init is broadcast by ddp
@@ -135,22 +133,6 @@ def main(args: DictConfig):
             DATA_ROOT / "fomo300k" / "tables" / "images.parquet",
         )
 
-    if args.model_kwargs.get("siteadv_weight") or (fino_meta is not None and args.fino3d.get("site")):
-        # obj3 siteadv / finosite (fino3d.site): the training collection index as the metadata's last column
-        # (siteadv_classes / fino3d.site_classes size the heads)
-        from nanobrain.obj3 import site_codes
-
-        assert fino_meta is not None, "siteadv: needs fino3d (the per-image metadata rows)"
-        codes, names = site_codes(Path(args.train_filelist).read_text().split(), DATA_ROOT / "fomo300k" / "tables" / "images.parquet",
-                                  int(args.model_kwargs.get("siteadv_min_count", 300)), list(args.fino3d.get("exclude_collections") or []))
-        args.model_kwargs.pop("siteadv_min_count", None)
-        if args.model_kwargs.get("siteadv_weight"):
-            args.model_kwargs.siteadv_classes = len(names)
-        if args.fino3d.get("site"):
-            args.fino3d.site_classes = names
-        fino_meta = torch.cat([fino_meta, codes[:, None]], 1)
-        logger.info(f"siteadv: {len(names)} collections, {float((~codes.isnan()).float().mean()):.3f} of images labelled")
-
     # model
     model = ViTMAE3D.from_config(args)
     model.decoder_prune_last = args.decoder_prune_last
@@ -192,22 +174,6 @@ def main(args: DictConfig):
 
         apply_natural_init(model, args.natinit)
     model.to(device)
-    if args.get("native_fp8"):
-        # NUMERICS-CHANGING (off when unset): fp8 compute for the encoder / decoder block linears (torchao float8
-        # training, dynamic scaling; native_fp8_recipe tensorwise | rowwise | rowwise_with_gw_hp). the weights stay
-        # fp32 parameters with the same names (state dict, muon, the eval loader unchanged); only the matmuls cast.
-        # heads, embeddings and projections stay bf16. needs torchao (a venv with it: NB_PYTHON)
-        from torchao.float8 import Float8LinearConfig, convert_to_float8_training
-
-        def fp8_filter(mod: nn.Module, fqn: str) -> bool:
-            return (
-                isinstance(mod, nn.Linear) and fqn.startswith(("blocks.", "decoder_blocks."))
-                and mod.in_features % 16 == 0 and mod.out_features % 16 == 0
-            )
-
-        recipe = str(args.get("native_fp8_recipe") or "tensorwise")
-        convert_to_float8_training(model, config=Float8LinearConfig.from_recipe_name(recipe), module_filter_fn=fp8_filter)
-        logger.info(f"native_fp8: {recipe} float8 linears in the encoder / decoder blocks")
     logger.info(f"model:\n{model}")
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     logger.info(f"num params: {num_params / 1e6:.1f}M")
@@ -225,42 +191,11 @@ def main(args: DictConfig):
             if isinstance(mod, Mlp) and mod.fc1.bias is not None:
                 mod.lt_gelu = True
 
-    if args.get("native_fp8_lt"):
-        # speed, NUMERICS-CHANGING (off when unset): the encoder blocks' linears (training) as in-graph cuBLASLt fp8 GEMMs
-        # (kernels.py: rowwise-scaled e4m3 fprop / dgrad, bf16 wgrad). native_fp8_lt = comma list of mlp | qkv | proj.
-        # native_fp8_lt_bwd = fp8 (default) | bf16: bf16 dgrad too (fp8 fprop only; backward errors don't compound)
-        from nanobrain import cublaslt, kernels
-
-        bwd = str(args.get("native_fp8_lt_bwd") or "fp8")
-        assert bwd in ("fp8", "bf16"), f"native_fp8_lt_bwd={bwd}: fp8 | bf16"
-        kernels.BWD_BF16 = bwd == "bf16"
-
-        cublaslt.init(device)
-        parts = str(args.native_fp8_lt).split(",")
-        for block in model.blocks:
-            block.mlp.fp8, block.attn.fp8_qkv, block.attn.fp8_proj = "mlp" in parts, "qkv" in parts, "proj" in parts
-        logger.info(f"native_fp8_lt: encoder {parts} as fp8 GEMMs, {bwd} dgrad")
     if args.get("native_muon_syrk"):
         # speed, same math up to rounding: muon's symmetric newton-schulz products as upper-triangle GEMMs (kernels.py)
         from nanobrain import optim
 
         optim.NS_SYRK = True
-    if args.get("native_fp8_mlp"):
-        # speed, NUMERICS-CHANGING (off when unset): every block's norm2 + mlp (training) as transformer engine's
-        # LayerNormMLP in fp8 (delayed scaling, HYBRID e4m3 / e5m2, amax history 16) on the same parameters.
-        # native_fp8_mlp = encoder | decoder | all. needs a venv with transformer_engine (NB_PYTHON) and, for TE 2.21's
-        # cu13 core, cuBLASLt >= 13.2 preloaded (LD_PRELOAD the cuda 13.3 libcublasLt / libcublas)
-        from transformer_engine.common.recipe import DelayedScaling, Format
-
-        from nanobrain import modules as M
-
-        M.TE_RECIPE = DelayedScaling(fp8_format=Format.HYBRID, amax_history_len=16, amax_compute_algo="max")
-        which = str(args.native_fp8_mlp)
-        blocks = [*(model.blocks if which in ("encoder", "all", "True") else []),
-                  *(model.decoder_blocks if which in ("decoder", "all") else [])]
-        for block in blocks:
-            M.te_layernorm_mlp(block)
-        logger.info(f"native_fp8_mlp: {len(blocks)} blocks' norm2 + mlp as fp8 LayerNormMLP")
 
     model_without_ddp = model
     if args.distributed:
@@ -412,18 +347,6 @@ def main(args: DictConfig):
         sampler.start //= 2
         sampler = SubjectPairSampler(sampler, subject_counts(dataset.paths)[0], seed=args.seed)
         logger.info("gdist subject pairs: batch images 2k, 2k + 1 share a subject")
-    if args.model_kwargs.get("xcon_pairs") or args.model_kwargs.get("travel_pairs"):
-        # obj3 xcon / travel: batch images 2k, 2k + 1 (k < n) are one session's two contrasts on one grid (xcon) /
-        # one subject's same-contrast scans from two scanners (travel)
-        from nanobrain.obj3 import PairMixSampler, pair_partners
-
-        kind = "xcon" if args.model_kwargs.get("xcon_pairs") else "travel"
-        n = int(args.model_kwargs.get(f"{kind}_pairs"))
-        assert world_size == 1 and not args.get("native_bucket_window") and not args.model_kwargs.get("gdist_weight"), "obj3 pairs"
-        partners = pair_partners(dataset.paths, DATA_ROOT / "fomo300k" / "tables" / "images.parquet", kind)
-        sampler.start = sampler.start * (args.batch_size - n) // args.batch_size
-        sampler = PairMixSampler(sampler, partners, n, args.batch_size, seed=args.seed)
-        logger.info(f"{kind}: {n} pairs per batch, {sum(len(x) > 0 for x in partners)} images with a partner")
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
@@ -552,22 +475,6 @@ def main(args: DictConfig):
         logger.info(f"done! step {step}, wall time: {wall_time_str}")
     else:
         logger.info(f"stopped by signal at step {step}. wall time: {wall_time_str}")
-
-
-def te_preload() -> None:
-    # transformer engine 2.21's cu13 core needs cuBLASLt >= 13.2 symbols; torch's wheel loads 13.1 first. re-exec once
-    # with the cuda toolkit's cuBLAS(Lt) preloaded (+ the venv's cudnn on the library path), before any cuda call
-    lt = os.environ.get("NB_TE_CUBLAS_DIR", "/usr/local/cuda-13.3/lib64")
-    if "libcublasLt" in os.environ.get("LD_PRELOAD", ""):
-        return
-    import sys
-
-    nv = Path(torch.__file__).parent.parent / "nvidia"
-    env = dict(os.environ, LD_PRELOAD=f"{lt}/libcublasLt.so.13:{lt}/libcublas.so.13",
-               LD_LIBRARY_PATH=":".join(filter(None, [str(nv / "cudnn" / "lib"), str(nv / "cu13" / "lib"),
-                                                       os.environ.get("LD_LIBRARY_PATH")])))
-    logger.info("transformer engine: re-exec with the cuda toolkit cuBLAS preloaded")
-    os.execve(sys.executable, sys.orig_argv, env)
 
 
 def train(

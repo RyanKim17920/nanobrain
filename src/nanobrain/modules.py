@@ -20,8 +20,6 @@ Layer = Type[nn.Module]
 
 
 class Attention(nn.Module):
-    fp8_qkv = fp8_proj = False  # native_fp8_lt (train.py)
-
     def __init__(
         self,
         dim: int,
@@ -70,17 +68,9 @@ class Attention(nn.Module):
         _, M, _ = context.shape
         h = self.num_heads
 
-        if self.fp8_qkv and self.training and context is x:
-            # native_fp8_lt (NUMERICS-CHANGING): q, k, v as one in-graph fp8 GEMM (kernels.QKV8)
-            from nanobrain.kernels import QKV8
-
-            w = torch.cat([self.q.weight, self.k.weight, self.v.weight])
-            b = torch.cat([self.q.bias, self.k.bias, self.v.bias]) if self.q.bias is not None else None
-            q, k, v = QKV8.apply(x.reshape(B * N, D).to(torch.bfloat16), w, b, B, h)
-        else:
-            q = self.q(x).reshape(B, N, h, D // h).transpose(1, 2)
-            k = self.k(context).reshape(B, M, h, D // h).transpose(1, 2)
-            v = self.v(context).reshape(B, M, h, D // h).transpose(1, 2)
+        q = self.q(x).reshape(B, N, h, D // h).transpose(1, 2)
+        k = self.k(context).reshape(B, M, h, D // h).transpose(1, 2)
+        v = self.v(context).reshape(B, M, h, D // h).transpose(1, 2)
         if vgate is not None:
             # per-key value gate (rtd suspicion gating): a gated key still takes attention mass but
             # contributes a shrunk value. None = the plain attention
@@ -90,10 +80,6 @@ class Attention(nn.Module):
             k = self.k_norm(k)
         x = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         x = x.transpose(1, 2).reshape(B, N, D)
-        if self.fp8_proj and self.training:
-            from nanobrain.kernels import linear8
-
-            return linear8(x, self.proj)
         x = self.proj(x)
         return x
 
@@ -102,7 +88,6 @@ class Mlp(nn.Module):
     # lt_gelu (training speed, NUMERICS-CHANGING: tanh GELU; set by train.py native_lt_gelu): fc1 + bias + GELU
     # and fc2's input grad + GELU' as cuBLASLt epilogues (cublaslt.LtMlp)
     lt_gelu = False
-    fp8 = False  # native_fp8_lt (NUMERICS-CHANGING): fc1 / GELU / fc2 as in-graph fp8 GEMMs (kernels.Mlp8), training only
 
     def __init__(
         self,
@@ -117,10 +102,6 @@ class Mlp(nn.Module):
         self.fc2 = nn.Linear(hidden_features, dim, bias=bias)
 
     def forward(self, x: Float[Tensor, "... D"]) -> Float[Tensor, "... D"]:
-        if self.fp8 and self.training:
-            from nanobrain.kernels import mlp8
-
-            return mlp8(x, self)
         if self.lt_gelu and self.training:
             from nanobrain.cublaslt import LtMlp
 
@@ -186,10 +167,6 @@ class Block(nn.Module):
         return x + self._mlp_branch(x)
 
     def _mlp_branch(self, x: Tensor) -> Tensor:
-        te_mlp = self.__dict__.get("te_mlp")
-        if te_mlp is not None and self.training and TE_ON:
-            # native_fp8_mlp (NUMERICS-CHANGING): norm2 + mlp as transformer engine's fp8 LayerNormMLP
-            return _te_mlp(te_mlp, x)
         return self.drop_path2(self.mlp(self.norm2(x)))
 
     def forward_last_rows(
@@ -199,36 +176,6 @@ class Block(nn.Module):
         h = self.norm1(x)
         x = x[:, -num_rows:] + self.drop_path1(self.attn(h[:, -num_rows:], context=h, vgate=vgate))
         return x + self._mlp_branch(x)
-
-
-TE_RECIPE = None  # native_fp8_mlp: the transformer engine fp8 recipe (train.py)
-TE_ON = True  # dev in-run A/B switch
-
-
-@torch.compiler.disable
-def _te_mlp(mod: nn.Module, x: Tensor) -> Tensor:
-    # outside the compiled graphs (a graph break per block): transformer engine runs its own fp8 cast / amax kernels
-    import transformer_engine.pytorch as te
-
-    with te.fp8_autocast(enabled=True, fp8_recipe=TE_RECIPE):
-        return mod(x)
-
-
-def te_layernorm_mlp(block: "Block") -> nn.Module:
-    # a transformer engine LayerNormMLP (tanh GELU) on the block's own norm2 / fc1 / fc2 parameters (shared, so the
-    # state dict, the optimizers and the eval path see the same tensors); not registered as a submodule
-    import transformer_engine.pytorch as te
-
-    fc1, fc2, ln = block.mlp.fc1, block.mlp.fc2, block.norm2
-    mod = te.LayerNormMLP(
-        fc1.in_features, fc1.out_features, eps=ln.eps, bias=fc1.bias is not None, activation="gelu",
-        params_dtype=torch.float32, device=fc1.weight.device,
-    )
-    for name, p in [("layer_norm_weight", ln.weight), ("layer_norm_bias", ln.bias), ("fc1_weight", fc1.weight),
-                    ("fc1_bias", fc1.bias), ("fc2_weight", fc2.weight), ("fc2_bias", fc2.bias)]:
-        setattr(mod, name, p)
-    block.__dict__["te_mlp"] = mod
-    return mod
 
 
 # Position embedding

@@ -12,8 +12,6 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
 from .fino import FinoHeads
-from .fino import SITE_COL
-from .obj3 import Obj3, bio_cov, level_fractions, token_mse
 from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
 from .data import (
     crop_to_mask,
@@ -221,38 +219,6 @@ class ViTMAE3D(nn.Module):
         # subject = batch images 2k <-> 2k+1 (one subject, train.py's subject-pair sampler)
         gdist_weight: float = 0.0,
         gdist_pairs: str = "sample",
-        # ---- objective round 2 (native_sparse_tokens + native_fast_prep training only; 0 / False = off) ----
-        # o-deform: views 1.. of every image read through a smooth random displacement field (knots 24 mm apart, rms
-        # deform_mm x U(0.3, 1), zero mean; MAE targets the deformed view), view 0 undeformed; a zero-init Linear(D, 3)
-        # (in the fused heads) gives each visible token an anatomical position h, and h(view-1 token) - h(view-0 token
-        # at the same place) regresses the displacement / deform_mm there (MSE, in-mask weighted, clean pairs)
-        deform_weight: float = 0.0,
-        deform_mm: float = 3.0,
-        # o-path: + MS / WMH-like ovoids and microbleed-like foci (lesion target) + an atrophy warp (ventricular
-        # enlargement; the unified head's extra "atrophy" class), lesion and tumour polarity by the sequence
-        path_syn: bool = False,
-        # o-res: views 1.. of each image at 1.5-2x coarser voxels; 1 - cos between a low-res view's visible encoder
-        # tokens and the stop-grad view-0 (native resolution) tokens at the same token (both clean)
-        res_weight: float = 0.0,
-        # o-kspace: MSE between the 3d fft magnitudes (ortho, dc out) of the masked-in predicted and target patches
-        # (the ~1 mm groups' 8^3 tokens)
-        kspace_weight: float = 0.0,
-        # ---- objective round 3 (obj3.py; native training only, 0 = off: no params, the flags-off path unchanged) ----
-        # siteadv: gradient-reversal (siteadv_grl) collection classifier on the pooled embedding (train.py sets
-        # siteadv_classes from the training collections); vicreg: variance hinge (vicreg_gamma) + vicreg_cov x
-        # off-diagonal covariance on it; diffmae: that fraction of mask tokens get a noised target hint;
-        # xcon: batch images 2k, 2k + 1 (k < xcon_pairs, same-session other contrast) swap sequence 1's targets;
-        # travel: SimSiam (travel_weight) between batch images 2k, 2k + 1 (k < travel_pairs: one subject, 2 scanners)
-        siteadv_weight: float = 0.0,
-        siteadv_classes: int = 0,
-        siteadv_grl: float = 0.1,
-        vicreg_weight: float = 0.0,
-        vicreg_cov: float = 0.04,
-        vicreg_gamma: float = 1.0,
-        diffmae_frac: float = 0.0,
-        xcon_pairs: int = 0,
-        travel_weight: float = 0.0,
-        travel_pairs: int = 0,
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -532,28 +498,6 @@ class ViTMAE3D(nn.Module):
                 assert native, "gdist: native path only"
                 self.gdist_pred = nn.Sequential(nn.Linear(embed_dim, 256), nn.GELU(), nn.Linear(256, embed_dim))
                 self.gdist_pred.apply(_init_weights)
-        # objective round 2 (same: fork_rng, zero init)
-        self.deform_weight, self.deform_mm = float(deform_weight), float(deform_mm)
-        self.path_syn, self.res_weight, self.kspace_weight = bool(path_syn), float(res_weight), float(kspace_weight)
-        self.deform_head = None
-        with torch.random.fork_rng(devices=[]):
-            if self.deform_weight:
-                assert native, "deform: native path only"
-                self.deform_head = zero_linear(3)
-            if self.path_syn:
-                assert self.unified_head is not None and self.lesion_head is not None, "path_syn: unified + lesion heads"
-                self.unified_head = zero_linear(self.unified_classes + 1)
-
-        self.obj3 = None
-        if siteadv_weight or vicreg_weight or diffmae_frac or xcon_pairs or travel_weight:
-            assert native, "obj3: native path only"
-            with torch.random.fork_rng(devices=[]):
-                self.obj3 = Obj3(embed_dim, decoder_embed_dim, siteadv_weight, siteadv_classes, siteadv_grl,
-                                 vicreg_weight, vicreg_cov, vicreg_gamma, diffmae_frac, xcon_pairs, travel_weight, travel_pairs)
-        # obj3 biological covariates (site arms: the conditional discriminators + the tissue anchor) from the level targets
-        self.fino_tissue = bool(fino3d and fino3d.get("tissue"))
-        self.bio_on = bool(siteadv_weight or self.fino_tissue or (fino3d and fino3d.get("site")))
-        assert not self.bio_on or level_weight, "obj3 site arms: need the level targets (level_weight)"
 
     @torch.no_grad()
     def brain_frame(
@@ -1245,7 +1189,6 @@ class ViTMAE3D(nn.Module):
         target_coord: Float[Tensor, "B M 3"],
         vis_gate: Float[Tensor, "B N"] | None = None,
         skip: Float[Tensor, "B R+N E"] | None = None,
-        hint: Float[Tensor, "B M E"] | None = None,
     ) -> Float[Tensor, "B M D"]:
         # forward_decoder before the head. vis_gate (rtd suspicion gating, training only): a per
         # visible token value gate in every decoder attention; class and mask tokens stay at 1
@@ -1272,8 +1215,6 @@ class ViTMAE3D(nn.Module):
         mask_tokens = self.decoder_pos_embed(mask_tokens, target_coord)
         if self.global_proj is not None:
             mask_tokens = mask_tokens + pooled
-        if hint is not None:
-            mask_tokens = mask_tokens + hint
 
         x = torch.cat([embeds, mask_tokens], dim=1)
         if getattr(self, "bf16_residual", False) and self.training:
@@ -1655,8 +1596,7 @@ class ViTMAE3D(nn.Module):
         self._fh = {}
         if getattr(self, "fused_heads", False) and self.training:
             # fused_heads: the level / lesion / unified token heads as one linear (one weight cast, one input grad)
-            use = {"level_head": "lvl_w" in parts[0], "lesion_head": True, "unified_head": "unified_label" in parts[0],
-                   "deform_head": "dfm_t" in parts[0]}
+            use = {"level_head": "lvl_w" in parts[0], "lesion_head": True, "unified_head": "unified_label" in parts[0]}
             hs = [(n, getattr(self, n)) for n, u in use.items() if u and getattr(self, n) is not None]
             if len(hs) > 1:
                 # zero rows pad the output width to a multiple of 8 (aligned gemm)
@@ -1672,28 +1612,10 @@ class ViTMAE3D(nn.Module):
             if self.rtd_gate_scale > 0.0:
                 vis_gate = (2.0 * torch.sigmoid(-self.rtd_gate_scale * rtd_logits)).clamp(max=1.0)
                 vis_gate = vis_gate.to(embeds.dtype)
-        o3 = self.obj3 if self.training else None
-        o3_perm = o3_hint = o3_keep = None
-        if o3 is not None:
-            o3.stats = {}
-            o3_perm = o3.xcon_perm(parts, num_samples, device)
-            if o3.diffmae_frac:
-                NP = parts[0]["target_coord"].shape[1]
-                tg = ([t.view(len(p["ids"]) * num_samples, NP, -1) for p, t in zip(parts, torch.split(
-                    parts[0]["flat_t"], [len(p["ids"]) * num_samples * NP * int(np.prod(p["patch"])) for p in parts]))]
-                      if "flat_t" in parts[0] else [p["target_patches"] for p in parts])
-                o3_hint, o3_keep = o3.diffmae_hint(
-                    parts, tg, lambda x, p: self.patch_embed.native(x, p["spacing"], p["patch"], embed_ws.get(p["spacing"])))
-        tcoord = cat("target_coord") if o3_perm is None else cat("target_coord")[o3_perm]
-        if o3_hint is not None and o3_perm is not None:
-            o3_hint = o3_hint[o3_perm]
-        if fuse_skip is None and o3_hint is None:
-            feats = self.decode_features(embeds, tcoord, vis_gate)
+        if fuse_skip is None:
+            feats = self.decode_features(embeds, cat("target_coord"), vis_gate)
         else:
-            feats = self.decode_features(embeds, tcoord, vis_gate, fuse_skip, o3_hint)
-        if o3_perm is not None:
-            # row r decoded row perm[r]'s targets: back to the target's row (perm is an involution)
-            feats = feats[o3_perm]
+            feats = self.decode_features(embeds, cat("target_coord"), vis_gate, fuse_skip)
         dfeats = feats
         feats = torch.split(feats, [len(part["ids"]) * num_samples for part in parts])
         # graft: the v3 loss stack, extended to per-spacing native patches. norm_target
@@ -1709,20 +1631,16 @@ class ViTMAE3D(nn.Module):
                 sp = part["spacing"]
                 part["pred_patches"] = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
                 preds.append(part["pred_patches"].flatten())
-            if o3 is not None and getattr(self, "want_stats", True):
-                o3.flat = (flat_rows(preds), parts[0]["flat_t"], parts[0]["flat_w"])
-            w, t = parts[0].pop("flat_w"), parts[0].pop("flat_t")
+            w = parts[0].pop("flat_w")
             if getattr(self, "compiled_loss", False):
                 # compiled_loss: the masked mse sums as one compiled reduction (dynamic length)
-                num, den = _wmse(flat_rows(preds), t, w)
+                num, den = _wmse(flat_rows(preds), parts[0].pop("flat_t"), w)
                 losses.append(num.view(1))
                 wts.append(den.view(1))
             else:
-                losses.append(w * F.mse_loss(flat_rows(preds), t, reduction="none"))
+                losses.append(w * F.mse_loss(flat_rows(preds), parts[0].pop("flat_t"), reduction="none"))
                 wts.append(w)
             feats = ()
-            if self.kspace_weight and self.training:
-                self._ks = self.kspace_loss(parts, preds, t, w)
         for part, feat in zip(parts, feats):
             sp = part["spacing"]
             pred = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
@@ -1760,18 +1678,6 @@ class ViTMAE3D(nn.Module):
                 grad_num += [(mx * dx).sum(), (my * dy).sum(), (mz * dz).sum()]
                 grad_den += [mx.sum(), my.sum(), mz.sum()]
         loss = flat_cat(losses).sum() / flat_cat(wts).sum()
-        if o3 is not None:
-            o3.stats["pix_loss"] = loss.detach()
-            if getattr(o3, "flat", None) is not None:
-                num, den = token_mse(parts, *o3.flat, num_samples, parts[0]["target_coord"].shape[1])
-                o3.flat = None
-                if o3_keep is not None:
-                    o3.stats["diff_hint_mse"] = (num * o3_keep).sum() / (den * o3_keep).sum().clamp_min(1e-6)
-                    o3.stats["diff_plain_mse"] = (num * ~o3_keep).sum() / (den * ~o3_keep).sum().clamp_min(1e-6)
-                if o3_perm is not None:
-                    xr = (o3_perm != torch.arange(len(o3_perm), device=device))[:, None]
-                    o3.stats["xcon_mse"] = (num * xr).sum() / (den * xr).sum().clamp_min(1e-6)
-                    o3.stats["xcon_own_mse"] = (num * ~xr).sum() / (den * ~xr).sum().clamp_min(1e-6)
         if self.grad_loss_weight > 0.0:
             # per axis over every spacing group (grad_num holds x, y, z per group; only the first
             # group's three terms were used before)
@@ -1792,8 +1698,6 @@ class ViTMAE3D(nn.Module):
                 logits = self._head("level_head", embeds[:, self.class_tokens :])
                 num, den = _wbce(logits, target, weight) if getattr(self, "compiled_loss", False) else _wbce_eager(logits, target, weight)
                 den = den * target.shape[1]
-                if self.bio_on and self.training:
-                    self._bio_frac = level_fractions(weight, target, embeds.shape[0])
             else:
                 for part, tokens in zip(parts, rows):
                     n, d = self.level_terms(
@@ -1848,19 +1752,8 @@ class ViTMAE3D(nn.Module):
             meta = fino_meta.cpu()[rows]
             if device.type == "cuda":
                 meta = meta.pin_memory().to(device, non_blocking=True)
-            cov = None
-            if self.bio_on and self.training:
-                frac = self.__dict__.pop("_bio_frac")
-                assert meta.shape[1] == SITE_COL + 1, "obj3 site arms: train.py appends the site column"
-                cov = bio_cov(meta, frac)
-                if self.fino_tissue:
-                    meta = torch.cat([meta, frac], 1)
-            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma, cov)
+            fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
             loss = loss + fino_loss
-        if o3 is not None and (o3.site_head is not None or o3.vicreg_weight or o3.travel_weight):
-            has = self.fino_heads is not None and fino_meta is not None
-            pairs = o3.pair_rows(parts, num_samples, o3.travel_pairs, False) if o3.travel_weight else None
-            loss = loss + o3.global_losses(embeds[:, self.class_tokens :].mean(dim=1), meta if has else None, cov if has else None, pairs)
         if rtd_on:
             labels = cat("rtd_label").float()
             logits = rtd_logits
@@ -1918,11 +1811,6 @@ class ViTMAE3D(nn.Module):
             loss = loss + self.aux_losses(parts, embeds, num_samples, subject_ids, device)
         if self.training and (self.xlat_head is not None or self.gdist_pred is not None):
             loss = loss + self.obj_losses(parts, dfeats, embeds, geoms, num_samples, num_visible)
-        if self.training and (self.deform_weight or self.res_weight or self.kspace_weight or self.path_syn):
-            rec = flat_cat(losses).sum() / flat_cat(wts).sum()
-            loss = loss + self.obj2_losses(parts, embeds, num_samples, num_visible, rec)
-        if o3 is not None:
-            self.aux_stats = {**getattr(self, "aux_stats", {}), **o3.stats}
         for part in parts:
             part.pop("vis_patches", None)
             part.pop("vis_mask", None)
@@ -1980,12 +1868,7 @@ class ViTMAE3D(nn.Module):
             sparse.geometry(groups, geoms)
             images, mask = [torch.empty(sh, device="meta") for sh in sparse.ras], None
         device = images[0].device if sparse is None else sparse.device
-        tumors, owners = {}, set()
-        syn = self.training and (self.deform_weight or self.path_syn or self.res_weight)
-        if syn:
-            from . import sparse as sparse_mod
-
-            assert sparse is not None and sparse_mod.FAST_TOK, "objective round 2: native_sparse_tokens + native_fast_prep"
+        tumors = {}
         if self.training and self.tumor_prob * self.tumor_scale > 0:
             tumors = plan_tumors(
                 images, mask if sparse is None else images, groups, geoms, self.tumor_prob * self.tumor_scale,
@@ -1993,8 +1876,6 @@ class ViTMAE3D(nn.Module):
                 neg=self.tumor_neg_prob, lims=lims, sparse=sparse,
             )
             if sparse is not None:
-                if self.path_syn and tumors:
-                    sparse.tumor_polarity(tumors)
                 sparse.tumors(tumors)
                 owners, tumors = set(tumors.get("owners", ())), {}
         parts = []
@@ -2004,8 +1885,6 @@ class ViTMAE3D(nn.Module):
 
             svols = {sp: sparse.group(sp, ids, geoms[sp][0], geoms[sp][2]) for sp, ids in groups.items()}
             sfrac = dict(zip(svols, frac_all(sparse, list(svols.values()))))
-            if syn:
-                owners = owners | sparse.syn_plan(self, groups, geoms, sfrac)
         from . import sparse as sparse_mod
 
         fast_scores = sparse is not None and sparse_mod.FAST_SCORES
@@ -2399,8 +2278,6 @@ class ViTMAE3D(nn.Module):
                     names = ["swap", "bias", "blur", "noise", "gamma", "down", "contrast", "ghost"][: 1 + self.corrupt_kinds]
                     if self.unified_shuffle:
                         names.append("shuf")
-                    if self.path_syn:
-                        names.append("atr")
                     for c, name in enumerate(names, start=1):
                         sel = labels == c
                         stats[f"uc_rec_{name}"] = ((pred == c) & sel).sum() / sel.sum().clamp_min(1)
@@ -2462,72 +2339,6 @@ class ViTMAE3D(nn.Module):
             loss = loss + self.gdist_weight * gd
             stats["gdist_loss"] = gd.detach()
             stats["gdist_cos"] = F.cosine_similarity(z, z[partner], dim=-1).mean().detach()
-        self.aux_stats = {**getattr(self, "aux_stats", {}), **stats}
-        return loss
-
-    def kspace_loss(self, parts: list[dict], preds: list[Tensor], t: Tensor, w: Tensor) -> Tensor:
-        # o-kspace: per predicted token, the squared difference of the 3d fft magnitudes (ortho, dc out) of the
-        # in-mask prediction and of the target (0 off the mask), / voxels, weighted by its in-mask fraction. phase
-        # free: the texture power at high frequencies that the pixel mse lets a blurry prediction drop counts. on the
-        # ~1 mm groups' 8^3-voxel tokens only (every group shape a launch set of its own: the step is launch bound),
-        # the half spectrum (re | im) as one matmul with the cached dft basis
-        sel, o = [], 0
-        for part, pred in zip(parts, preds):
-            n = pred.numel()
-            if tuple(part["patch"]) == (8, 8, 8):
-                sel.append((pred, t[o : o + n], w[o : o + n]))
-            o += n
-        if not sel:
-            return t.new_zeros(())
-        p, tt, ww = [(torch.cat(x) if len(x) > 1 else x[0]).view(-1, 512) for x in zip(*sel)]
-        m = ww > 0
-        W = _dft_basis((8, 8, 8), p.device)
-        fp, ft = [torch.mm(x, W).view(x.shape[0], 2, -1).square().sum(1).add(1e-12).sqrt() for x in (p.float() * m, tt)]
-        frac = m.float().mean(1)
-        return ((fp - ft).square()[:, 1:].sum(1) * frac).sum() / 512 / frac.sum().clamp_min(1e-6)
-
-    def obj2_losses(self, parts: list[dict], embeds: Tensor, S: int, V: int, rec: Tensor) -> Tensor:
-        # the objective round 2 losses (training only, every spacing group at once); stats into self.aux_stats
-        loss, stats = embeds.new_zeros((), dtype=torch.float32), {"rec_loss": rec.detach()}
-        tokens = embeds[:, self.class_tokens :]
-        dfm = "dfm_t" in parts[0]
-        if dfm or self.res_weight:
-            # each view-1 visible token's slot among its image's view-0 visible tokens (sorted ids + searchsorted),
-            # and whether it is there with both copies clean (rows: image-major, sample-minor, groups in order)
-            assert S == 2, "deform / res: num_samples 2"
-            t = torch.cat([p["order"][..., :V] for p in parts]) if len(parts) > 1 else parts[0]["order"][..., :V]
-            lab = torch.cat([p["unified_label"] for p in parts]).view(-1, S, V)
-            s0, i0 = t[:, 0].sort(-1)
-            pos = torch.searchsorted(s0, t[:, 1].contiguous()).clamp_max(V - 1)
-            slot = i0.gather(1, pos)
-            hit = (s0.gather(1, pos) == t[:, 1]) & (lab[:, 1] == 0) & (lab[:, 0].gather(1, slot) == 0)
-        if dfm:
-            # registration-like: the head maps a token to its content's anatomical position (3 numbers); a view-1
-            # token's displacement = h(view-1 token) - h(the view-0 token at the same place) (view 0 undeformed)
-            h = self._head("deform_head", tokens).float().view(-1, S, V, 3)
-            pred = h[:, 1] - h[:, 0].gather(1, slot[..., None].expand(-1, -1, 3))
-            tgt = parts[0].pop("dfm_t").view(-1, S, V, 3)[:, 1]
-            wt = parts[0].pop("dfm_w").view(-1, S, V)[:, 1] * hit
-            num = ((pred - tgt).square().mean(-1) * wt).sum()
-            df = num / wt.sum().clamp_min(1e-6)
-            loss = loss + self.deform_weight * df
-            stats["dfm_loss"] = df.detach()
-            stats["dfm_r2"] = (1 - num / (tgt.square().mean(-1) * wt).sum().clamp_min(1e-6)).detach()
-        if self.res_weight:
-            # 1 - cos between each low-res (view 1) token and the stop-grad view-0 token at the same place, on
-            # features centred on the batch mean token (stop-grad: the shared offset would make every cos ~1)
-            e = (tokens.float() - tokens.float().mean((0, 1)).detach()).view(-1, S, V, tokens.shape[-1])
-            z0 = e[:, 0].gather(1, slot[..., None].expand(-1, -1, e.shape[-1])).detach()
-            den = hit.sum()
-            rl = ((1 - F.cosine_similarity(e[:, 1], z0, dim=-1)) * hit).sum() / den.clamp_min(1)
-            loss = loss + self.res_weight * rl
-            stats["res_loss"], stats["res_pairs"] = rl.detach(), (den / len(tokens)).detach()
-        if self.kspace_weight:
-            ks = self.__dict__.pop("_ks")
-            loss = loss + self.kspace_weight * ks
-            stats["ks_loss"] = ks.detach()
-        if self.path_syn and getattr(self, "want_stats", True):
-            stats["atr_frac"] = (torch.cat([p["unified_label"] for p in parts]) == self.unified_classes).float().mean()
         self.aux_stats = {**getattr(self, "aux_stats", {}), **stats}
         return loss
 
@@ -2843,13 +2654,6 @@ def plan_tumors(
         out[sp] = (flat[a:b], val[a:b], outer[a:b], lim[a:b])
         t += n
     return out
-
-
-@lru_cache(maxsize=64)
-def _dft_basis(patch: tuple, device) -> Tensor:
-    # o-kspace: [P, 2 F] real / imaginary parts of the ortho 3d rfft of every voxel basis vector (dc first)
-    f = torch.fft.rfftn(torch.eye(math.prod(patch), dtype=torch.float64).view(-1, *patch), dim=(1, 2, 3), norm="ortho")
-    return torch.cat([f.real.flatten(1), f.imag.flatten(1)], 1).float().to(device)
 
 
 @lru_cache(maxsize=1024)
