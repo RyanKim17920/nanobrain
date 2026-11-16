@@ -249,6 +249,15 @@ def main(args: DictConfig):
         index = {}
         dataset.subject_ids = np.array([index.setdefault(k, len(index)) for k in keys], dtype=np.int64)
         logger.info(f"scanmatch: {len(index)} subject keys for negative masking")
+    if args.model_kwargs.get("gdist_site_center"):
+        # gap round: the collection (site) of each image as the batch "subject" ids (site-centred xsubj)
+        from nanobrain.data import subject_counts
+
+        assert not float(args.model_kwargs.get("scanmatch_weight", 0.0) or 0.0), "gdist_site_center: scanmatch off"
+        keys, _ = subject_counts(dataset.paths)
+        index = {}
+        dataset.subject_ids = np.array([index.setdefault(k.rsplit("/", 1)[0], len(index)) for k in keys], dtype=np.int64)
+        logger.info(f"gdist_site_center: {len(index)} collections")
     logger.info(f"train dataset: {len(dataset)} images")
 
     if args.epochs:
@@ -345,7 +354,12 @@ def main(args: DictConfig):
 
         assert args.batch_size % 2 == 0 and world_size == 1 and not args.get("native_bucket_window"), "subject pairs"
         sampler.start //= 2
-        sampler = SubjectPairSampler(sampler, subject_counts(dataset.paths)[0], seed=args.seed)
+        pair_keys = subject_counts(dataset.paths)[0]
+        if args.get("gdist_pair_same_mod"):
+            # gap round: the partner is one of the subject's images of the same BIDS datatype (anat / dwi / perf)
+            pair_keys = [f"{k}|{p.split('/')[-2]}" for k, p in zip(pair_keys, dataset.paths)]
+            logger.info(f"gdist subject pairs: same datatype, {len(set(pair_keys))} keys")
+        sampler = SubjectPairSampler(sampler, pair_keys, seed=args.seed)
         logger.info("gdist subject pairs: batch images 2k, 2k + 1 share a subject")
     fast_prep = not args.native
     train_loader = DataLoader(

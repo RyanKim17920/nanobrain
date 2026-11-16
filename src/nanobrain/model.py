@@ -219,6 +219,24 @@ class ViTMAE3D(nn.Module):
         # subject = batch images 2k <-> 2k+1 (one subject, train.py's subject-pair sampler)
         gdist_weight: float = 0.0,
         gdist_pairs: str = "sample",
+        # ---- gap round (native sparse training only; 0 = off: no params, the flags-off path unchanged) ----
+        # tumour description from the GLOBAL embedding: an MLP on each sequence's mean visible token predicts whether
+        # a synthetic tumour was pasted (BCE, every row) and, for pasted rows, its kind (nodule / ring / diffuse, CE),
+        # log radius, contrast, log edge width and centre in the box (MSE on fixed-scale targets)
+        tumor_desc_weight: float = 0.0,
+        # lesion-pool distillation: an MLP maps each sequence's batch-centred mean visible token to the stop-grad,
+        # batch-centred lesion-head-weighted pool of its own visible tokens (weights sigmoid(lesion head), detached),
+        # 1 - cos, on rows whose max token lesion probability exceeds lespool_thresh (pasted or real lesions)
+        lespool_weight: float = 0.0,
+        lespool_thresh: float = 0.5,
+        # mid-layer keep: an MLP maps each sequence's batch-centred mean final token to the stop-grad, batch-centred
+        # mean of the layer-normed block-midkeep_layer output (1-based, as fuse_layers), 1 - cos (needs fuse_layers)
+        midkeep_weight: float = 0.0,
+        midkeep_layer: int = 10,
+        # site-centred xsubj (gdist_pairs=subject): z is centred by an EMA of its collection's mean pooled token
+        # (train.py passes collection ids as subject_ids) instead of the batch mean, so the pull carries the
+        # subject's deviation from its site, not the site
+        gdist_site_center: bool = False,
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -498,6 +516,31 @@ class ViTMAE3D(nn.Module):
                 assert native, "gdist: native path only"
                 self.gdist_pred = nn.Sequential(nn.Linear(embed_dim, 256), nn.GELU(), nn.Linear(256, embed_dim))
                 self.gdist_pred.apply(_init_weights)
+            self.midkeep_weight, self.midkeep_layer = float(midkeep_weight), int(midkeep_layer)
+            self.midkeep_pred = None
+            if self.midkeep_weight:
+                assert native and self.fuse_layers and 1 <= self.midkeep_layer < depth, "midkeep: fuse path, 1..depth-1"
+                self.midkeep_pred = nn.Sequential(nn.Linear(embed_dim, 256), nn.GELU(), nn.Linear(256, embed_dim))
+                self.midkeep_pred.apply(_init_weights)
+            self.gdist_site_center = bool(gdist_site_center)
+            if self.gdist_site_center:
+                assert self.gdist_weight and gdist_pairs == "subject", "gdist_site_center: xsubj on"
+                self.register_buffer("site_mean", torch.zeros(4096, embed_dim), persistent=False)
+                self.register_buffer("site_seen", torch.zeros(4096), persistent=False)
+            self.lespool_weight, self.lespool_thresh = float(lespool_weight), float(lespool_thresh)
+            self.lespool_pred = None
+            if self.lespool_weight:
+                assert native and lesion_mask_weight, "lespool: native path, lesion head on"
+                self.lespool_pred = nn.Sequential(nn.Linear(embed_dim, 256), nn.GELU(), nn.Linear(256, embed_dim))
+                self.lespool_pred.apply(_init_weights)
+            self.tumor_desc_weight = float(tumor_desc_weight)
+            self.tumor_desc_head = None
+            if self.tumor_desc_weight:
+                assert native and tumor_prob, "tumor_desc: native path, tumours on"
+                self.tumor_desc_head = nn.Sequential(
+                    nn.LayerNorm(embed_dim, elementwise_affine=False), nn.Linear(embed_dim, 256), nn.GELU(), nn.Linear(256, 10)
+                )
+                self.tumor_desc_head.apply(_init_weights)
 
     @torch.no_grad()
     def brain_frame(
@@ -1165,6 +1208,7 @@ class ViTMAE3D(nn.Module):
 
         index = {l: jj for jj, l in enumerate(self.fuse_layers)}
         skip = None
+        keep = None
         if 0 in index:
             skip = self.fuse_projs[index[0]](self.fuse_norms[index[0]](x))
         for ii, block in enumerate(self.blocks):
@@ -1173,7 +1217,12 @@ class ViTMAE3D(nn.Module):
             if jj is not None:
                 term = self.fuse_projs[jj](self.fuse_norms[jj](x))
                 skip = term if skip is None else skip + term
+            if getattr(self, "midkeep_pred", None) is not None and ii + 1 == self.midkeep_layer:
+                # midkeep target: the layer-normed block output's mean token (no grad)
+                keep = F.layer_norm(x[:, self.class_tokens :].detach().float(), x.shape[-1:]).mean(1)
         x = self.norm(x)
+        if keep is not None:
+            return x, self.fuse_scale * skip, keep
         return x, self.fuse_scale * skip
 
     def forward_decoder(
@@ -1588,9 +1637,9 @@ class ViTMAE3D(nn.Module):
         bp_on = self.brainpos_head is not None and self.training and "bp_target" in parts[0]
         fuse_skip = None
         if self.fuse_layers and self.training:
-            embeds, fuse_skip = self.encode_tokens_fused(
-                cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None
-            )
+            enc = self.encode_tokens_fused(cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None)
+            embeds, fuse_skip = enc[0], enc[1]
+            self._midkeep = enc[2] if len(enc) > 2 else None
         else:
             embeds = self.encode_tokens(cat("embeds"), cat("vis_coord"), cat("bp_hide") if bp_on else None)
         self._fh = {}
@@ -1737,6 +1786,19 @@ class ViTMAE3D(nn.Module):
             lw = lw.clamp_min(1e-6)
             les_loss = num / lw
             loss = loss + self.lesion_mask_weight * self.lesion_scale * les_loss
+            if getattr(self, "lespool_pred", None) is not None:
+                tok = embeds[:, self.class_tokens :].float()
+                p = torch.sigmoid(logits.detach().float().view(*tok.shape[:2], -1)).mean(-1)  # [R, V]
+                keep = (p.amax(1) > self.lespool_thresh).float()
+                w = p / p.sum(1, keepdim=True).clamp_min(1e-6)
+                tgt = torch.einsum("rv,rvd->rd", w, tok).detach()
+                tgt = tgt - tgt.mean(0, keepdim=True)
+                z = tok.mean(1)
+                z = z - z.mean(0, keepdim=True).detach()
+                cos = F.cosine_similarity(self.lespool_pred(z).float(), tgt, dim=-1)
+                lp = ((1.0 - cos) * keep).sum() / keep.sum().clamp_min(1.0)
+                loss = loss + self.lespool_weight * lp
+                self.tdesc_stats = {"lp_loss": lp.detach(), "lp_frac": keep.mean().detach()}
             self.level_mirror_stats = {
                 **self.level_mirror_stats, "les_bce": les_loss.detach(),
                 **({"les_pos": ((weight * target).sum() / lw).detach()} if getattr(self, "want_stats", True) else {}),
@@ -1754,6 +1816,25 @@ class ViTMAE3D(nn.Module):
                 meta = meta.pin_memory().to(device, non_blocking=True)
             fino_loss, self.fino_stats = self.fino_heads(pooled, meta, fino_gamma)
             loss = loss + fino_loss
+        if getattr(self, "tumor_desc_head", None) is not None and self.training and "tdesc" in parts[0]:
+            idx, tdesc = parts[0].pop("tdesc")
+            out = self.tumor_desc_head(embeds[:, self.class_tokens :].float().mean(dim=1))
+            has = (idx >= 0).to(device, non_blocking=True)
+            td = F.binary_cross_entropy_with_logits(out[:, 0], has.float())
+            st = {"td_bce": td.detach()}
+            if tdesc is not None:
+                rows = idx.clamp_min(0).to(device, non_blocking=True)
+                flags, cen = tdesc[1][0].to(device, non_blocking=True)[rows], tdesc[1][1].float()[rows]
+                kind = torch.where(flags[:, 0] > 0.5, 0, torch.where(flags[:, 1] > 0.5, 1, 2))
+                w = has.float()
+                n = w.sum().clamp_min(1.0)
+                ce = (F.cross_entropy(out[:, 1:4], kind, reduction="none") * w).sum() / n
+                reg = torch.cat([flags[:, 2:], cen], 1)
+                mse = ((out[:, 4:] - reg).square().mean(1) * w).sum() / n
+                td = td + ce + mse
+                st["td_ce"], st["td_mse"] = ce.detach(), mse.detach()
+            loss = loss + self.tumor_desc_weight * td
+            self.tdesc_stats = st
         if rtd_on:
             labels = cat("rtd_label").float()
             logits = rtd_logits
@@ -1810,7 +1891,17 @@ class ViTMAE3D(nn.Module):
         if self.training and any(h is not None for h in aux_on):
             loss = loss + self.aux_losses(parts, embeds, num_samples, subject_ids, device)
         if self.training and (self.xlat_head is not None or self.gdist_pred is not None):
-            loss = loss + self.obj_losses(parts, dfeats, embeds, geoms, num_samples, num_visible)
+            loss = loss + self.obj_losses(parts, dfeats, embeds, geoms, num_samples, num_visible, subject_ids)
+        if self.training and getattr(self, "midkeep_pred", None) is not None and self._midkeep is not None:
+            z = embeds[:, self.class_tokens :].float().mean(1)
+            z = z - z.mean(0, keepdim=True).detach()
+            t = self._midkeep - self._midkeep.mean(0, keepdim=True)
+            mk = 1.0 - F.cosine_similarity(self.midkeep_pred(z).float(), t, dim=-1).mean()
+            loss = loss + self.midkeep_weight * mk
+            self.tdesc_stats = {"mk_loss": mk.detach()}
+            self._midkeep = None
+        if getattr(self, "tdesc_stats", None):
+            self.aux_stats = {**getattr(self, "aux_stats", {}), **self.tdesc_stats}
         for part in parts:
             part.pop("vis_patches", None)
             part.pop("vis_mask", None)
@@ -1868,13 +1959,16 @@ class ViTMAE3D(nn.Module):
             sparse.geometry(groups, geoms)
             images, mask = [torch.empty(sh, device="meta") for sh in sparse.ras], None
         device = images[0].device if sparse is None else sparse.device
-        tumors = {}
+        tumors, tdesc = {}, None
+        assert getattr(self, "tumor_desc_head", None) is None or sparse is not None, "tumor_desc: native_sparse_tokens"
         if self.training and self.tumor_prob * self.tumor_scale > 0:
             tumors = plan_tumors(
                 images, mask if sparse is None else images, groups, geoms, self.tumor_prob * self.tumor_scale,
                 self.tumor_radius, self.tumor_ring, self.tumor_contrast, self.tumor_edge, self.tumor_nodule,
-                neg=self.tumor_neg_prob, lims=lims, sparse=sparse,
+                neg=self.tumor_neg_prob, lims=lims, sparse=sparse, desc=getattr(self, "tumor_desc_head", None) is not None,
             )
+            if "desc" in tumors:
+                tdesc = (tumors["owners"], tumors.pop("desc"))
             if sparse is not None:
                 sparse.tumors(tumors)
                 owners, tumors = set(tumors.get("owners", ())), {}
@@ -2186,6 +2280,14 @@ class ViTMAE3D(nn.Module):
             # flat in group order, so forward_native's loss is one pass over the cat of the predictions
             parts[0]["flat_w"] = flat_rows([(p.pop("target_mask_patches") / p["target_patches"].shape[-1]).flatten() for p in parts])
             parts[0]["flat_t"] = flat_rows([p.pop("target_patches").flatten() for p in parts])
+        if getattr(self, "tumor_desc_head", None) is not None and self.training:
+            # rows part by part, image-major, num_samples each (as embeds): the paste index of each row's image, -1 none
+            img = torch.tensor([ii for p in parts for ii in p["ids"]]).repeat_interleave(num_samples)
+            pos = torch.full((int(img.max()) + 1 if len(img) else 1,), -1, dtype=torch.long)
+            if tdesc is not None and len(tdesc[0]):
+                own = torch.tensor(tdesc[0])
+                pos[own] = torch.arange(len(own))
+            parts[0]["tdesc"] = (pos[img], tdesc)
         return parts
 
     def aux_losses(
@@ -2297,7 +2399,8 @@ class ViTMAE3D(nn.Module):
         return loss
 
     def obj_losses(
-        self, parts: list[dict], feats: Tensor, embeds: Tensor, geoms: dict, S: int, V: int
+        self, parts: list[dict], feats: Tensor, embeds: Tensor, geoms: dict, S: int, V: int,
+        subject_ids: Tensor | None = None,
     ) -> Tensor:
         # the objective-round losses (training only); stats merged into self.aux_stats
         loss, stats = embeds.new_zeros((), dtype=torch.float32), {}
@@ -2326,7 +2429,22 @@ class ViTMAE3D(nn.Module):
             stats["xlat_loss"], stats["xlat_frac"] = xl.detach(), w.mean().detach()
         if self.gdist_pred is not None:
             z = tokens.float().mean(1)
-            z = z - z.mean(0, keepdim=True).detach()
+            if getattr(self, "gdist_site_center", False) and subject_ids is not None:
+                # site-centred: each row minus its collection's EMA mean pooled token (updated with this batch first)
+                img = torch.tensor([ii for p in parts for ii in p["ids"]]).repeat_interleave(S)
+                cid = (subject_ids[img] % self.site_mean.shape[0]).to(z.device, non_blocking=True)
+                with torch.no_grad():
+                    n = torch.zeros_like(self.site_seen).index_add_(0, cid, torch.ones_like(cid, dtype=torch.float32))
+                    sm = torch.zeros_like(self.site_mean).index_add_(0, cid, z.detach())
+                    hit = n > 0
+                    bm = sm / n.clamp_min(1.0)[:, None]
+                    first = (hit & (self.site_seen == 0))[:, None]
+                    upd = torch.where(first, bm, 0.9 * self.site_mean + 0.1 * bm)
+                    self.site_mean.copy_(torch.where(hit[:, None], upd, self.site_mean))
+                    self.site_seen.add_(n)
+                z = z - self.site_mean[cid]
+            else:
+                z = z - z.mean(0, keepdim=True).detach()
             if self.gdist_pairs == "sample":
                 assert S == 2, "gdist_pairs=sample: num_samples 2"
                 partner = torch.arange(z.shape[0], device=z.device) ^ 1
@@ -2535,6 +2653,7 @@ def plan_tumors(
     neg: float = 0.0,
     lims: list | None = None,
     sparse=None,
+    desc: bool = False,
 ) -> dict[tuple, tuple[Tensor, Tensor, Tensor, Tensor]]:
     # one lobulated mass sized in mm in a prob share of the batch, centred >= 6 mm inside the mask: a
     # solid bright 3-10 mm nodule (share nodule), else a bright 3-8 mm rim of uneven thickness on a
@@ -2618,7 +2737,12 @@ def plan_tumors(
     ]).float()
     if sparse is not None:
         knots = (0.15 * torch.randn(1, 2, 5 * k, 5, 5, device=dev)).clamp(-0.25, 0.25)
-        return {"owners": owners, "lo": lo, "num": num, "par": torch.cat([cols, centre - lo, lim], 1), "knots": knots}
+        out = {"owners": owners, "lo": lo, "num": num, "par": torch.cat([cols, centre - lo, lim], 1), "knots": knots}
+        if desc:
+            # tumor_desc targets: kind flags, log radius, contrast, log edge width (cpu draws), centre in [-1, 1]
+            out["desc"] = (torch.stack([is_nodule.double(), is_ring.double(), (r.log() - 2.5) / 0.5, (amp - 2.5) / 1.0,
+                                        (width.log() - 1.0) / 0.5], 1).float(), centre / dims * 2 - 1)
+        return out
 
     # every box voxel of every mass in one ragged row: owner, then its box and volume indices
     owner = torch.zeros(total, dtype=torch.int32, device=dev)
