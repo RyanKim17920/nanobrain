@@ -27,6 +27,8 @@ class Fomo300kDataset(Dataset):
         self.meta = None
         # per-image subject index (subject_counts keys), for same-subject negative masking; None = off
         self.subject_ids = None
+        # rim round: modality suffixes whose images may get rim / nodule pastes (model tumor_hot_mods); None = off
+        self.hot_mods = None
 
     def __len__(self) -> int:
         return len(self.paths)
@@ -50,7 +52,21 @@ class Fomo300kDataset(Dataset):
             sample["fino"] = self.meta[index].numpy()
         if self.subject_ids is not None:
             sample["subject"] = int(self.subject_ids[index])
+        if self.hot_mods is not None:
+            sample["hot_ok"] = modality_of(self.paths[index]) in self.hot_mods
         return sample
+
+
+def modality_of(path: str) -> str:
+    # the BIDS suffix of a filelist path (.../sub-01_ses-01_T1w.npz -> T1w; dwi shells: bval1000, ...)
+    name = path.rsplit("/", 1)[-1]
+    return name.rsplit("_", 1)[-1].split(".", 1)[0]
+
+
+def modality_weights(paths: list[str], mults: dict) -> torch.Tensor:
+    """Per-image multipliers of the sampler weights: mults[suffix] for the images of that modality suffix, else 1."""
+    mults = {str(k): float(v) for k, v in mults.items()}
+    return torch.tensor([mults.get(modality_of(p), 1.0) for p in paths], dtype=torch.float64)
 
 
 def subject_temper_weights(paths: list[str], alpha: float) -> torch.Tensor:

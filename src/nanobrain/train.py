@@ -258,6 +258,11 @@ def main(args: DictConfig):
         index = {}
         dataset.subject_ids = np.array([index.setdefault(k.rsplit("/", 1)[0], len(index)) for k in keys], dtype=np.int64)
         logger.info(f"gdist_site_center: {len(index)} collections")
+    if args.model_kwargs.get("tumor_hot_mods"):
+        # rim round: rims / nodules pasted only on these modalities (per image flags through the batch)
+        assert args.get("native_prep_tokens"), "tumor_hot_mods: native_prep_tokens (the flags reach native_prepare)"
+        dataset.hot_mods = set(str(m) for m in args.model_kwargs.tumor_hot_mods)
+        logger.info(f"tumor_hot_mods: rims / nodules on {sorted(dataset.hot_mods)} only")
     logger.info(f"train dataset: {len(dataset)} images")
 
     if args.epochs:
@@ -339,6 +344,19 @@ def main(args: DictConfig):
             f"effective subjects {eff_before:.0f} -> {effective_subjects(dataset.paths, sampler.weights):.0f}, "
             f"effective images {n_eff:.0f} of {len(dataset)}"
         )
+    if args.get("modality_weights"):
+        # rim round: per-modality multipliers of the draw weights (after the subject cap), e.g. {T1c: 3}
+        from nanobrain.data import modality_of, modality_weights
+
+        base_w = sampler.weights if sampler.weights is not None else torch.ones(len(dataset), dtype=torch.float64)
+        mults = dict(args.modality_weights)
+        sampler.weights = base_w * modality_weights(dataset.paths, mults)
+        for m in mults:
+            on = torch.tensor([modality_of(p) == str(m) for p in dataset.paths])
+            logger.info(
+                f"modality weights: {m} x{mults[m]}: base draw share {float(base_w[on].sum() / base_w.sum()):.4f} -> "
+                f"{float(sampler.weights[on].sum() / sampler.weights.sum()):.4f}"
+            )
     if args.get("native_bucket_window"):
         # speed, CHANGES BATCH COMPOSITION (off when unset): windows of native_bucket_window batches sorted by
         # spacing, so a batch has fewer spacing groups (data.BucketSampler)
@@ -411,6 +429,7 @@ def main(args: DictConfig):
                 batch["tokens"] = model_without_ddp.native_prepare(
                     batch["image"], batch["mask"], batch["spacing"], args.num_visible, args.num_predict,
                     args.num_samples, lims=batch.get("lim"),
+                    **({"hot_ok": batch["hot_ok"]} if "hot_ok" in batch else {}),
                 )
             if batch["mask"] is None:
                 # native_sparse_tokens: the SparseVolumes stays in this thread (the model reads only the tokens)
@@ -913,6 +932,8 @@ def make_batch_transform(args: DictConfig):
                 out["fino"] = torch.from_numpy(np.stack([sample["fino"] for sample in raw]))
             if "subject" in raw[0]:
                 out["subject"] = torch.tensor([sample["subject"] for sample in raw], dtype=torch.int64)
+            if "hot_ok" in raw[0]:
+                out["hot_ok"] = [bool(sample["hot_ok"]) for sample in raw]
             if any(sample["lim"] is not None for sample in batch):
                 out["lim"] = [sample["lim"] for sample in batch]
             return out

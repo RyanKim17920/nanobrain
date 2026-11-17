@@ -154,6 +154,8 @@ def native_batch_transform(batch: dict, target_spacing: float = 1.0, index: bool
         out["fino"] = torch.from_numpy(np.stack([s["fino"] for s in samples]))
     if "subject" in samples[0]:
         out["subject"] = torch.tensor([s["subject"] for s in samples], dtype=torch.int64)
+    if "hot_ok" in samples[0]:
+        out["hot_ok"] = [bool(s["hot_ok"]) for s in samples]
     return out
 
 

@@ -237,6 +237,18 @@ class ViTMAE3D(nn.Module):
         # (train.py passes collection ids as subject_ids) instead of the batch mean, so the pull carries the
         # subject's deviation from its site, not the site
         gdist_site_center: bool = False,
+        # ---- rim round (native training only; 0 / None = off: no params, no extra draws, the flags-off path unchanged) ----
+        # rim-only lesion head: a second zero-init Linear(embed_dim, (patch / level_pool)^3) beside lesion_head, same
+        # weights and exclusions, BCE to the sub-block fraction of the ENHANCING part of each pasted mass only: the rim
+        # (outer - core) of a ring, the whole of a nodule, nothing of a diffuse mass (BraTS ET-shaped)
+        lesion_rim_weight: float = 0.0,
+        # smoke only: the rim loss into the logged stats (rim_bce / rim_pos); off in production (no logging added)
+        lesion_rim_log: bool = False,
+        # paste realism: rim thickness drawn uniform in tumor_rim_mm (default None = 3-8 mm), and rims / nodules
+        # pasted only on images whose modality suffix is in tumor_hot_mods (others get a diffuse mass; train.py
+        # passes the per-image flags; None = any image)
+        tumor_rim_mm: tuple[float, float] | None = None,
+        tumor_hot_mods: tuple[str, ...] | None = None,
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -492,6 +504,19 @@ class ViTMAE3D(nn.Module):
                 self.lesion_head = nn.Linear(embed_dim, (patch_size // level_pool) ** 3)
             nn.init.zeros_(self.lesion_head.weight)
             nn.init.zeros_(self.lesion_head.bias)
+        self.lesion_rim_weight = float(lesion_rim_weight)
+        self.lesion_rim_log = bool(lesion_rim_log)
+        self.lesion_rim_head = None
+        if self.lesion_rim_weight:
+            assert self.lesion_head is not None and tumor_prob, "lesion_rim_weight: lesion head and tumours on"
+            with torch.random.fork_rng(devices=[]):
+                self.lesion_rim_head = nn.Linear(embed_dim, (patch_size // level_pool) ** 3)
+            nn.init.zeros_(self.lesion_rim_head.weight)
+            nn.init.zeros_(self.lesion_rim_head.bias)
+        self.tumor_rim_mm = None if tumor_rim_mm is None else tuple(float(v) for v in tumor_rim_mm)
+        assert self.tumor_rim_mm is None or 0 < self.tumor_rim_mm[0] <= self.tumor_rim_mm[1], "tumor_rim_mm: [lo, hi] mm"
+        self.tumor_hot_mods = None if not tumor_hot_mods else tuple(str(v) for v in tumor_hot_mods)
+        assert self.tumor_hot_mods is None or tumor_prob, "tumor_hot_mods: tumours on"
         self.fuse_norms = self.fuse_projs = None
         if self.fuse_layers:
             assert native, "fuse_layers: native path only"
@@ -1069,7 +1094,7 @@ class ViTMAE3D(nn.Module):
             full, vis_order, select = select, vis_order.gather(1, cand), select.gather(1, cand)
         if type(vols).__name__ == "SparseGroup":
             # native_sparse_tokens: the partner rows gathered from the values / bitmap
-            p_patches, p_mask, _ = vols.gather(vis_order, vols.rimg.roll(-1), num_samples * vis_order.shape[1])
+            p_patches, p_mask = vols.gather(vis_order, vols.rimg.roll(-1), num_samples * vis_order.shape[1])[:2]
             p_patches, p_mask = p_patches.view(rows, vis_order.shape[1], -1), p_mask.view(rows, vis_order.shape[1], -1)
         else:
             flat = vis_order + (partner_img * num)[:, None]
@@ -1646,6 +1671,8 @@ class ViTMAE3D(nn.Module):
         if getattr(self, "fused_heads", False) and self.training:
             # fused_heads: the level / lesion / unified token heads as one linear (one weight cast, one input grad)
             use = {"level_head": "lvl_w" in parts[0], "lesion_head": True, "unified_head": "unified_label" in parts[0]}
+            if getattr(self, "lesion_rim_head", None) is not None:
+                use["lesion_rim_head"] = True
             hs = [(n, getattr(self, n)) for n, u in use.items() if u and getattr(self, n) is not None]
             if len(hs) > 1:
                 # zero rows pad the output width to a multiple of 8 (aligned gemm)
@@ -1775,10 +1802,21 @@ class ViTMAE3D(nn.Module):
                     **{f"pos{t:g}": v for t, v in zip(self.level_mirror, (mp / mw.clamp_min(1e-6)).detach())},
                 }
         if self.lesion_head is not None and self.training:
+            rim_head = getattr(self, "lesion_rim_head", None)
+            rim_t = None
             if "les_w" in parts[0]:
-                weight = flat_rows([part.pop("les_w") for part in parts])
+                lws = [part.pop("les_w") for part in parts]
+                if rim_head is not None:
+                    # a part without a rim target (no paste in its group) gets zeros
+                    rts = [part.pop("rim_t", None) for part in parts]
+                    rim_t = flat_rows([torch.zeros_like(w) if r is None else r for w, r in zip(lws, rts)])
+                weight = flat_rows(lws)
                 target = flat_rows([part.pop("les_t") for part in parts])
             else:
+                if rim_head is not None:
+                    rim_t = torch.cat([
+                        self.lesion_targets(part.pop("rim", None), part["lesion_mask"], part["patch"])[1] for part in parts
+                    ])
                 pairs = [self.lesion_targets(part.pop("lesion"), part.pop("lesion_mask"), part["patch"]) for part in parts]
                 weight, target = [torch.cat(v) for v in zip(*pairs)]
             logits = self._head("lesion_head", embeds[:, self.class_tokens :])
@@ -1786,6 +1824,14 @@ class ViTMAE3D(nn.Module):
             lw = lw.clamp_min(1e-6)
             les_loss = num / lw
             loss = loss + self.lesion_mask_weight * self.lesion_scale * les_loss
+            rim_loss = None
+            if rim_head is not None:
+                # lesion_rim_weight: the rim-only target with the lesion loss' weights (same exclusions)
+                assert rim_t is not None and rim_t.shape == target.shape, "lesion_rim: rim target missing on this path"
+                rl = self._head("lesion_rim_head", embeds[:, self.class_tokens :])
+                rnum, _ = _wbce(rl, rim_t, weight) if getattr(self, "compiled_loss", False) else _wbce_eager(rl, rim_t, weight)
+                rim_loss = rnum / lw
+                loss = loss + self.lesion_rim_weight * self.lesion_scale * rim_loss
             if getattr(self, "lespool_pred", None) is not None:
                 tok = embeds[:, self.class_tokens :].float()
                 p = torch.sigmoid(logits.detach().float().view(*tok.shape[:2], -1)).mean(-1)  # [R, V]
@@ -1799,6 +1845,9 @@ class ViTMAE3D(nn.Module):
                 lp = ((1.0 - cos) * keep).sum() / keep.sum().clamp_min(1.0)
                 loss = loss + self.lespool_weight * lp
                 self.tdesc_stats = {"lp_loss": lp.detach(), "lp_frac": keep.mean().detach()}
+            if rim_loss is not None and getattr(self, "lesion_rim_log", False):
+                self.level_mirror_stats = {**self.level_mirror_stats, "rim_bce": rim_loss.detach(),
+                                           "rim_pos": ((weight * rim_t).sum() / lw).detach()}
             self.level_mirror_stats = {
                 **self.level_mirror_stats, "les_bce": les_loss.detach(),
                 **({"les_pos": ((weight * target).sum() / lw).detach()} if getattr(self, "want_stats", True) else {}),
@@ -1932,18 +1981,19 @@ class ViTMAE3D(nn.Module):
     @torch.no_grad()
     def native_prepare(
         self, images: list[Tensor], mask: list[Tensor], spacing: list, num_visible: int, num_predict: int,
-        num_samples: int, lims: list | None = None,
+        num_samples: int, lims: list | None = None, hot_ok: list | None = None,
     ) -> dict:
         # native_prep_tokens: forward_native's weight-free tokenization of a batch (run in a prep thread,
         # under the training autocast), passed back as forward(prepared=...). lims: per image in-mask
         # (min, max) if known (native_worker_clip), else plan_tumors computes them
         groups, geoms = self.native_groups(spacing, images.device if type(images).__name__ == "SparseVolumes" else images[0].device)
-        parts = self.native_tokens(images, mask, groups, geoms, num_visible, num_predict, num_samples, lims=lims)
+        parts = self.native_tokens(images, mask, groups, geoms, num_visible, num_predict, num_samples, lims=lims,
+                                   **({"hot_ok": hot_ok} if hot_ok is not None else {}))
         return {"groups": groups, "geoms": geoms, "parts": parts}
 
     def native_tokens(
         self, images: list[Tensor], mask: list[Tensor], groups: dict, geoms: dict, num_visible: int,
-        num_predict: int, num_samples: int, lims: list | None = None,
+        num_predict: int, num_samples: int, lims: list | None = None, hot_ok: list | None = None,
     ) -> list[dict]:
         # forward_native's tokenization (no weights): tumour paste, patchify, sequences, token corruptions,
         # per group; each part keeps its visible patches as "vis_tok" for the patch embedding
@@ -1960,11 +2010,23 @@ class ViTMAE3D(nn.Module):
         device = images[0].device if sparse is None else sparse.device
         tumors, tdesc = {}, None
         assert getattr(self, "tumor_desc_head", None) is None or sparse is not None, "tumor_desc: native_sparse_tokens"
+        rim_on = getattr(self, "lesion_rim_head", None) is not None and self.training
+        if self.training and getattr(self, "tumor_hot_mods", None):
+            # tumor_hot_mods: train.py's per image modality flags must arrive (never silently pasting everywhere)
+            assert hot_ok is not None and len(hot_ok) == len(images), "tumor_hot_mods: no per image hot_ok flags"
         if self.training and self.tumor_prob * self.tumor_scale > 0:
+            rim_kw = {}
+            if rim_on:
+                rim_kw["rim"] = True
+            if getattr(self, "tumor_rim_mm", None) is not None:
+                rim_kw["rim_mm"] = self.tumor_rim_mm
+            if getattr(self, "tumor_hot_mods", None):
+                rim_kw["hot_ok"] = hot_ok
             tumors = plan_tumors(
                 images, mask if sparse is None else images, groups, geoms, self.tumor_prob * self.tumor_scale,
                 self.tumor_radius, self.tumor_ring, self.tumor_contrast, self.tumor_edge, self.tumor_nodule,
                 neg=self.tumor_neg_prob, lims=lims, sparse=sparse, desc=getattr(self, "tumor_desc_head", None) is not None,
+                **rim_kw,
             )
             if "desc" in tumors:
                 tdesc = (tumors["owners"], tumors.pop("desc"))
@@ -2016,8 +2078,11 @@ class ViTMAE3D(nn.Module):
             clean_img = None
             if sp in tumors and self.tumor_one_view:
                 clean_img = vols[0].clone()
+            rim = None
             if sp in tumors:
                 tumor = paste_tumors(vols[0], vols[1], tumors[sp], with_mask=self.lesion_head is not None)
+                if isinstance(tumor, tuple):
+                    tumor, rim = tumor
                 if tumor is not None:
                     lesion = tumor if lesion is None else torch.maximum(lesion, tumor)
             raw = vols if (self.hemiswap_head is not None and self.training) else None
@@ -2045,6 +2110,8 @@ class ViTMAE3D(nn.Module):
                 parts[-1]["raw"] = raw
             if self.lesion_head is not None and self.training:
                 parts[-1]["lesion"] = None if lesion is None else patchify(lesion)
+            if rim_on:
+                parts[-1]["rim"] = None if rim is None else patchify(rim)
             if clean_img is not None:
                 parts[-1]["clean_img"] = patchify(clean_img)
 
@@ -2159,10 +2226,31 @@ class ViTMAE3D(nn.Module):
                             # views 1.. saw the clean volume: no lesion there (blobs are off with this flag)
                             les = part["lesion"].view(b, num_samples, num_visible, -1)
                             part["lesion"] = torch.cat([les[:, :1], torch.zeros_like(les[:, 1:])], 1).flatten(0, 2)
+                    if "rim" in part and part["rim"] is not None and not part.pop("rim_vis", False):
+                        # lesion_rim_weight: the rim-only mask through the same visible selection
+                        part["rim"] = part["rim"].flatten(0, 1).index_select(0, vis_ids)
+                        if self.tumor_one_view:
+                            rr = part["rim"].view(b, num_samples, num_visible, -1)
+                            part["rim"] = torch.cat([rr[:, :1], torch.zeros_like(rr[:, 1:])], 1).flatten(0, 2)
                     lm = vis_mask
                     if altered is not None:
                         lm = vis_mask * ~altered[..., None]
                     part["lesion_mask"] = lm
+                    if "rim" in part and (fused or lvl_pre):
+                        # the rim target with the lesion target's weights / exclusions (rim_t; the loss uses les_w)
+                        rim = part.pop("rim")
+                        if rim is None:
+                            part["rim_t"] = None
+                        elif fused:
+                            from .sparse import pool_targets
+
+                            rp = pool_targets(vis_patches, vis_mask, rim, self.level_thresholds[:0], patch,
+                                              self.patch_size[0] // self.level_pool)
+                            w = rp[:, :1].flatten(1)
+                            keep = torch.ones_like(w[:, :1], dtype=torch.bool) if altered is None else ~altered.reshape(-1, 1)
+                            part["rim_t"] = torch.where(keep, rp[:, 1].flatten(1) / w.clamp_min(1e-6), 0.0)
+                        else:
+                            part["rim_t"] = self.lesion_targets(rim, lm, patch, pool=sep_pool)[1]
                     if fused:
                         from .sparse import pool_targets
 
@@ -2205,11 +2293,16 @@ class ViTMAE3D(nn.Module):
             part["order"] = order.unflatten(0, (b, num_samples))
             if sparse is not None:
                 # native_sparse_tokens: the rows straight from the values / bitmap (tumour pasted per voxel)
-                img, msk, les = next(sgath)
+                img, msk, les, rimg_ = next(sgath)
                 patches, mask_patches = img.view(b * num_samples, seq_length, -1), msk.view(b * num_samples, seq_length, -1)
                 if les is not None:
                     part["lesion"] = les.view(b, num_samples, seq_length, -1)[:, :, :num_visible].reshape(-1, les.shape[-1])
                     part["lesion_vis"] = True
+                if rim_on and "lesion" in part:
+                    part["rim"] = None
+                    if rimg_ is not None:
+                        part["rim"] = rimg_.view(b, num_samples, seq_length, -1)[:, :, :num_visible].reshape(-1, rimg_.shape[-1])
+                        part["rim_vis"] = True
             else:
                 # images and masks gathered together by flat token ids
                 flat_ids = part["order"] + gather_offsets(b, num, device)
@@ -2629,7 +2722,7 @@ def insert_blobs(
 def paste_tumors(images: Tensor, mask: Tensor, plan: tuple, with_mask: bool = False) -> Tensor | None:
     # in place on a spacing group's padded volumes [B, X, Y, Z], in the mask only, clipped to each
     # image's own in-mask range (a saturating enhancement). returns the soft lesion mask if asked
-    flat, val, soft, lim = plan
+    flat, val, soft, lim = plan[:4]
     inside = mask.reshape(-1)[flat] > 0
     old = images.view(-1)[flat]
     new = torch.minimum(torch.maximum(old + val, lim[:, 0]), lim[:, 1]).to(old.dtype)
@@ -2638,6 +2731,11 @@ def paste_tumors(images: Tensor, mask: Tensor, plan: tuple, with_mask: bool = Fa
         return None
     out = torch.zeros_like(images)
     out.view(-1).index_copy_(0, flat, (soft * inside).to(out.dtype))
+    if len(plan) > 4:
+        # lesion_rim_weight: (the soft lesion mask, the rim-only mask)
+        rim = torch.zeros_like(images)
+        rim.view(-1).index_copy_(0, flat, (plan[4] * inside).to(rim.dtype))
+        return out, rim
     return out
 
 
@@ -2656,6 +2754,9 @@ def plan_tumors(
     lims: list | None = None,
     sparse=None,
     desc: bool = False,
+    rim: bool = False,
+    rim_mm: tuple[float, float] | None = None,
+    hot_ok: list | None = None,
 ) -> dict[tuple, tuple[Tensor, Tensor, Tensor, Tensor]]:
     # one lobulated mass sized in mm in a prob share of the batch, centred >= 6 mm inside the mask: a
     # solid bright 3-10 mm nodule (share nodule), else a bright 3-8 mm rim of uneven thickness on a
@@ -2664,6 +2765,9 @@ def plan_tumors(
     # value to add, the soft lesion mask and the image's in-mask (min, max) there
     # sparse (native_sparse_tokens): masks are shape-only (meta) stand-ins; the mask reads go to its bitmap and the
     # masses come back as their parameters (sparse.SparseVolumes.tumors), pasted per gathered voxel
+    # rim round (all off = the same draws and outputs): rim, + the rim-only soft mask (ring outer - core, nodule outer,
+    # diffuse 0; dense: a 5th tuple entry, sparse: per mass "hot" flags); rim_mm, the rim thickness range in mm;
+    # hot_ok (per batch image), rims / nodules only where True (a False owner's mass is diffuse; the same draws)
     dev = masks[0].device if sparse is None else sparse.device
     k = min(len(masks), int(prob * len(masks) + torch.rand(()).item()))
     if k == 0:
@@ -2688,12 +2792,18 @@ def plan_tumors(
     u = torch.rand(k, 10, dtype=torch.float64)
     is_nodule = u[:, 9] < nodule
     is_ring = ~is_nodule & (u[:, 4] < ring)
+    if hot_ok is not None:
+        ok = torch.tensor([bool(hot_ok[ii]) for ii in owners])
+        is_nodule, is_ring = is_nodule & ok, is_ring & ok
     hot = is_nodule | is_ring
     r = torch.where(is_nodule, 3.0 * (10.0 / 3.0) ** u[:, 0], radius[0] * (radius[1] / radius[0]) ** u[:, 0])
     axes = r[:, None] * torch.exp(u[:, 1:4] * 0.4 - 0.2)
     # ring and nodule edges 2 mm wide (10-90%), diffuse edges at most r wide
     width = torch.where(hot, 2.0, torch.minimum(edge[0] + u[:, 5] * (edge[1] - edge[0]), r))
-    rim = torch.minimum(3.0 + 5.0 * u[:, 6], 0.6 * r)
+    if rim_mm is None:
+        rim_th = torch.minimum(3.0 + 5.0 * u[:, 6], 0.6 * r)
+    else:
+        rim_th = torch.minimum(rim_mm[0] + (rim_mm[1] - rim_mm[0]) * u[:, 6], 0.6 * r)
     amp = torch.where(hot, 2.0 + 3.0 * u[:, 7], contrast[0] + u[:, 7] * (contrast[1] - contrast[0]))
     if neg > 0:
         # h-tneg: a neg share of the masses darker than the tissue (drawn only when on: the default stream is unchanged)
@@ -2710,7 +2820,7 @@ def plan_tumors(
     start, base = ints[:, 21], ints[:, 22]
     # columns: mm per voxel, 1 / semi-axes, 1 / bump scale, r, 1 / logistic scale, rim, ring, contrasts, knot row
     cols = torch.cat([
-        spc, 1 / axes, 1 / (1.6 * r[:, None]), r[:, None], 4.4 / width[:, None], rim[:, None], is_ring[:, None],
+        spc, 1 / axes, 1 / (1.6 * r[:, None]), r[:, None], 4.4 / width[:, None], rim_th[:, None], is_ring[:, None],
         amp[:, None], 0.2 + 0.6 * u[:, 8:9], 5.0 * torch.arange(k)[:, None],
     ], 1).float().to(dev)
 
@@ -2740,6 +2850,8 @@ def plan_tumors(
     if sparse is not None:
         knots = (0.15 * torch.randn(1, 2, 5 * k, 5, 5, device=dev)).clamp(-0.25, 0.25)
         out = {"owners": owners, "lo": lo, "num": num, "par": torch.cat([cols, centre - lo, lim], 1), "knots": knots}
+        if rim:
+            out["hot"] = hot.float().to(dev)
         if desc:
             # tumor_desc targets (cpu draws): kind flags, log radius, contrast, log edge width
             out["desc"] = torch.stack([is_nodule.double(), is_ring.double(), (r.log() - 2.5) / 0.5, (amp - 2.5) / 1.0,
@@ -2773,11 +2885,13 @@ def plan_tumors(
     core = torch.sigmoid((depth - par[:, 9] * (1 + 2 * thick)) * (4.4 / 4.0)) * par[:, 10]
     val = par[:, 11] * (outer - core) - par[:, 12] * core
     lim = lim.index_select(0, owner)
+    if rim:
+        rimv = (outer - core).clamp_min(0.0) * hot.float().to(dev).index_select(0, owner)
     out, t = {}, 0
     size, start = size.tolist(), start.tolist()
     for sp, n in counts.items():
         a, b = start[t], start[t + n - 1] + size[t + n - 1]
-        out[sp] = (flat[a:b], val[a:b], outer[a:b], lim[a:b])
+        out[sp] = (flat[a:b], val[a:b], outer[a:b], lim[a:b]) + ((rimv[a:b],) if rim else ())
         t += n
     return out
 

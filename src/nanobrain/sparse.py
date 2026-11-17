@@ -196,9 +196,11 @@ def _frac_kernel(gtab, G, rimg, geo, line, bits, pre, out, NT, TB: tl.constexpr,
 @triton.jit(do_not_specialize=["G", "NK", "V", "SEQ"])
 def _gather_kernel(
     gtab, G, tok, rimg, geo, nrm, bits, pre, vals, mass, ti, tf, knots, img_out, msk_out, les_out, NK,
-    t_img, t_w, V, SEQ,
+    t_img, t_w, V, SEQ, rim_out, hot,
     TUMOR: tl.constexpr, LES: tl.constexpr, BLOCK: tl.constexpr, SPLIT: tl.constexpr = False, NC: tl.constexpr = 10,
+    RIM: tl.constexpr = False,
 ):
+    # RIM (lesion_rim_weight, with LES): + the rim-only soft mask (max(outer - core, 0) x the mass' hot flag) to rim_out
     # one row of (image, box token) per program, rows of every group: the normalized image / mask voxels (+ the
     # pasted tumour, its soft mask). group table rows (NC 10): first row, P, PX, PY, PZ, GY, GZ, rows per image,
     # first image id, first output element. SPLIT (FAST_TOK, NC 13; rows = sequence rows of SEQ tokens): + first
@@ -235,6 +237,7 @@ def _gather_kernel(
         f, valid, b0, b1, b2 = _token_voxels(tid, q, geo, img, PX, PY, PZ, GY, GZ)
         v, inm = _lookup(f, valid & qm, bits, pre, vals, img, nrm)
         les = tl.zeros([BLOCK], dtype=tl.float32)
+        rim = tl.zeros([BLOCK], dtype=tl.float32)
         if TUMOR:
             if k >= 0:
                 # plan_tumors' mass value at these box voxels (the knot noise trilinear on the mass' 5^3 block)
@@ -277,17 +280,23 @@ def _gather_kernel(
                 new = tl.minimum(tl.maximum(v + val, tl.load(fp + 17)), tl.load(fp + 18))
                 v = tl.where(inside, new, v)
                 les = tl.where(inside, outer, 0.0)
+                if RIM:
+                    rim = tl.where(inside, tl.maximum(outer - core, 0.0) * tl.load(hot + k), 0.0)
         o = obase + q
         if SPLIT:
             tl.store(o1 + o, v, mask=qm)
             tl.store(o2 + o, tl.where(inm, on, 0.0), mask=qm)
             if LES:
                 tl.store(les_out + o, les, mask=qm & want)
+                if RIM:
+                    tl.store(rim_out + o, rim, mask=qm & want)
         else:
             tl.store(img_out + o, v, mask=qm)
             tl.store(msk_out + o, inm.to(tl.float32), mask=qm)
             if LES:
                 tl.store(les_out + o, les, mask=qm)
+                if RIM:
+                    tl.store(rim_out + o, rim, mask=qm)
 
 
 @triton.jit(do_not_specialize=["R", "P", "T"])
@@ -643,6 +652,7 @@ class SparseVolumes:
         self.geo, self.line, *rimg = _pack(self.device, [np.asarray(rows, np.int64), line, *groups.values()])
         self.rimg = dict(zip(groups, rimg))
         self.mass = None
+        self.hot = None
 
     def tumors(self, plan: dict | None) -> None:
         # plan_tumors' sparse plan: per mass box (lo, num) and its float parameters, the knot noise
@@ -654,9 +664,12 @@ class SparseVolumes:
         self.ti = torch.cat([plan["lo"], plan["num"]], 1).contiguous()
         self.tf = plan["par"].contiguous()
         self.knots = plan["knots"].contiguous()
+        # lesion_rim_weight: per mass 1 = rim / nodule (enhancing), 0 = diffuse
+        self.hot = plan["hot"].contiguous() if "hot" in plan else None
 
     def gather(self, specs: list[tuple], cfg: tuple = (512, 4)) -> list[tuple]:
-        # specs (group, tok, rimg, rows per image, lesion) -> (image, mask, lesion | None) [R, P] each, in one kernel
+        # specs (group, tok, rimg, rows per image, lesion) -> (image, mask, lesion | None, rim | None) [R, P] each, in
+        # one kernel (rim: lesion_rim_weight's rim-only mask, with the lesion when the plan carries hot flags)
         tab, rimg_off, toks, rimgs, r0, o0, n_img = [], [], [], [], 0, 0, 0
         for G, tok, rimg, per_img, _ in specs:
             (_, gy, gz) = G.grid
@@ -673,18 +686,21 @@ class SparseVolumes:
         tumor = self.mass is not None
         lesion = tumor and any(s[4] for s in specs)
         les = torch.empty_like(img) if lesion else img
+        rim_on = lesion and self.hot is not None
+        rim = torch.empty_like(img) if rim_on else img
         d = self.bits
         _gather_kernel[(r0,)](
             tab, len(specs), tok, rimg, self.geo, self.nrm, self.bits, self.pre, self.vals,
             self.mass if tumor else d, self.ti if tumor else d, self.tf if tumor else d, self.knots if tumor else d,
-            img, msk, les, (self.knots.shape[2] // 5) if tumor else 1, img, img, 0, 1, TUMOR=tumor, LES=lesion, BLOCK=cfg[0],
-            num_warps=cfg[1],
+            img, msk, les, (self.knots.shape[2] // 5) if tumor else 1, img, img, 0, 1, rim,
+            self.hot if rim_on else img, TUMOR=tumor, LES=lesion, BLOCK=cfg[0], num_warps=cfg[1], RIM=rim_on,
         )
         out, o0 = [], 0
         for G, tok, _, _, want in specs:
             n = tok.numel() * G.P
             sl = slice(o0, o0 + n)
-            out.append((img[sl].view(-1, G.P), msk[sl].view(-1, G.P), les[sl].view(-1, G.P) if want and lesion else None))
+            out.append((img[sl].view(-1, G.P), msk[sl].view(-1, G.P), les[sl].view(-1, G.P) if want and lesion else None,
+                        rim[sl].view(-1, G.P) if want and rim_on else None))
             o0 += n
         return out
 
@@ -702,7 +718,7 @@ class SparseGroup:
         self.rimg = vol.rimg[sp]
 
     def gather(self, tok: Tensor, rimg: Tensor, per_img: int, lesion: bool = False):
-        # rows (rimg[row // per_img], tok[row]) -> image, mask (float 0 / 1) [R, P] (+ the soft lesion mask)
+        # rows (rimg[row // per_img], tok[row]) -> image, mask (float 0 / 1) [R, P] (+ the soft lesion, rim masks)
         return self.vol.gather([(self, tok, rimg, per_img, lesion)])[0]
 
 
@@ -739,6 +755,8 @@ def sparse_batch_transform(batch: dict, target_spacing: float = 1.0) -> dict:
         out["fino"] = torch.from_numpy(np.stack([s["fino"] for s in samples]))
     if "subject" in samples[0]:
         out["subject"] = torch.tensor([s["subject"] for s in samples], dtype=torch.int64)
+    if "hot_ok" in samples[0]:
+        out["hot_ok"] = [bool(s["hot_ok"]) for s in samples]
     return out
 
 
@@ -960,6 +978,9 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     f32 = dict(device=dev, dtype=torch.float32)
     vimg, vmsk = torch.empty(vb, **f32), torch.empty(vb, **f32)
     vles = torch.empty(vb, **f32) if lesion else vimg
+    # lesion_rim_weight: the rim-only mask beside the lesion (hot flags in the plan)
+    rim_on = lesion and vol.hot is not None
+    vrim = torch.empty(vb, **f32) if rim_on else vimg
     timg, tw = torch.empty(tb, **f32), torch.empty(tb, **f32)
     tmin = torch.empty(R * V, **f32)
     out = torch.empty(vb, **f32)
@@ -1014,8 +1035,9 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
         gtab, len(gs), order_all.reshape(-1) if order_all.is_contiguous() else order_all.contiguous().view(-1),
         rimg, vol.geo, vol.nrm, vol.bits, vol.pre, vol.vals,
         vol.mass if tumor else d, vol.ti if tumor else d, vol.tf if tumor else d, vol.knots if tumor else d,
-        vimg, vmsk, vles, (vol.knots.shape[2] // 5) if tumor else 1, timg, tw, V, seq,
-        TUMOR=tumor, LES=lesion, BLOCK=GATHER_CFG[0], SPLIT=True, NC=13, num_warps=GATHER_CFG[1],
+        vimg, vmsk, vles, (vol.knots.shape[2] // 5) if tumor else 1, timg, tw, V, seq, vrim,
+        vol.hot if rim_on else vimg, TUMOR=tumor, LES=lesion, BLOCK=GATHER_CFG[0], SPLIT=True, NC=13,
+        num_warps=GATHER_CFG[1], RIM=rim_on,
     )
     # token centres: every group's table in one gather
     ctr = geoms[parts[0]["spacing"]][3][0] if len(parts) == 1 else torch.cat([geoms[p["spacing"]][3][0] for p in parts])
@@ -1066,6 +1088,12 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     _pool_all_kernel[(blk, 1 if FAST_POOL else T + 2)](ptab, len(gs), out, vmsk, vles, thr, pooled, T,
                                                        T + 1 if FAST_POOL else 0, BR=64, BK=64, NB=NB, SUB=sub,
                                                        NC=8 + 3 * sub)
+    rpool = None
+    if rim_on:
+        # the rim channel alone: _pool_all_kernel's lesion branch with T = -1 (channel 0 = T + 1, rows of 1 channel)
+        rpool = torch.empty(R * V, 1, NB, **f32)
+        _pool_all_kernel[(blk, 1)](ptab, len(gs), out, vmsk, vrim, thr, rpool, -1, 0, BR=64, BK=64, NB=NB, SUB=sub,
+                                   NC=8 + 3 * sub)
     pooled = pooled.view(R * V, T + 2, sub, sub, sub)
     w = pooled[:, :1]
     lvl_t = pooled[:, 1 : 1 + T] / w.clamp_min(1e-6)
@@ -1074,6 +1102,7 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     keep = ~altered.reshape(-1, 1)
     les_w = torch.where(keep, w, 0.0)
     les_t = torch.where(keep, pooled[:, 1 + T].flatten(1) / w.clamp_min(1e-6), 0.0)
+    rim_t = None if rpool is None else torch.where(keep, rpool.flatten(1) / w.clamp_min(1e-6), 0.0)
     syn = ~altered
     for p, g, order in zip(parts, gs, order_all.split([g["rows"] for g in gs])):
         a, z, P = g["r0"], g["r0"] + g["rows"], g["P"]
@@ -1086,6 +1115,8 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
         p["lvl_w"], p["lvl_t"] = pooled[a * V : z * V, :1], lvl_t[a * V : z * V]
         p["syn_clean"] = syn[a:z]
         p["les_w"], p["les_t"] = les_w[a * V : z * V], les_t[a * V : z * V]
+        if rim_t is not None:
+            p["rim_t"] = rim_t[a * V : z * V]
     parts[0]["flat_w"], parts[0]["flat_t"] = tw, timg
     return parts
 
