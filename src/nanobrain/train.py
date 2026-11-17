@@ -418,7 +418,8 @@ def main(args: DictConfig):
         keys = spacing_keys(dataset.paths, DATA_ROOT / "fomo300k" / "tables" / "images.parquet")
         sampler = BucketSampler(sampler, keys, args.batch_size, int(args.native_bucket_window), seed=args.seed)
         logger.info(f"bucket sampler: windows of {args.native_bucket_window} batches, {len(set(keys.tolist()))} spacing keys")
-    if args.model_kwargs.get("gdist_weight") and args.model_kwargs.get("gdist_pairs") == "subject":
+    if (args.model_kwargs.get("gdist_weight") and args.model_kwargs.get("gdist_pairs") == "subject") or args.get("subject_pairs"):
+        # (w1 subject_pairs: the pair sampler alone, no gdist loss)
         # objective round: batch images 2k, 2k + 1 from one subject (data.SubjectPairSampler); the base draws half
         from nanobrain.data import SubjectPairSampler, subject_counts
 

@@ -253,6 +253,20 @@ class ViTMAE3D(nn.Module):
         xcon_pairs: int = 0,
         travel_weight: float = 0.0,
         travel_pairs: int = 0,
+        # ---- w1 (unified corruption refinements; native_fast_prep tokenization only, defaults off: no params, the
+        # flags-off path unchanged) ----
+        # uc_sswap: + a same-subject swap class (the partner: the spacing group's next image of the host's subject,
+        # another scan); the swap class then takes the next image of ANOTHER subject (no such image: the token stays
+        # clean). uc_blur_sigma (lo, hi): blur sigma U[lo, hi] voxels per token (else 1). uc_noise_frac (lo, hi): noise
+        # sigma U[lo, hi] x the patch's in-brain std (else 0.1). uc_down_factor: the downsample class as area down by
+        # this factor + linear up per axis of >= patch / 2 voxels (else the 2x block mean). uc_reg_weight: a zero-init
+        # Linear(D, corrupt_kinds) on the corrupted tokens regresses their class's drawn parameter scaled to [-1, 1]
+        # (bias amplitude, blur sigma, noise fraction, log gamma; MSE; a kind with a fixed parameter has no target)
+        uc_sswap: bool = False,
+        uc_blur_sigma: tuple | None = None,
+        uc_noise_frac: tuple | None = None,
+        uc_down_factor: float | None = None,
+        uc_reg_weight: float = 0.0,
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -459,9 +473,23 @@ class ViTMAE3D(nn.Module):
             assert self.rtd_weight == 0.0 and self.corrupt_weight == 0.0, (
                 "unified corruption replaces the rtd and corrupt heads: set rtd_weight = corrupt_weight = 0"
             )
-            # classes: 0 clean, 1 swap, 2 .. 1 + corrupt_kinds corruptions, (last) shuffle
-            self.unified_classes = 2 + self.corrupt_kinds + int(self.unified_shuffle)
+            # classes: 0 clean, 1 swap, 2 .. 1 + corrupt_kinds corruptions, (w1 uc_sswap) same-subject swap, (last) shuffle
+            self.unified_classes = 2 + self.corrupt_kinds + int(self.unified_shuffle) + int(bool(uc_sswap))
             self.unified_head = zero_linear(self.unified_classes)
+        # w1 (FAST_TOK tokenization: sparse.fast_tokens reads these)
+        self.uc_sswap = bool(uc_sswap)
+        self.uc_blur_sigma = None if uc_blur_sigma is None else tuple(float(v) for v in uc_blur_sigma)
+        self.uc_noise_frac = None if uc_noise_frac is None else tuple(float(v) for v in uc_noise_frac)
+        self.uc_down_factor = None if uc_down_factor is None else float(uc_down_factor)
+        self.uc_reg_weight = float(uc_reg_weight)
+        self.unified_reg_head = None
+        if self.uc_sswap or self.uc_blur_sigma or self.uc_noise_frac or self.uc_down_factor or self.uc_reg_weight:
+            assert self.unified_head is not None and not self.unified_shuffle and self.corrupt_kinds <= 5, (
+                "w1 uc_*: unified head, no shuffle / extended2"
+            )
+            self.uc_sswap_cls = 2 + self.corrupt_kinds
+        if self.uc_reg_weight > 0.0:
+            self.unified_reg_head = zero_linear(self.corrupt_kinds)
         self.edgelvl_head = None
         if self.edgelvl_weight > 0.0:
             assert native, "edgelvl: native training only"
@@ -1656,7 +1684,7 @@ class ViTMAE3D(nn.Module):
         if getattr(self, "fused_heads", False) and self.training:
             # fused_heads: the level / lesion / unified token heads as one linear (one weight cast, one input grad)
             use = {"level_head": "lvl_w" in parts[0], "lesion_head": True, "unified_head": "unified_label" in parts[0],
-                   "deform_head": "dfm_t" in parts[0]}
+                   "deform_head": "dfm_t" in parts[0], "unified_reg_head": "unified_par" in parts[0]}
             hs = [(n, getattr(self, n)) for n, u in use.items() if u and getattr(self, n) is not None]
             if len(hs) > 1:
                 # zero rows pad the output width to a multiple of 8 (aligned gemm)
@@ -2135,6 +2163,7 @@ class ViTMAE3D(nn.Module):
             return sparse_mod.fast_tokens(
                 self, sparse, parts, order_all, (cand, labels, kind), geoms, num_samples, num_visible, num_predict
             )
+        assert not (self.training and hasattr(self, "uc_sswap_cls")), "w1 uc_*: native_sparse_tokens + native_fast_prep"
 
         def finish(part, order, num, vols, coord, b, vis_patches, vis_mask):
             # a group's tokenization after its unified corruption (split out so batched_corrupt can apply
@@ -2394,6 +2423,17 @@ class ViTMAE3D(nn.Module):
             uc_loss = F.cross_entropy(logits, labels)
             loss = loss + self.unified_weight * self.unified_scale * uc_loss
             stats["uc_loss"] = uc_loss.detach()
+            if self.unified_reg_head is not None and "unified_par" in parts[0]:
+                # w1 uc_reg: the corrupted tokens' drawn parameter (scaled to [-1, 1]; nan = no target) by their kind
+                tgt = cat("unified_par").flatten()
+                kind = labels - 2
+                ok = (kind >= 0) & (kind < self.corrupt_kinds) & ~tgt.isnan()
+                pred = self._head("unified_reg_head", tokens).float().flatten(0, 1)
+                pred = pred.gather(1, kind.clamp(0, self.corrupt_kinds - 1)[:, None]).squeeze(1)
+                w = ok.float()
+                ur_loss = ((pred - torch.nan_to_num(tgt)).pow(2) * w).sum() / w.sum().clamp_min(1.0)
+                loss = loss + self.uc_reg_weight * self.unified_scale * ur_loss
+                stats["ur_loss"] = ur_loss.detach()
             # want_stats (native_log_stats_only: only on log steps): the logged accuracies, not in the loss
             if getattr(self, "want_stats", True):
                 with torch.no_grad():
@@ -2403,6 +2443,8 @@ class ViTMAE3D(nn.Module):
                     stats["uc_acc_corrupt"] = ((pred == labels) & bad).sum() / bad.sum().clamp_min(1)
                     stats["uc_acc_clean"] = ((pred == 0) & ~bad).sum() / (~bad).sum().clamp_min(1)
                     names = ["swap", "bias", "blur", "noise", "gamma", "down", "contrast", "ghost"][: 1 + self.corrupt_kinds]
+                    if self.uc_sswap:
+                        names.append("sswap")
                     if self.unified_shuffle:
                         names.append("shuf")
                     if self.path_syn:

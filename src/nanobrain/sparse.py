@@ -520,12 +520,17 @@ def _rowmin_kernel(gtab, G, lo, R, CB: tl.constexpr):
     tl.store(lo + row, tl.where(v < float("inf"), v, 0.0))
 
 
-@triton.jit(do_not_specialize=["seed", "G"])
-def _corrupt_kernel(gtab, G, cand, kind, lo, seed, CB: tl.constexpr, BF16: tl.constexpr):
+@triton.jit(do_not_specialize=["seed", "G", "DP"])
+def _corrupt_kernel(gtab, G, cand, kind, lo, seed, par, bl_lo, bl_hi, nz_lo, nz_hi, dtab, DP, CB: tl.constexpr,
+                    BF16: tl.constexpr, BL: tl.constexpr = False, NZ: tl.constexpr = False, REG: tl.constexpr = False,
+                    DN: tl.constexpr = False):
     # corrupt_apply_batched's per candidate math, one program per candidate token (kind 0 = untouched), CB voxels at
     # a time: 1 bias ramp, 2 masked gaussian blur (sigma 1 voxel, replicate padded, the three passes as one 5^3
     # stencil), 3 rician noise, 4 gamma, 5 2x block mean. random draws from the philox stream (seed, candidate)
-    # group table rows (NC 14): first candidate, NV, K, P, PX, PY, PZ, KX, KY, KZ, vis / mask / out pointers, first row
+    # group table rows (NC 14): first candidate, NV, K, P, PX, PY, PZ, KX, KY, KZ, vis / mask / out pointers, first row.
+    # w1: BL = blur sigma U[bl_lo, bl_hi] (draw roff + 6), NZ = noise sigma U[nz_lo, nz_hi] x std (draw roff + 7),
+    # REG = the drawn parameter into par[cid] (bias amplitude, blur sigma, noise fraction, log gamma, 0), DN = kind 5 as
+    # the normalized 5^3 stencil of the per axis down-up maps dtab [p, DP, 5] (axes with KX 1: identity)
     cid = tl.program_id(0)
     kd = tl.load(kind + cid)
     if kd > 0:
@@ -565,6 +570,9 @@ def _corrupt_kernel(gtab, G, cand, kind, lo, seed, CB: tl.constexpr, BF16: tl.co
         cnt = tl.maximum(tl.sum(s1, axis=0), 1.0)
         mean = tl.sum(s2, axis=0) / cnt
         sd = 0.0
+        fr = 0.1
+        if NZ:
+            fr = nz_lo + (nz_hi - nz_lo) * tl.rand(seed, roff + 7)
         if kd == 3:
             s3 = tl.zeros([CB], dtype=tl.float32)
             for q0 in range(0, P, CB):
@@ -573,7 +581,10 @@ def _corrupt_kernel(gtab, G, cand, kind, lo, seed, CB: tl.constexpr, BF16: tl.co
                 x = tl.load(vis + base + q, mask=qm, other=0.0)
                 m = tl.load(msk + base + q, mask=qm, other=0.0)
                 s3 += (x - mean) * (x - mean) * m
-            sd = 0.1 * tl.sqrt(tl.sum(s3, axis=0) / cnt)
+            if NZ:
+                sd = fr * tl.sqrt(tl.sum(s3, axis=0) / cnt)
+            else:
+                sd = 0.1 * tl.sqrt(tl.sum(s3, axis=0) / cnt)
         bg = tl.max(big, axis=0)
         sm_ = tl.min(small, axis=0)
         fin = tl.sum(s1, axis=0) > 0
@@ -588,6 +599,16 @@ def _corrupt_kernel(gtab, G, cand, kind, lo, seed, CB: tl.constexpr, BF16: tl.co
         u2 = _rnd(u2 / nrm, BF16)
         amp = 0.2 + 0.1 * tl.rand(seed, roff + 3)
         g = tl.exp(tl.where(tl.rand(seed, roff + 4) < 0.5, -1.0, 1.0) * (0.2 + 0.3 * tl.rand(seed, roff + 5)))
+        sg = 1.0
+        iv = 0.5
+        zn = 2.4837318859
+        if BL:
+            sg = bl_lo + (bl_hi - bl_lo) * tl.rand(seed, roff + 6)
+            iv = 0.5 / (sg * sg)
+            zn = 1.0 + 2.0 * tl.exp(-iv) + 2.0 * tl.exp(-4.0 * iv)
+        if REG:
+            pv = tl.where(kd == 1, amp, tl.where(kd == 2, sg, tl.where(kd == 3, fr, tl.where(kd == 4, tl.log(g), 0.0))))
+            tl.store(par + cid, pv)
         for q0 in range(0, P, CB):
             q = q0 + tl.arange(0, CB)
             qm = q < P
@@ -609,9 +630,14 @@ def _corrupt_kernel(gtab, G, cand, kind, lo, seed, CB: tl.constexpr, BF16: tl.co
                     a = t // 25
                     bb = (t // 5) % 5
                     cc = t % 5
-                    wa = tl.where(PX >= 2, _rnd(tl.exp(-((a - 2.0) * (a - 2.0)) / 2) / 2.4837318859, BF16), tl.where(a == 2, 1.0, 0.0))
-                    wb = tl.where(PY >= 2, _rnd(tl.exp(-((bb - 2.0) * (bb - 2.0)) / 2) / 2.4837318859, BF16), tl.where(bb == 2, 1.0, 0.0))
-                    wc = tl.where(PZ >= 2, _rnd(tl.exp(-((cc - 2.0) * (cc - 2.0)) / 2) / 2.4837318859, BF16), tl.where(cc == 2, 1.0, 0.0))
+                    if BL:
+                        wa = tl.where(PX >= 2, tl.exp(-((a - 2.0) * (a - 2.0)) * iv) / zn, tl.where(a == 2, 1.0, 0.0))
+                        wb = tl.where(PY >= 2, tl.exp(-((bb - 2.0) * (bb - 2.0)) * iv) / zn, tl.where(bb == 2, 1.0, 0.0))
+                        wc = tl.where(PZ >= 2, tl.exp(-((cc - 2.0) * (cc - 2.0)) * iv) / zn, tl.where(cc == 2, 1.0, 0.0))
+                    else:
+                        wa = tl.where(PX >= 2, _rnd(tl.exp(-((a - 2.0) * (a - 2.0)) / 2) / 2.4837318859, BF16), tl.where(a == 2, 1.0, 0.0))
+                        wb = tl.where(PY >= 2, _rnd(tl.exp(-((bb - 2.0) * (bb - 2.0)) / 2) / 2.4837318859, BF16), tl.where(bb == 2, 1.0, 0.0))
+                        wc = tl.where(PZ >= 2, _rnd(tl.exp(-((cc - 2.0) * (cc - 2.0)) / 2) / 2.4837318859, BF16), tl.where(cc == 2, 1.0, 0.0))
                     w = wa * wb * wc
                     if w != 0.0:
                         ia = tl.minimum(tl.maximum(c0 + (a - 2), 0), PX - 1)
@@ -633,25 +659,46 @@ def _corrupt_kernel(gtab, G, cand, kind, lo, seed, CB: tl.constexpr, BF16: tl.co
                 v = tl.minimum(tl.maximum((x - sm_) / span, 0.0), 1.0)
                 res = sm_ + span * libdevice.pow(v, g)
             elif kd == 5:
-                s0 = (c0 // KX) * KX
-                b1 = (c1 // KY) * KY
-                b2 = (c2 // KZ) * KZ
-                sxm = tl.zeros([CB], dtype=tl.float32)
-                smm = tl.zeros([CB], dtype=tl.float32)
-                n = tl.zeros([CB], dtype=tl.float32)
-                for o in range(8):
-                    d0 = (o >> 2) & 1
-                    d1 = (o >> 1) & 1
-                    d2 = o & 1
-                    ok = qm & (d0 < KX) & (d1 < KY) & (d2 < KZ) & (s0 + d0 < PX) & (b1 + d1 < PY) & (b2 + d2 < PZ)
-                    oo = base + ((s0 + d0) * PY + (b1 + d1)) * PZ + b2 + d2
-                    xv = tl.load(vis + oo, mask=ok, other=0.0)
-                    mv = tl.load(msk + oo, mask=ok, other=0.0)
-                    sxm += xv * mv
-                    smm += mv
-                    n += ok.to(tl.float32)
-                n = tl.maximum(n, 1.0)
-                res = (sxm / n) / tl.maximum(smm / n, 1e-3)
+                if DN:
+                    num = tl.zeros([CB], dtype=tl.float32)
+                    den = tl.zeros([CB], dtype=tl.float32)
+                    for t in range(125):
+                        a = t // 25
+                        bb = (t // 5) % 5
+                        cc = t % 5
+                        wa = tl.where(KX == 2, tl.load(dtab + (PX * DP + c0) * 5 + a, mask=qm, other=0.0), tl.where(a == 2, 1.0, 0.0))
+                        wb = tl.where(KY == 2, tl.load(dtab + (PY * DP + c1) * 5 + bb, mask=qm, other=0.0), tl.where(bb == 2, 1.0, 0.0))
+                        wc = tl.where(KZ == 2, tl.load(dtab + (PZ * DP + c2) * 5 + cc, mask=qm, other=0.0), tl.where(cc == 2, 1.0, 0.0))
+                        w = wa * wb * wc
+                        ia = tl.minimum(tl.maximum(c0 + (a - 2), 0), PX - 1)
+                        ib = tl.minimum(tl.maximum(c1 + (bb - 2), 0), PY - 1)
+                        ic = tl.minimum(tl.maximum(c2 + (cc - 2), 0), PZ - 1)
+                        o = base + (ia * PY + ib) * PZ + ic
+                        xv = tl.load(vis + o, mask=qm, other=0.0)
+                        mv = tl.load(msk + o, mask=qm, other=0.0)
+                        num += w * xv * mv
+                        den += w * mv
+                    res = num / tl.maximum(den, 1e-3)
+                else:
+                    s0 = (c0 // KX) * KX
+                    b1 = (c1 // KY) * KY
+                    b2 = (c2 // KZ) * KZ
+                    sxm = tl.zeros([CB], dtype=tl.float32)
+                    smm = tl.zeros([CB], dtype=tl.float32)
+                    n = tl.zeros([CB], dtype=tl.float32)
+                    for o in range(8):
+                        d0 = (o >> 2) & 1
+                        d1 = (o >> 1) & 1
+                        d2 = o & 1
+                        ok = qm & (d0 < KX) & (d1 < KY) & (d2 < KZ) & (s0 + d0 < PX) & (b1 + d1 < PY) & (b2 + d2 < PZ)
+                        oo = base + ((s0 + d0) * PY + (b1 + d1)) * PZ + b2 + d2
+                        xv = tl.load(vis + oo, mask=ok, other=0.0)
+                        mv = tl.load(msk + oo, mask=ok, other=0.0)
+                        sxm += xv * mv
+                        smm += mv
+                        n += ok.to(tl.float32)
+                    n = tl.maximum(n, 1.0)
+                    res = (sxm / n) / tl.maximum(smm / n, 1e-3)
             tl.store(out + base + q, res * m, mask=qm)
 
 
@@ -678,7 +725,7 @@ def corrupt_all(items: list[tuple], min_vox: int) -> list[Tensor]:
     kind = torch.cat([it[4].reshape(-1) for it in items])
     bf16 = torch.is_autocast_enabled(dev.type) and torch.get_autocast_dtype(dev.type) == torch.bfloat16
     seed = int(torch.randint(0, 2**30, (1,)).item())
-    _corrupt_kernel[(c0,)](ctab, len(items), cand, kind, lo, seed, CB=512, BF16=bf16)
+    _corrupt_kernel[(c0,)](ctab, len(items), cand, kind, lo, seed, lo, 0.0, 0.0, 0.0, 0.0, lo, 1, CB=512, BF16=bf16)
     return outs
 
 
@@ -765,6 +812,7 @@ class SparseVolumes:
             self.spacing.append(affine)
             off += nvox
         self.contrast = [contrast_of(s.get("path", "")) for s in samples]
+        self.paths = [s.get("path", "") for s in samples]
         self.syn = self.wtab = self.wk = self.spt = self.spp = None
 
     def mask_at(self, owners: list[int], ras: Tensor) -> Tensor:
@@ -1051,6 +1099,42 @@ def warp_targets(model, vol: "SparseVolumes", gs: list[dict], order_all: Tensor,
 
 
 @functools.lru_cache(maxsize=64)
+def _subject_key(path: str) -> str:
+    # data.subject_counts' subject key (up to the first sub-* segment)
+    parts = path.split("/")
+    cut = next((ii for ii, part in enumerate(parts) if part.startswith("sub")), 2)
+    return "/".join(parts[: cut + 1])
+
+
+@functools.lru_cache(maxsize=16)
+def _down_table(f: float, pmax: int, device) -> Tensor:
+    # w1 uc_down_factor: [p, pmax, 5] per axis length p (rows 0 / 1 unused): output voxel a's weights on input voxels
+    # a - 2 .. a + 2 of the area down (to round(p / f) voxels) + linear up map (its band is <= 2 voxels wide)
+    pmax = max(pmax, 8)
+    tab = torch.zeros(pmax + 1, pmax, 5, dtype=torch.float64)
+    for p in range(2, pmax + 1):
+        n = max(1, round(p / f))
+        # _lowres_bank's row n alone: area down (D [n, p]), linear up (U [p, n], align_corners False, edges clamped)
+        D = torch.zeros(n, p, dtype=torch.float64)
+        for j in range(n):
+            lo_, hi_ = j * p / n, (j + 1) * p / n
+            for i in range(p):
+                D[j, i] = max(0.0, min(hi_, i + 1) - max(lo_, i)) * n / p
+        U = torch.zeros(p, n, dtype=torch.float64)
+        for i in range(p):
+            c = min(max((i + 0.5) * n / p - 0.5, 0.0), n - 1.0)
+            j0 = min(int(c), n - 1)
+            U[i, j0] += 1 - (c - j0)
+            U[i, min(j0 + 1, n - 1)] += c - j0
+        m = U @ D
+        for a in range(p):
+            for i in range(p):
+                if m[a, i] != 0:
+                    assert abs(i - a) <= 2, "uc_down_factor: down-up map wider than the 5-tap stencil"
+                    tab[p, a, i - a + 2] = m[a, i]
+    return tab.float().contiguous().to(device)
+
+
 def _lowres_bank(p: int, device) -> Tensor:
     # [p + 1, p, p]: row n (1..p) = area downsampling of p voxels to n, then linear upsampling back (align_corners
     # False, edges clamped), as one matrix
@@ -1203,7 +1287,7 @@ def _tokmin_kernel(rbase, rp, vis, msk, tmin, V, BLOCK: tl.constexpr):
 
 @triton.jit(do_not_specialize=["K", "V"])
 def _rtd_kernel(grow, vb, prs, pb, prow, cand, labels, q, p_img, p_msk, vis, msk, done, K, V,
-                NQ: tl.constexpr, BLOCK: tl.constexpr):
+                NQ: tl.constexpr, BLOCK: tl.constexpr, CLS: tl.constexpr = 1):
     # rtd_replace (unified swap) of candidate c of row r2: the partner patch (>= 50% brain) quantile mapped to the
     # host row's quantiles into the visible row in place where the label selects it, and done
     pid = tl.program_id(0)
@@ -1212,7 +1296,7 @@ def _rtd_kernel(grow, vb, prs, pb, prow, cand, labels, q, p_img, p_msk, vis, msk
     r = tl.load(grow + r2)
     P = tl.load(prs + r2)
     cd = tl.load(cand + r * K + c)
-    sel = tl.load(labels + r * V + cd) == 1
+    sel = tl.load(labels + r * V + cd) == CLS
     pbase = tl.load(pb + r2) + c.to(tl.int64) * P
     n = tl.zeros([BLOCK], dtype=tl.int32)
     for q0 in range(0, P, BLOCK):
@@ -1388,19 +1472,52 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     # rtd rows (groups of >= 2 images): partner rows of the next image, same sample index
     two = sorted((g for g in gs if g["b"] >= 2), key=lambda g: g["P"])
     grow, rvb, rps, rpb, prow, rlen, pspecs, pb, s2 = [], [], [], [], [], [], [], 0, 0
+    sswap = getattr(model, "uc_sswap", False)
+    if sswap:
+        # w1 uc_sswap: per image the group's next image of ANOTHER subject (swap) / of its subject, another scan
+        # (same-subject swap); none: that class leaves the token clean (partner = itself, row not eligible)
+        prow2, pspecs2, ok1, ok2 = [], [], torch.ones(R, dtype=torch.bool), torch.zeros(R, dtype=torch.bool)
+        subj = [_subject_key(p_) for p_ in vol.paths]
     for g in two:
         b, P = g["b"], g["P"]
+        ids = g["G"].ids
+        if sswap:
+            nxt = []
+            for want_same in (False, True):
+                col = []
+                for j in range(b):
+                    hit = next((jj for jj in ((j + d) % b for d in range(1, b))
+                                if (subj[ids[jj]] == subj[ids[j]]) == want_same
+                                and vol.paths[ids[jj]] != vol.paths[ids[j]]), None)
+                    col.append(hit)
+                nxt.append(col)
+            for j, (c1, c2) in enumerate(zip(*nxt)):
+                rr = slice(g["r0"] + j * S, g["r0"] + (j + 1) * S)
+                ok1[rr], ok2[rr] = c1 is not None, c2 is not None
+            part1 = [j if c is None else c for j, c in enumerate(nxt[0])]
+            part2 = [j if c is None else c for j, c in enumerate(nxt[1])]
         for rl in range(g["rows"]):
             grow.append(g["r0"] + rl)
             rvb.append(g["vb"] + rl * V * P)
             rps.append(P)
             rpb.append(pb + rl * K * P)
-            prow.append(s2 + (rl // S + 1) % b * S + rl % S)
+            if sswap:
+                prow.append(s2 + part1[rl // S] * S + rl % S)
+                prow2.append(s2 + part2[rl // S] * S + rl % S)
+            else:
+                prow.append(s2 + (rl // S + 1) % b * S + rl % S)
             rlen.append(V * P)
         s2 += g["rows"]
         pb += g["rows"] * K * P
-        ids = g["G"].ids
-        pspecs.append(ids[1:] + ids[:1])
+        if sswap:
+            pspecs.append([ids[j] for j in part1])
+            pspecs2.append([ids[j] for j in part2])
+        else:
+            pspecs.append(ids[1:] + ids[:1])
+    if sswap:
+        pspecs += pspecs2
+        prow2 = _to(dev, prow2) if prow2 else None
+        ok1, ok2 = _to(dev, ok1), _to(dev, ok2)
     rlen_ = rlen
     koff_ = np.cumsum([0] + rlen[:-1]).tolist() if rlen else []
     tabs = _pack(dev, [gtab, rimg, coff, ptab, ctab, rbase, rp, grow, rvb, rps, rpb, prow, rlen, koff_, *pspecs])
@@ -1444,11 +1561,24 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
         qv = torch.where(torch.isfinite(qv), qv, torch.zeros_like(qv))
         qv = (qv + 1e-5 * torch.arange(nq, device=dev)[None]).contiguous()
         done = torch.zeros(R, V, device=dev, dtype=torch.int8)
+        if sswap:
+            # w1: rows without a partner of the class select nothing; the same-subject swap from its own partner rows
+            cs = model.uc_sswap_cls
+            labels = torch.where(((labels == 1) & ~ok1[:, None]) | ((labels == cs) & ~ok2[:, None]), 0, labels)
+            pg2 = vol.gather([(g["G"], vo[g["r0"] : g["r0"] + g["rows"]], pr, S * K, False)
+                              for g, pr in zip(two, prims[len(two):])], GATHER_CFG)
+            p_img2, p_msk2 = (torch.as_strided(t, (pb,), (1,)) for t in pg2[0][:2])
+            done2 = torch.zeros(R, V, device=dev, dtype=torch.int8)
+            _rtd_kernel[(s2 * K,)](grow, rvb, rps, rpb, prow2, cand, labels.contiguous(), qv, p_img2, p_msk2, vimg, vmsk,
+                                   done2, K, V, NQ=nq, BLOCK=512, CLS=cs)
+            labels = torch.where((labels == cs) & ~done2.bool(), 0, labels)
         _rtd_kernel[(s2 * K,)](grow, rvb, rps, rpb, prow, cand, labels.contiguous(), qv, p_img, p_msk, vimg, vmsk, done,
                                K, V, NQ=nq, BLOCK=512)
         labels = torch.where((labels == 1) & ~done.bool(), 0, labels)
     else:
         labels = torch.where(labels == 1, 0, labels)
+        if sswap:
+            labels = torch.where(labels == model.uc_sswap_cls, 0, labels)
     # corruptions (corrupt_all's kernel, the row minima from the token minima)
     out.copy_(vimg)
     _tokmin_kernel[(R * V,)](rbase, rp, vimg, vmsk, tmin, V, BLOCK=512)
@@ -1456,7 +1586,24 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     lo = torch.where(lo < float("inf"), lo, 0.0)
     bf16 = torch.is_autocast_enabled(dev.type) and torch.get_autocast_dtype(dev.type) == torch.bfloat16
     seed = int(torch.randint(0, 2**30, (1,)).item())
-    _corrupt_kernel[(R * K,)](ctab, len(gs), cand, kind, lo, seed, CB=512, BF16=bf16)
+    bl, nz, reg = model.uc_blur_sigma, model.uc_noise_frac, model.unified_reg_head is not None
+    par = torch.zeros(R * K, **f32) if reg else lo
+    dn = model.uc_down_factor
+    # (the table for the batch's longest patch axis, rounded up to a power of 2: few distinct tables, one kernel)
+    dtab = _down_table(dn, triton.next_power_of_2(max(8, *(max(g["G"].patch) for g in gs))), dev) if dn else lo
+    _corrupt_kernel[(R * K,)](ctab, len(gs), cand, kind, lo, seed, par, *(bl or (0.0, 0.0)), *(nz or (0.0, 0.0)), dtab,
+                              dtab.shape[1] if dn else 1, CB=512, BF16=bf16, BL=bl is not None, NZ=nz is not None,
+                              REG=reg, DN=bool(dn))
+    if reg:
+        # w1 uc_reg: per kind the parameter's (mid, half range) -> [-1, 1] targets; a fixed parameter: nan (no target)
+        b_ = model.uc_blur_sigma or (1.0, 1.0)
+        n_ = model.uc_noise_frac or (0.1, 0.1)
+        mid = torch.tensor([0.0, 0.25, sum(b_) / 2, sum(n_) / 2, 0.0, 0.0], device=dev)
+        half = torch.tensor([0.0, 0.05, (b_[1] - b_[0]) / 2, (n_[1] - n_[0]) / 2, 0.5, 0.0], device=dev)
+        kk = kind.view(R, K).long()
+        h = half[kk]
+        t = torch.where(h > 0, (par.view(R, K) - mid[kk]) / h.clamp_min(1e-6), float("nan"))
+        upar = torch.full((R, V), float("nan"), **f32).scatter(1, cand, t)
     # level + lesion targets (pool_targets), the token weights
     thr = model.level_thresholds.float().contiguous()
     if FAST_POOL:
@@ -1484,6 +1631,8 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
         p.pop("lesion", None)
         p["order"] = order.unflatten(0, (g["b"], S))
         p["unified_label"] = labels[a:z]
+        if reg:
+            p["unified_par"] = upar[a:z]
         p["vis_coord"], p["target_coord"] = coord[a:z].split([V, NP], 1)
         p["vis_tok"] = out[g["vb"] : g["vb"] + g["rows"] * V * P].view(g["rows"], V, P)
         p["lvl_w"], p["lvl_t"] = pooled[a * V : z * V, :1], lvl_t[a * V : z * V]
