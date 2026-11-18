@@ -429,7 +429,7 @@ def get_param_groups(model, patch_embed_lr_mult=1.0, skip_names=(), lr_mult_fn=N
             continue
         d = {"param": param, "lr_multiplier": 1.0, "wd_multiplier": 1.0, "name": name}
 
-        if name.endswith(".bias") or "norm" in name or "gamma" in name or "qk_scale" in name:
+        if name.endswith(".bias") or "norm" in name or "gamma" in name or "qk_scale" in name or name == "rope_freqs":
             d["wd_multiplier"] = 0.0
 
         if "patch_embed" in name:

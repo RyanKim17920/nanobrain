@@ -12,7 +12,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from jaxtyping import Float, Int
 
 from .fino import FinoHeads
-from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D
+from .modules import Block, LayerNorm, NativeEmbed, NativeHead, SeparablePosEmbed3D, rope_tables
 from .data import (
     crop_to_mask,
     fit_to_shape,
@@ -219,6 +219,14 @@ class ViTMAE3D(nn.Module):
         # subject = batch images 2k <-> 2k+1 (one subject, train.py's subject-pair sampler)
         gdist_weight: float = 0.0,
         gdist_pairs: str = "sample",
+        # rope_id: encoder self-attention 3D RoPE-Mixed (Heo et al. 2024) on q / k, learnable per layer / head / pair
+        # 3D frequency vectors initialised to ZERO (identity rotation: the step-0 function is the flags-off one);
+        # the additive table stays. true = every block, or a list of block indices (each rotated block costs
+        # ~0.6 ms of step time on ViT-B). rope_fade (with rope_id; fraction of the training clock, 0 = off): the additive
+        # encoder table is scaled by pos_scale, 1 -> 0 linearly over that fraction (a persistent buffer, so the
+        # saved model / eval carry it). off = no params, no buffers, the flags-off path unchanged
+        rope_id: bool | list[int] = False,
+        rope_fade: float = 0.0,
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -498,6 +506,22 @@ class ViTMAE3D(nn.Module):
                 assert native, "gdist: native path only"
                 self.gdist_pred = nn.Sequential(nn.Linear(embed_dim, 256), nn.GELU(), nn.Linear(256, embed_dim))
                 self.gdist_pred.apply(_init_weights)
+        # rope_id / rope_fade (zeros / ones: no rng draws)
+        self.rope_freqs = None
+        self.rope_layers = {}
+        if rope_id:
+            layers = list(range(depth)) if rope_id is True else [int(l) for l in rope_id]
+            assert layers and all(0 <= l < depth for l in layers) and len(set(layers)) == len(layers), "rope_id: blocks"
+            assert not qk_norm, "rope_id: not with qk_norm"
+            self.rope_layers = {l: jj for jj, l in enumerate(sorted(layers))}
+            self.rope_freqs = nn.Parameter(torch.zeros(len(layers), num_heads, embed_dim // num_heads // 2, 3))
+        self.rope_fade = float(rope_fade)
+        if self.rope_fade > 0.0:
+            assert rope_id and self.rope_fade <= 1.0, "rope_fade: a fraction in (0, 1], with rope_id"
+            assert not self.brainpos_weight, "rope_fade: not with brainpos"
+            self.register_buffer("pos_scale", torch.ones(()))
+        else:
+            self.pos_scale = None
 
     @torch.no_grad()
     def brain_frame(
@@ -1132,8 +1156,12 @@ class ViTMAE3D(nn.Module):
         B = x.shape[0]
         if pos_hide is not None:
             x = torch.where(pos_hide[..., None], x + self.brainpos_unk.to(x.dtype), self.pos_embed(x, coord))
+        elif self.pos_scale is not None:
+            # rope_fade: the additive table scaled by pos_scale (0 after the fade: no additive term)
+            x = x + self.pos_scale * self.pos_embed(torch.zeros_like(x), coord)
         else:
             x = self.pos_embed(x, coord)
+        rope = self.encoder_rope(coord)
 
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
@@ -1141,10 +1169,27 @@ class ViTMAE3D(nn.Module):
         if getattr(self, "bf16_residual", False) and self.training:
             # bf16_residual (speed, CHANGES NUMERICS: the residual stream in bf16, not fp32; training only)
             x = x.to(torch.bfloat16)
-        for block in self.blocks:
-            x = block(x)
+        for ii, block in enumerate(self.blocks):
+            r = None if rope is None else rope(ii)
+            x = block(x) if r is None else block(x, rope=r)
         x = self.norm(x)
         return x
+
+    def encoder_rope(self, coord: Tensor):
+        # rope_id: block -> (cos, sin) [B R+N h T] of the encoder tokens (prefix tokens: angle 0), None for an
+        # unrotated block; None = off
+        if self.rope_freqs is None:
+            return None
+        coord = coord.float()
+        if self.class_tokens:
+            coord = torch.cat([coord.new_zeros(coord.shape[0], self.class_tokens, 3), coord], dim=1)
+        index = self.rope_layers
+        return lambda ii: rope_tables(coord, self.rope_freqs[index[ii]]) if ii in index else None
+
+    def set_pos_fade(self, t: float) -> None:
+        # rope_fade at training progress t (the LR clock): pos_scale = max(0, 1 - t / rope_fade), in place
+        if self.pos_scale is not None:
+            self.pos_scale.fill_(max(0.0, 1.0 - t / self.rope_fade))
 
     def encode_tokens_fused(
         self,
@@ -1157,8 +1202,12 @@ class ViTMAE3D(nn.Module):
         B = x.shape[0]
         if pos_hide is not None:
             x = torch.where(pos_hide[..., None], x + self.brainpos_unk.to(x.dtype), self.pos_embed(x, coord))
+        elif self.pos_scale is not None:
+            # rope_fade: the additive table scaled by pos_scale (0 after the fade: no additive term)
+            x = x + self.pos_scale * self.pos_embed(torch.zeros_like(x), coord)
         else:
             x = self.pos_embed(x, coord)
+        rope = self.encoder_rope(coord)
 
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
@@ -1168,7 +1217,8 @@ class ViTMAE3D(nn.Module):
         if 0 in index:
             skip = self.fuse_projs[index[0]](self.fuse_norms[index[0]](x))
         for ii, block in enumerate(self.blocks):
-            x = block(x)
+            r = None if rope is None else rope(ii)
+            x = block(x) if r is None else block(x, rope=r)
             jj = index.get(ii + 1)
             if jj is not None:
                 term = self.fuse_projs[jj](self.fuse_norms[jj](x))

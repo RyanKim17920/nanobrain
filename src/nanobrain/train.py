@@ -621,6 +621,14 @@ def train(
             aux_scales = model_without_ddp.set_aux_progress(min(max(aux_prog, 0.0), 1.0))
             if log_step:
                 metric_logger.update(**aux_scales)
+        if getattr(model_without_ddp, "pos_scale", None) is not None:
+            # rope_fade: the additive encoder table's scale on the LR schedule's progress clock (as the aux schedules)
+            if time_schedule:
+                wall = prev_wall_time + time.monotonic() - start_time
+                fade_prog = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+            else:
+                fade_prog = step / total_steps
+            model_without_ddp.set_pos_fade(min(max(fade_prog, 0.0), 1.0))
         fino_kwargs = {}
         if "fino" in batch:
             # FINO's gamma ramp over training progress (the time schedule's clock when time keyed)

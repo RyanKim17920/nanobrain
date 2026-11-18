@@ -61,6 +61,7 @@ class Attention(nn.Module):
         x: Float[Tensor, "B N D"],
         context: Float[Tensor, "B M D"] | None = None,
         vgate: Float[Tensor, "B M"] | None = None,
+        rope: tuple[Tensor, Tensor] | None = None,
     ) -> Float[Tensor, "B N D"]:
         if context is None:
             context = x
@@ -68,8 +69,13 @@ class Attention(nn.Module):
         _, M, _ = context.shape
         h = self.num_heads
 
-        q = self.q(x).reshape(B, N, h, D // h).transpose(1, 2)
-        k = self.k(context).reshape(B, M, h, D // h).transpose(1, 2)
+        q = self.q(x).reshape(B, N, h, D // h)
+        k = self.k(context).reshape(B, M, h, D // h)
+        if rope is not None:
+            # rope_id: (cos, sin) [B N h T] of the token rows (self attention, no qk_norm), rotated in the
+            # projections' own [B N h d] layout (the attention reads the same strides as without it)
+            q, k = apply_rope(q, *rope), apply_rope(k, *rope)
+        q, k = q.transpose(1, 2), k.transpose(1, 2)
         v = self.v(context).reshape(B, M, h, D // h).transpose(1, 2)
         if vgate is not None:
             # per-key value gate (rtd suspicion gating): a gated key still takes attention mass but
@@ -161,9 +167,10 @@ class Block(nn.Module):
         x: Float[Tensor, "B N D"],
         context: Float[Tensor, "B M D"] | None = None,
         vgate: Float[Tensor, "B M"] | None = None,
+        rope: tuple[Tensor, Tensor] | None = None,
     ) -> Float[Tensor, "B N D"]:
         # should the context also be normalized? capi doesn't, so I guess not
-        x = x + self.drop_path1(self.attn(self.norm1(x), context=context, vgate=vgate))
+        x = x + self.drop_path1(self.attn(self.norm1(x), context=context, vgate=vgate, rope=rope))
         return x + self._mlp_branch(x)
 
     def _mlp_branch(self, x: Tensor) -> Tensor:
@@ -179,6 +186,24 @@ class Block(nn.Module):
 
 
 # Position embedding
+
+
+def rope_tables(coord: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
+    # rope_id: angles <freqs[h, t], coord[b, n]> (radians; coord in position-table units, i.e. tokens) as
+    # three broadcast products (pointwise, fuses into the rotation). coord [B N 3], freqs [h T 3] -> [B N h T]
+    c = coord.float()[:, :, None, None, :]
+    f = freqs.float()[None, None]
+    ang = c[..., 0] * f[..., 0] + c[..., 1] * f[..., 1] + c[..., 2] * f[..., 2]
+    return ang.cos(), ang.sin()
+
+
+def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    # rotate the dim pairs (t, T + t) of each head by the angles behind cos / sin [B N h T], in fp32. zero
+    # angles (cos 1, sin 0) return x exactly
+    T = cos.shape[-1]
+    xf = x.float()
+    x1, x2, rest = xf[..., :T], xf[..., T : 2 * T], xf[..., 2 * T :]
+    return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos, rest], dim=-1).to(x.dtype)
 
 
 class SeparablePosEmbed3D(nn.Module):
