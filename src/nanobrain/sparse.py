@@ -330,11 +330,12 @@ def _pool_kernel(x, m, les, thr, kb, kf, out, R, P, T, BR: tl.constexpr, BK: tl.
 
 @functools.lru_cache(maxsize=1024)
 def _pool_mats(patch, sub: int, device):
-    # model.pool_kron's 0/1 bin indicator as [P, sub^3] fp32 and bf16 (exact), + the bin lengths
+    # model.pool_kron's 0/1 bin indicator as [P, NBP] fp32 and bf16 (exact), + the bin lengths. NBP = sub^3 up to a
+    # power of two (tl.arange): zero columns past sub^3 (patch 6 / 2 mm: 27 -> 32), sliced off by the callers
     from .model import _cached, pool_kron
 
     k, lx, ly, lz = pool_kron(patch, sub, device)
-    kf = k.t().contiguous()
+    kf = torch.nn.functional.pad(k.t(), (0, triton.next_power_of_2(sub**3) - sub**3)).contiguous()
     return _cached(kf.to(torch.bfloat16)), _cached(kf), lx, ly, lz
 
 
@@ -346,13 +347,13 @@ def pool_targets(x: Tensor, m: Tensor, les: Tensor | None, thr: Tensor, patch, s
     x, m = x.reshape(-1, P).contiguous(), m.reshape(-1, P).contiguous()
     R, T = x.shape[0], thr.numel()
     kb, kf, lx, ly, lz = _pool_mats(tuple(patch), sub, x.device)
-    out = torch.empty(R, T + 2, sub**3, device=x.device, dtype=torch.float32)
+    out = torch.empty(R, T + 2, kf.shape[1], device=x.device, dtype=torch.float32)
     C = T + 2 if les is not None else T + 1
     _pool_kernel[(triton.cdiv(R, 64), C)](
         x, m, les.reshape(-1, P).contiguous() if les is not None else m, thr.float().contiguous(), kb,
-        kf, out, R, P, T, BR=64, BK=64, NB=sub**3,
+        kf, out, R, P, T, BR=64, BK=64, NB=kf.shape[1],
     )
-    out = out.view(R, T + 2, sub, sub, sub)
+    out = out[..., : sub**3].reshape(R, T + 2, sub, sub, sub)
     return out / lx.view(-1, 1, 1) / ly.view(1, -1, 1) / lz.view(1, 1, -1)
 
 
@@ -962,7 +963,7 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     K = cand.shape[1]
     T = model.level_thresholds.numel()
     sub = model.patch_size[0] // model.level_pool
-    NB = sub**3
+    NB = triton.next_power_of_2(sub**3)  # the pool kernels' padded bins (_pool_mats), sliced to sub^3 below
     nq = model.rtd_quantiles + 1
     min_vox = max(2, model.patch_size[0] // 2)
     gs, r0, vb, tb = [], 0, 0, 0
@@ -1094,7 +1095,7 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
         rpool = torch.empty(R * V, 1, NB, **f32)
         _pool_all_kernel[(blk, 1)](ptab, len(gs), out, vmsk, vrim, thr, rpool, -1, 0, BR=64, BK=64, NB=NB, SUB=sub,
                                    NC=8 + 3 * sub)
-    pooled = pooled.view(R * V, T + 2, sub, sub, sub)
+    pooled = (pooled if NB == sub**3 else pooled[..., : sub**3]).reshape(R * V, T + 2, sub, sub, sub)
     w = pooled[:, :1]
     lvl_t = pooled[:, 1 : 1 + T] / w.clamp_min(1e-6)
     w = w.flatten(1)
@@ -1102,7 +1103,7 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     keep = ~altered.reshape(-1, 1)
     les_w = torch.where(keep, w, 0.0)
     les_t = torch.where(keep, pooled[:, 1 + T].flatten(1) / w.clamp_min(1e-6), 0.0)
-    rim_t = None if rpool is None else torch.where(keep, rpool.flatten(1) / w.clamp_min(1e-6), 0.0)
+    rim_t = None if rpool is None else torch.where(keep, rpool[..., : sub**3].flatten(1) / w.clamp_min(1e-6), 0.0)
     syn = ~altered
     for p, g, order in zip(parts, gs, order_all.split([g["rows"] for g in gs])):
         a, z, P = g["r0"], g["r0"] + g["rows"], g["P"]

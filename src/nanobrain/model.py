@@ -1634,13 +1634,16 @@ class ViTMAE3D(nn.Module):
             groups, geoms = self.native_groups(spacing, images[0].device)
         else:
             groups, geoms = prepared["groups"], prepared["geoms"]
+        # token_mm (native_prepare): the kernels see each spacing as kernel_spacing (unset: the spacing itself)
+        tmm = prepared.get("token_mm") if prepared is not None else None
+        ksp = {sp: self.kernel_spacing(sp, tmm) for sp in groups} if tmm is not None else {sp: sp for sp in groups}
         # embedding and head weights of all non 1 mm spacings in one pass each
-        native_sps = [sp for sp in groups if sp != (1.0, 1.0, 1.0)]
+        native_sps = [sp for sp in groups if ksp[sp] != (1.0, 1.0, 1.0)]
         embed_ws, head_ws = {}, {}
         if native_sps:
             sp_patches = [geoms[sp][0] for sp in native_sps]
-            embed_ws = self.patch_embed.native_weights(native_sps, sp_patches)
-            head_ws = self.decoder_head.native_weights(native_sps, sp_patches)
+            embed_ws = self.patch_embed.native_weights([ksp[sp] for sp in native_sps], sp_patches)
+            head_ws = self.decoder_head.native_weights([ksp[sp] for sp in native_sps], sp_patches)
             embed_ws, head_ws = dict(zip(native_sps, embed_ws)), dict(zip(native_sps, head_ws))
 
         if prepared is None:
@@ -1650,7 +1653,7 @@ class ViTMAE3D(nn.Module):
         device = parts[0]["vis_coord"].device
         for part in parts:
             sp = part["spacing"]
-            part["embeds"] = self.patch_embed.native(part.pop("vis_tok"), sp, part["patch"], embed_ws.get(sp))
+            part["embeds"] = self.patch_embed.native(part.pop("vis_tok"), ksp[sp], part["patch"], embed_ws.get(sp))
 
         def cat(key: str) -> Tensor:
             # contiguous for one group too, the compiled encoder would recompile on view strides
@@ -1709,7 +1712,7 @@ class ViTMAE3D(nn.Module):
             preds = []
             for part, feat in zip(parts, feats):
                 sp = part["spacing"]
-                part["pred_patches"] = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
+                part["pred_patches"] = self.decoder_head.native(feat, ksp[sp], part["patch"], head_ws.get(sp))
                 preds.append(part["pred_patches"].flatten())
             w = parts[0].pop("flat_w")
             if getattr(self, "compiled_loss", False):
@@ -1723,7 +1726,7 @@ class ViTMAE3D(nn.Module):
             feats = ()
         for part, feat in zip(parts, feats):
             sp = part["spacing"]
-            pred = self.decoder_head.native(feat, sp, part["patch"], head_ws.get(sp))
+            pred = self.decoder_head.native(feat, ksp[sp], part["patch"], head_ws.get(sp))
             part["pred_patches"] = pred
             px, py, pz = part["patch"]
             tgt = part["target_patches"]
@@ -1973,27 +1976,43 @@ class ViTMAE3D(nn.Module):
             self.target_lp_mm > 0.0 or self.norm_target or self.fg_loss_weight > 0.0 or self.grad_loss_weight > 0.0
         )
 
-    def native_groups(self, spacing: list, device: torch.device) -> tuple[dict, dict]:
-        # images by spacing (insertion order) and each spacing's token geometry
-        token_mm = self.patch_size[0] * self.target_spacing
+    def native_groups(self, spacing: list, device: torch.device, token_mm: float | None = None) -> tuple[dict, dict]:
+        # images by spacing (insertion order) and each spacing's token geometry. token_mm (train.py token_mm /
+        # vis_sched, patch_size mm when unset): tokens of token_mm on the patch_size model, positions in its table
+        unit_mm = self.patch_size[0] * self.target_spacing
+        if token_mm is None or float(token_mm) == unit_mm:
+            token_mm, unit_mm = unit_mm, None
         groups: dict[tuple, list[int]] = {}
         for ii, sp in enumerate(spacing):
             groups.setdefault(tuple(sp), []).append(ii)
-        geoms = {sp: native_geometry(sp, tuple(self.grid_size), token_mm, device) for sp in groups}
+        geoms = {sp: native_geometry(sp, tuple(self.grid_size), float(token_mm), device, unit_mm) for sp in groups}
         return groups, geoms
+
+    def kernel_spacing(self, sp: tuple, token_mm: float | None) -> tuple:
+        # the voxel size the patch_size kernels see: a token_mm token is patch_size mm to them (native_groups), so
+        # its voxels are sp * patch_size / token_mm (the image resampled by that factor; 1 mm images at 8 mm
+        # tokens on a 6 mm model: 0.75 mm voxels, 8 per token per axis)
+        if token_mm is None:
+            return sp
+        return tuple(v * (self.patch_size[0] * self.target_spacing / float(token_mm)) for v in sp)
 
     @torch.no_grad()
     def native_prepare(
         self, images: list[Tensor], mask: list[Tensor], spacing: list, num_visible: int, num_predict: int,
-        num_samples: int, lims: list | None = None, hot_ok: list | None = None,
+        num_samples: int, lims: list | None = None, hot_ok: list | None = None, token_mm: float | None = None,
     ) -> dict:
         # native_prep_tokens: forward_native's weight-free tokenization of a batch (run in a prep thread,
         # under the training autocast), passed back as forward(prepared=...). lims: per image in-mask
         # (min, max) if known (native_worker_clip), else plan_tumors computes them
-        groups, geoms = self.native_groups(spacing, images.device if type(images).__name__ == "SparseVolumes" else images[0].device)
+        if token_mm is not None and float(token_mm) == self.patch_size[0] * self.target_spacing:
+            token_mm = None
+        groups, geoms = self.native_groups(spacing, images.device if type(images).__name__ == "SparseVolumes" else images[0].device, token_mm)
         parts = self.native_tokens(images, mask, groups, geoms, num_visible, num_predict, num_samples, lims=lims,
                                    **({"hot_ok": hot_ok} if hot_ok is not None else {}))
-        return {"groups": groups, "geoms": geoms, "parts": parts}
+        out = {"groups": groups, "geoms": geoms, "parts": parts}
+        if token_mm is not None:
+            out["token_mm"] = float(token_mm)
+        return out
 
     def native_tokens(
         self, images: list[Tensor], mask: list[Tensor], groups: dict, geoms: dict, num_visible: int,
@@ -3001,17 +3020,20 @@ def native_geometry(
     box_mm: tuple[int, int, int],
     token_mm: float,
     device: torch.device | None = None,
+    unit_mm: float | None = None,
 ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], Float[Tensor, "1 N 3"]]:
     # per axis: patch voxels (~token_mm), the box in voxels, the token grid tiling the box from
     # its low corner, and token centres in position table units, centred like fit_to_shape. at
-    # 1 mm these are make_coord_grid's coordinates
+    # 1 mm these are make_coord_grid's coordinates. unit_mm (token_mm when unset): the table's row
+    # spacing in mm (token_mm schedule: the patch_size table, so a row is one place in every phase)
+    unit = token_mm if unit_mm is None else unit_mm
     patch = tuple(max(1, round(token_mm / sp)) for sp in spacing)
     box = native_box(spacing, box_mm)
     grid = tuple(math.ceil(size / p) for size, p in zip(box, patch))
     centres = []
     for sp, p, size, num, mm in zip(spacing, patch, box, grid, box_mm):
         voxel = (torch.arange(num, dtype=torch.float64, device=device) + 0.5) * p
-        centres.append((((voxel - size / 2) * sp + mm / 2) / token_mm - 0.5).float())
+        centres.append((((voxel - size / 2) * sp + mm / 2) / unit - 0.5).float())
     coord = torch.stack(torch.meshgrid(*centres, indexing="ij"), dim=-1).reshape(1, -1, 3)
     return patch, box, grid, _cached(coord)
 
