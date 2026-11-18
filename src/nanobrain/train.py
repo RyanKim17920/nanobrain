@@ -77,6 +77,13 @@ def main(args: DictConfig):
     args.wandb = args.wandb and misc.is_main_process()
 
     misc.setup_logging(logger, output_dir / "log.txt")
+    if args.get("native_compile_cache"):
+        # speed (off when unset; the same compiled kernels): inductor / triton caches in this persistent directory
+        # instead of the job's scratch, so a later run of the same code + config skips most of the ~1 min compile
+        cache = Path(str(args.native_compile_cache)).expanduser()
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(cache / "inductor")
+        os.environ["TRITON_CACHE_DIR"] = str(cache / "triton")
+        logger.info(f"compile cache: {cache}")
 
     logger.info("pretraining nanobrain")
     logger.info(f"start: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -156,6 +163,9 @@ def main(args: DictConfig):
     model.compiled_loss = bool(args.get("native_compiled_loss", False))
     # OPTIMIZATION-CHANGING (off when unset): the encoder / decoder residual streams in bf16 (fp32 now)
     model.bf16_residual = bool(args.get("native_bf16_residual", False))
+    # CHANGES NUMERICS (off when unset): native_bf16_residual also in the fuse_layers encoder (encode_tokens_fused),
+    # which kept the fp32 residual stream; with fuse_layers on it is the same speed as fuse_layers off
+    model.fused_bf16_residual = bool(args.get("native_fused_bf16_residual", False))
     assert not args.get("native_sparse_tokens") or (args.get("native_prep_tokens") and args.get("native_batched_prep"))
     if args.get("native_fast_prep"):
         # speed (off when unset; with native_sparse_tokens): the prep threads' tokenization as a few batched launches

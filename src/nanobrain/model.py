@@ -1231,6 +1231,10 @@ class ViTMAE3D(nn.Module):
         if self.class_tokens:
             x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
 
+        if getattr(self, "fused_bf16_residual", False) and self.training:
+            # native_fused_bf16_residual (speed, CHANGES NUMERICS; off when unset): bf16_residual for this fuse_layers
+            # path too (encode_tokens has it; this path kept the fp32 residual stream, ~5 ms/step at ViT-L)
+            x = x.to(torch.bfloat16)
         index = {l: jj for jj, l in enumerate(self.fuse_layers)}
         skip = None
         keep = None
