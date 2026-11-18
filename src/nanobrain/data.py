@@ -1,5 +1,6 @@
 import io
 import math
+import os
 from pathlib import Path
 
 import nibabel as nib
@@ -29,15 +30,37 @@ class Fomo300kDataset(Dataset):
         self.subject_ids = None
         # rim round: modality suffixes whose images may get rim / nodule pastes (model tumor_hot_mods); None = off
         self.hot_mods = None
+        # native_shard_fds (speed, off when None; same bytes): {} = each process keeps its shard files open and
+        # preads the members, instead of an open / seek / read / close (3 extra filesystem round trips) per image
+        self.shard_fds = None
 
     def __len__(self) -> int:
         return len(self.paths)
 
+    def _pread(self, index: int) -> bytes:
+        if self.shard_fds.get("pid") != os.getpid():
+            # fds opened by another process (the parent before the workers forked) are not reused
+            self.shard_fds = {"pid": os.getpid()}
+        fd = self.shard_fds.get(self.shards[index])
+        if fd is None:
+            fd = self.shard_fds[self.shards[index]] = os.open(self.root / self.shards[index], os.O_RDONLY)
+        offset, size = int(self.offsets[index]), int(self.sizes[index])
+        data = os.pread(fd, size, offset)
+        while len(data) < size:
+            more = os.pread(fd, size - len(data), offset + len(data))
+            if not more:
+                raise OSError(f"short read of {self.paths[index]}")
+            data += more
+        return data
+
     def __getitem__(self, index: int) -> dict:
         # npz members are stored uncompressed, so read them straight from their offset
-        with open(self.root / self.shards[index], "rb") as shard:
-            shard.seek(self.offsets[index])
-            data = shard.read(self.sizes[index])
+        if self.shard_fds is None:
+            with open(self.root / self.shards[index], "rb") as shard:
+                shard.seek(self.offsets[index])
+                data = shard.read(self.sizes[index])
+        else:
+            data = self._pread(index)
         with np.load(io.BytesIO(data)) as npz:
             sample = {
                 "path": self.paths[index],
@@ -193,6 +216,86 @@ class SubjectPairSampler(Sampler[int]):
                 jj = int(m[-1]) if jj == ii else jj
             yield ii
             yield jj
+
+
+class CountingSampler(Sampler[int]):
+    """native_readahead: the wrapped sampler's indices unchanged, counting how many the loader has drawn."""
+
+    def __init__(self, base: Sampler, counter):
+        self.base, self.counter = base, counter
+
+    def __iter__(self):
+        counter = self.counter
+        for ii in self.base:
+            counter.value += 1
+            yield ii
+
+
+def readahead(dataset: Fomo300kDataset, sampler: Sampler, lead: int, threads: int = 32) -> Sampler:
+    """native_readahead (speed, off when unset; same batches, same order): a forked helper process walks its own
+    iterator over the SAME sampler (same seed / start, so the same index stream) and reads the bytes of the next
+    `lead` samples beyond the ones the loader has drawn with `threads` parallel reads, so the workers' reads hit
+    the node's page cache instead of waiting on the shared filesystem (16 serial worker reads give ~1.3 GB/s cold;
+    the step needs ~0.9). The bytes are discarded (page cache only, no process memory). Returns the sampler for
+    the DataLoader, which counts the drawn indices for the helper. The helper dies with this process."""
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("fork")
+    counter = ctx.Value("q", 0, lock=False)
+    proc = ctx.Process(
+        target=_readahead_main,
+        args=(str(dataset.root), dataset.shards, dataset.offsets, dataset.sizes, sampler, counter, lead, threads),
+        daemon=True,
+    )
+    proc.start()
+    return CountingSampler(sampler, counter)
+
+
+def _readahead_main(root, shards, offsets, sizes, sampler, counter, lead, threads):
+    # forked child: file reads only, never cuda
+    import ctypes
+    import os
+    import queue
+    import signal
+    import threading
+    import time
+
+    try:
+        ctypes.CDLL("libc.so.6").prctl(1, signal.SIGKILL)  # PR_SET_PDEATHSIG: exit with the trainer
+    except OSError:
+        pass
+    os.nice(5)
+    todo = queue.Queue(maxsize=4 * threads)
+
+    fds = {}
+
+    def reader():
+        buf = memoryview(bytearray(8 << 20))
+        while True:
+            path, off, size = todo.get()
+            try:
+                fd = fds.get(path)
+                if fd is None:
+                    new = os.open(path, os.O_RDONLY)
+                    fd = fds.setdefault(path, new)
+                    if fd != new:
+                        os.close(new)
+                while size > 0:
+                    n = os.preadv(fd, [buf[: min(size, len(buf))]], off)
+                    if n <= 0:
+                        break
+                    off, size = off + n, size - n
+            except OSError:
+                pass
+
+    for _ in range(threads):
+        threading.Thread(target=reader, daemon=True).start()
+    issued = 0
+    for ii in sampler:
+        while issued - counter.value >= lead:
+            time.sleep(0.01)
+        todo.put((f"{root}/{shards[ii]}", int(offsets[ii]), int(sizes[ii])))
+        issued += 1
 
 
 def spacing_keys(paths: list[str], table: Path) -> np.ndarray:

@@ -251,6 +251,9 @@ def main(args: DictConfig):
 
     dataset = Fomo300kDataset(DATA_ROOT / "fomo300k", args.train_filelist)
     dataset.meta = fino_meta
+    if args.get("native_shard_fds"):
+        # speed (off when unset; same bytes): open shard files kept per loader worker (Fomo300kDataset.shard_fds)
+        dataset.shard_fds = {}
     if float(args.model_kwargs.get("scanmatch_weight", 0.0) or 0.0) > 0.0:
         # same-scan matching masks same-subject scans out of the negatives (subject tempering's key)
         from nanobrain.data import subject_counts
@@ -389,6 +392,14 @@ def main(args: DictConfig):
             logger.info(f"gdist subject pairs: same datatype, {len(set(pair_keys))} keys")
         sampler = SubjectPairSampler(sampler, pair_keys, seed=args.seed)
         logger.info("gdist subject pairs: batch images 2k, 2k + 1 share a subject")
+    if args.get("native_readahead"):
+        # speed (off when unset; same batches, same order): page cache readahead of the next native_readahead
+        # batches' files in a helper process (data.readahead)
+        from nanobrain.data import readahead
+
+        threads = int(args.get("native_readahead_threads") or 32)
+        sampler = readahead(dataset, sampler, int(args.native_readahead) * args.batch_size, threads)
+        logger.info(f"readahead: {args.native_readahead} batches ahead, {threads} threads")
     fast_prep = not args.native
     train_loader = DataLoader(
         dataset,
