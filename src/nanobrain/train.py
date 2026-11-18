@@ -213,7 +213,11 @@ def main(args: DictConfig):
             import torch._inductor.config as inductor_config
 
             inductor_config.coordinate_descent_tuning = True
-        model_without_ddp.compile_native(**({"mode": mode} if mode else {}))
+        kwargs = {"mode": mode} if mode else {}
+        if vis_sched_of(args) is not None:
+            # vis_sched: each phase's shape its own static graph (no automatic-dynamic recompile at the switch)
+            kwargs["dynamic"] = False
+        model_without_ddp.compile_native(**kwargs)
         native_cudagraphs = mode in ("reduce-overhead", "max-autotune")
     elif args.compile and args.cudagraphs:
         assert not args.distributed, "cudagraphs is single gpu only"
@@ -348,9 +352,16 @@ def main(args: DictConfig):
         sampler = SubjectPairSampler(sampler, subject_counts(dataset.paths)[0], seed=args.seed)
         logger.info("gdist subject pairs: batch images 2k, 2k + 1 share a subject")
     fast_prep = not args.native
+    vis = vis_sched_of(args)
+    loader_bs = args.batch_size if vis is None else max(vis["first"][2], vis["second"][2])
+    if vis is not None:
+        assert args.native and world_size == 1 and not args.get("native_bucket_window"), "vis_sched: single gpu native"
+        assert all(s[2] % 2 == 0 for s in (vis["first"], vis["second"])) or not (
+            args.model_kwargs.get("gdist_weight") and args.model_kwargs.get("gdist_pairs") == "subject"
+        ), "vis_sched.batch_size: even (subject pairs)"
     train_loader = DataLoader(
         dataset,
-        batch_size=args.batch_size,
+        batch_size=loader_bs,
         sampler=sampler,
         num_workers=args.num_workers,
         # no collate (variable shapes); the fast prep plans its numpy part in the workers
@@ -382,6 +393,19 @@ def main(args: DictConfig):
         )
     else:
         batch_transform = make_batch_transform(args)
+    if vis is not None:
+        # vis_sched: the batch shape current when this batch's prep starts (vis["cur"], set by the training loop), its
+        # first images when the phase's batch is smaller than the loader's; the loop drops batches of the other phase
+        sched_transform = batch_transform
+
+        def batch_transform(batch):
+            shape = vis["cur"]
+            if shape[2] < loader_bs:
+                batch = slice_raw_batch(batch, shape[2])
+            batch = sched_transform(batch)
+            batch["vis_shape"] = shape
+            return batch
+
     if args.get("native_prep_tokens"):
         # speed (off when unset): forward_native's weight-free tokenization (tumour paste, patchify,
         # sequences, token corruptions, level targets) in the prep threads, ahead of the main thread
@@ -393,11 +417,23 @@ def main(args: DictConfig):
 
         def batch_transform(batch):
             batch = base_transform(batch)
-            with torch.autocast(device_type=device.type, dtype=getattr(torch, args.amp_dtype), enabled=args.amp):
-                batch["tokens"] = model_without_ddp.native_prepare(
-                    batch["image"], batch["mask"], batch["spacing"], args.num_visible, args.num_predict,
-                    args.num_samples, lims=batch.get("lim"),
-                )
+            if vis is not None:
+                # vis_sched (recompiles mid-run): the autocast exit below would clear the autocast cast cache (one
+                # mutex for all threads) and free the main thread's compile-time fake casts here, without the gil,
+                # while the main thread's trace holds the gil and waits on that mutex: a deadlock (stack dumps of
+                # stalled smoke runs). one extra nesting level keeps this thread's exit from clearing the cache (the
+                # weight-free tokenization casts no weights, so its cache stays empty: same values)
+                torch.autocast_increment_nesting()
+            try:
+                with torch.autocast(device_type=device.type, dtype=getattr(torch, args.amp_dtype), enabled=args.amp):
+                    nv, npred = batch["vis_shape"][:2] if "vis_shape" in batch else (args.num_visible, args.num_predict)
+                    batch["tokens"] = model_without_ddp.native_prepare(
+                        batch["image"], batch["mask"], batch["spacing"], nv, npred,
+                        args.num_samples, lims=batch.get("lim"),
+                    )
+            finally:
+                if vis is not None:
+                    torch.autocast_decrement_nesting()
             if batch["mask"] is None:
                 # native_sparse_tokens: the SparseVolumes stays in this thread (the model reads only the tokens)
                 batch["image"], batch["mask"] = [], []
@@ -437,6 +473,7 @@ def main(args: DictConfig):
         batch_flops,
         stop_event,
         native_cudagraphs,
+        vis,
     )
 
     if args.distributed:
@@ -493,6 +530,7 @@ def train(
     batch_flops: float,
     stop_event: threading.Event,
     native_cudagraphs: bool = False,
+    vis: dict | None = None,
 ) -> dict:
     model.train()
 
@@ -579,7 +617,27 @@ def train(
         total_steps=num_batches,
         start_step=start_batch,
     )
+    num_visible, num_predict = args.num_visible, args.num_predict
     for batch_idx, batch in enumerate(batches, start=start_batch):
+        if vis is not None:
+            # vis_sched: one switch of (num_visible, num_predict, batch_size) at vis["frac"] of the lr schedule's
+            # progress clock; batches the prep threads tokenized in the other phase's shape are dropped
+            if time_schedule:
+                wall = prev_wall_time + time.monotonic() - start_time
+                vprog = 0.0 if train_t0 is None else (wall - train_t0) / max(time_limit - train_t0, 1.0)
+            else:
+                vprog = step / total_steps
+            want = vis["second"] if vprog >= vis["frac"] else vis["first"]
+            if want != vis["cur"]:
+                vis["cur"] = want
+                throughput.units_per_step["vol"] = want[2] * misc.get_world_size()
+                logger.info(
+                    f"vis_sched: step {step}, progress {vprog:.3f}: num_visible / num_predict / batch_size "
+                    f"-> {want[0]} / {want[1]} / {want[2]}"
+                )
+            if batch.get("vis_shape", want) != want:
+                continue
+            num_visible, num_predict = want[:2]
         need_update = (batch_idx + 1) % args.accum_iter == 0
         log_step = (batch_idx + 1) % print_freq_batches == 0
         if time_schedule:
@@ -643,8 +701,8 @@ def train(
             loss = model(
                 images,
                 masks,
-                num_visible=args.num_visible,
-                num_predict=args.num_predict,
+                num_visible=num_visible,
+                num_predict=num_predict,
                 num_samples=args.num_samples,
                 with_state=False,
                 spacing=batch.get("spacing"),
@@ -765,6 +823,31 @@ def train(
         "wall_time": prev_wall_time + time.monotonic() - start_time,
         "loss": metric_logger.loss.median,
     }
+
+
+def vis_sched_of(args: DictConfig) -> dict | None:
+    # vis_sched (off when unset): {frac, first / second: (num_visible, num_predict, batch_size), cur: the live shape}
+    vs = args.get("vis_sched")
+    if not vs or vs.get("frac") is None:
+        return None
+    frac = float(vs.frac)
+    assert 0.0 < frac < 1.0, f"vis_sched.frac in (0, 1), got {frac}"
+    first = (int(args.num_visible), int(args.num_predict), int(args.batch_size))
+    second = tuple(int(vs.get(k) or d) for k, d in zip(("num_visible", "num_predict", "batch_size"), first))
+    return {"frac": frac, "first": first, "second": second, "cur": first}
+
+
+def slice_raw_batch(batch, n: int):
+    # a loader batch's first n images (a native_concat dict or a per sample list)
+    if isinstance(batch, list):
+        return batch[:n]
+    samples = batch["samples"][:n]
+    out = dict(batch, samples=samples)
+    out["values"] = batch["values"][: sum(s["n_values"] for s in samples)]
+    out["mask_rle"] = batch["mask_rle"][: sum(s["n_runs"] for s in samples)]
+    for k in ("num_values", "num_runs", "scale", "clip"):
+        out[k] = batch[k][:n]
+    return out
 
 
 def make_optimizer(args: DictConfig, model: nn.Module):
