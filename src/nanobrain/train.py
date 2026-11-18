@@ -435,12 +435,21 @@ def main(args: DictConfig):
 
         def batch_transform(batch):
             batch = base_transform(batch)
-            with torch.autocast(device_type=device.type, dtype=getattr(torch, args.amp_dtype), enabled=args.amp):
-                batch["tokens"] = model_without_ddp.native_prepare(
-                    batch["image"], batch["mask"], batch["spacing"], args.num_visible, args.num_predict,
-                    args.num_samples, lims=batch.get("lim"),
-                    **({"hot_ok": batch["hot_ok"]} if "hot_ok" in batch else {}),
-                )
+            # start-up deadlock guard (from ofx/hr, there vis_sched only): the autocast exit below would clear the
+            # autocast cast cache (one mutex for all threads) and free the main thread's compile-time fake casts here,
+            # without the gil, while the main thread's trace holds the gil and waits on that mutex (stack dumps of
+            # stalled runs). one extra nesting level keeps this thread's exit from clearing the cache (the weight-free
+            # tokenization casts no weights, so its cache stays empty: same values)
+            torch.autocast_increment_nesting()
+            try:
+                with torch.autocast(device_type=device.type, dtype=getattr(torch, args.amp_dtype), enabled=args.amp):
+                    batch["tokens"] = model_without_ddp.native_prepare(
+                        batch["image"], batch["mask"], batch["spacing"], args.num_visible, args.num_predict,
+                        args.num_samples, lims=batch.get("lim"),
+                        **({"hot_ok": batch["hot_ok"]} if "hot_ok" in batch else {}),
+                    )
+            finally:
+                torch.autocast_decrement_nesting()
             if batch["mask"] is None:
                 # native_sparse_tokens: the SparseVolumes stays in this thread (the model reads only the tokens)
                 batch["image"], batch["mask"] = [], []
