@@ -183,6 +183,14 @@ class ViTMAE3D(nn.Module):
         # the tissue instead of brighter; a ring's core darkening keeps its sign, so a flipped ring is a
         # dark mass with a darker core). 0 = off: no extra draw, the paste and its RNG stream unchanged
         tumor_neg_prob: float = 0.0,
+        # les2 (adapted from the Labless lesion-objective runs; all off = unchanged, native_sparse_tokens fast path):
+        # tumor_count, masses per pasted image (uniform integer [lo, hi], the lesion mask their union; drawn only when
+        # hi > lo); lesion_typed, a 3-channel lesion head [whole, rim max(outer - core, 0), whole of masses with
+        # r <= lesion_small_mm] (BCE averaged over the channels); lesion_dice_weight, + per-scan squared soft Dice
+        tumor_count: tuple[int, int] = (1, 1),
+        lesion_typed: bool = False,
+        lesion_small_mm: float = 8.0,
+        lesion_dice_weight: float = 0.0,
         # zero-init linear head on the visible encoder tokens: BCE to the inserted lesion (blobs,
         # tumours) fraction of each level_pool^3 sub-block, in-mask weighted (weight; 0 = off).
         # tokens a corruption replaced or altered (rtd / unified / hemiswap / corrupt / orient /
@@ -496,12 +504,19 @@ class ViTMAE3D(nn.Module):
         self.tumor_nodule = float(tumor_nodule)
         self.tumor_neg_prob = float(tumor_neg_prob)
         assert 0.0 <= self.tumor_neg_prob <= 1.0, "tumor_neg_prob: in [0, 1]"
+        self.tumor_count = tuple(int(v) for v in tumor_count)
+        assert 1 <= self.tumor_count[0] <= self.tumor_count[1], "tumor_count: 1 <= lo <= hi"
+        self.lesion_typed, self.lesion_small_mm = bool(lesion_typed), float(lesion_small_mm)
+        self.lesion_ch = 3 if self.lesion_typed else 1
+        self.lesion_dice_weight = float(lesion_dice_weight)
         self.lesion_mask_weight = float(lesion_mask_weight)
+        assert not (self.lesion_typed or self.lesion_dice_weight) or self.lesion_mask_weight, "les2: lesion head on"
+        assert not (self.lesion_typed and lesion_rim_weight), "lesion_typed: not with lesion_rim_weight"
         self.lesion_head = None
         if self.lesion_mask_weight:
             assert native and (blob_prob or tumor_prob), "lesion_mask_weight: native path, blobs or tumours on"
             with torch.random.fork_rng(devices=[]):
-                self.lesion_head = nn.Linear(embed_dim, (patch_size // level_pool) ** 3)
+                self.lesion_head = nn.Linear(embed_dim, self.lesion_ch * (patch_size // level_pool) ** 3)
             nn.init.zeros_(self.lesion_head.weight)
             nn.init.zeros_(self.lesion_head.bias)
         self.lesion_rim_weight = float(lesion_rim_weight)
@@ -1827,10 +1842,15 @@ class ViTMAE3D(nn.Module):
                 pairs = [self.lesion_targets(part.pop("lesion"), part.pop("lesion_mask"), part["patch"]) for part in parts]
                 weight, target = [torch.cat(v) for v in zip(*pairs)]
             logits = self._head("lesion_head", embeds[:, self.class_tokens :])
-            num, lw = _wbce(logits, target, weight) if getattr(self, "compiled_loss", False) else _wbce_eager(logits, target, weight)
-            lw = lw.clamp_min(1e-6)
+            cl = getattr(self, "compiled_loss", False)
+            num, lw = _wbce(logits, target, weight) if cl else _wbce_eager(logits, target, weight)
+            # lesion_typed: weight [N, 1, NB] broadcast over the target's [N, 3, NB] channels (the channel mean)
+            lw = (lw * self.lesion_ch).clamp_min(1e-6) if self.lesion_typed else lw.clamp_min(1e-6)
             les_loss = num / lw
             loss = loss + self.lesion_mask_weight * self.lesion_scale * les_loss
+            if self.lesion_dice_weight:
+                dice = (_lesion_dice if cl else _lesion_dice_eager)(logits, target, weight, embeds.shape[0] // num_samples)
+                loss = loss + self.lesion_dice_weight * self.lesion_scale * dice
             rim_loss = None
             if rim_head is not None:
                 # lesion_rim_weight: the rim-only target with the lesion loss' weights (same exclusions)
@@ -2032,6 +2052,13 @@ class ViTMAE3D(nn.Module):
             images, mask = [torch.empty(sh, device="meta") for sh in sparse.ras], None
         device = images[0].device if sparse is None else sparse.device
         tumors, tdesc = {}, None
+        from . import sparse as sparse_mod
+
+        sparse_fast = (
+            sparse is not None and sparse_mod.FAST_TOK and self.flat_loss_ok() and getattr(self, "batched_level", False)
+            and self.level_head is not None and self.lesion_head is not None and self.corrupt_head is None
+            and self.orient_head is None and self.edgelvl_head is None
+        )
         assert getattr(self, "tumor_desc_head", None) is None or sparse is not None, "tumor_desc: native_sparse_tokens"
         rim_on = getattr(self, "lesion_rim_head", None) is not None and self.training
         if self.training and getattr(self, "tumor_hot_mods", None):
@@ -2045,6 +2072,11 @@ class ViTMAE3D(nn.Module):
                 rim_kw["rim_mm"] = self.tumor_rim_mm
             if getattr(self, "tumor_hot_mods", None):
                 rim_kw["hot_ok"] = hot_ok
+            les2 = getattr(self, "lesion_typed", False) or getattr(self, "tumor_count", (1, 1))[1] > 1
+            if les2:
+                # tumor_count / lesion_typed: the sparse gather kernel pastes several masses and the typed channels
+                assert sparse is not None and sparse_fast, "tumor_count / lesion_typed: native_fast_prep path"
+                rim_kw.update(count=self.tumor_count, small_mm=self.lesion_small_mm if self.lesion_typed else None)
             tumors = plan_tumors(
                 images, mask if sparse is None else images, groups, geoms, self.tumor_prob * self.tumor_scale,
                 self.tumor_radius, self.tumor_ring, self.tumor_contrast, self.tumor_edge, self.tumor_nodule,
@@ -2063,8 +2095,6 @@ class ViTMAE3D(nn.Module):
 
             svols = {sp: sparse.group(sp, ids, geoms[sp][0], geoms[sp][2]) for sp, ids in groups.items()}
             sfrac = dict(zip(svols, frac_all(sparse, list(svols.values()))))
-        from . import sparse as sparse_mod
-
         fast_scores = sparse is not None and sparse_mod.FAST_SCORES
         for sp, ids in groups.items():
             patch, box, grid, _ = geoms[sp]
@@ -2182,15 +2212,12 @@ class ViTMAE3D(nn.Module):
             uni = [t.split(num_rows) for t in (cand, labels, kind)]
         for part in parts:
             part.pop("mask_frac", None)
-        if (
-            sparse is not None and uni is not None and sparse_mod.FAST_TOK and self.flat_loss_ok()
-            and getattr(self, "batched_level", False) and self.level_head is not None and self.lesion_head is not None
-            and self.corrupt_head is None and self.orient_head is None and self.edgelvl_head is None
-        ):
+        if sparse_fast and uni is not None:
             # FAST_TOK (speed): the rest below as a few batched launches over flat buffers (sparse.fast_tokens)
             return self._attach_tdesc(sparse_mod.fast_tokens(
                 self, sparse, parts, order_all, (cand, labels, kind), geoms, num_samples, num_visible, num_predict
             ), tdesc, num_samples)
+        assert not getattr(self, "lesion_typed", False) or not self.training, "lesion_typed: native_fast_prep path"
 
         def finish(part, order, num, vols, coord, b, vis_patches, vis_mask):
             # a group's tokenization after its unified corruption (split out so batched_corrupt can apply
@@ -2780,6 +2807,8 @@ def plan_tumors(
     rim: bool = False,
     rim_mm: tuple[float, float] | None = None,
     hot_ok: list | None = None,
+    count: tuple[int, int] = (1, 1),
+    small_mm: float | None = None,
 ) -> dict[tuple, tuple[Tensor, Tensor, Tensor, Tensor]]:
     # one lobulated mass sized in mm in a prob share of the batch, centred >= 6 mm inside the mask: a
     # solid bright 3-10 mm nodule (share nodule), else a bright 3-8 mm rim of uneven thickness on a
@@ -2795,7 +2824,10 @@ def plan_tumors(
     k = min(len(masks), int(prob * len(masks) + torch.rand(()).item()))
     if k == 0:
         return {}
-    chosen = set(torch.randperm(len(masks))[:k].tolist())
+    chosen = torch.randperm(len(masks))[:k].tolist()
+    # les2 tumor_count: masses per chosen image (drawn only when hi > lo), an image's masses adjacent in the plan
+    reps = dict(zip(chosen, torch.randint(count[0], count[1] + 1, (k,)).tolist() if count[1] > count[0] else [1] * k))
+    chosen = set(chosen)
     geo, owners, counts = [], [], {}
     for sp, ids in groups.items():
         patch, box, grid, _ = geoms[sp]
@@ -2805,10 +2837,11 @@ def plan_tumors(
                 continue
             src, dst = fit_slices(masks[ii].shape, box)
             span = [d.stop - d.start for d in dst]
-            geo.append([*sp, *dims, *(d.start for d in dst), *span, *(d.start - c.start for c, d in zip(src, dst)),
-                        *masks[ii].shape, jj * math.prod(dims)])
-            owners.append(ii)
-            counts[sp] = counts.get(sp, 0) + 1
+            geo += [[*sp, *dims, *(d.start for d in dst), *span, *(d.start - c.start for c, d in zip(src, dst)),
+                     *masks[ii].shape, jj * math.prod(dims)]] * reps[ii]
+            owners += [ii] * reps[ii]
+            counts[sp] = counts.get(sp, 0) + reps[ii]
+    k = len(owners)
     # per mass draws and box sizes on the cpu stream (known sizes, no gpu sync)
     geo = torch.tensor(geo, dtype=torch.float64)
     spc, dims, dst0, span, shift, shape = geo[:, :18].split(3, 1)
@@ -2875,6 +2908,9 @@ def plan_tumors(
         out = {"owners": owners, "lo": lo, "num": num, "par": torch.cat([cols, centre - lo, lim], 1), "knots": knots}
         if rim:
             out["hot"] = hot.float().to(dev)
+        if small_mm is not None:
+            # les2 lesion_typed: the rim channel ungated (every mass), the small channel on masses of r <= small_mm
+            out["hot"], out["sml"] = torch.ones(k, device=dev), (r <= small_mm).float().to(dev)
         if desc:
             # tumor_desc targets (cpu draws): kind flags, log radius, contrast, log edge width
             out["desc"] = torch.stack([is_nodule.double(), is_ring.double(), (r.log() - 2.5) / 0.5, (amp - 2.5) / 1.0,
@@ -2994,6 +3030,19 @@ def _wbce_eager(logits: Tensor, target: Tensor, weight: Tensor) -> tuple[Tensor,
     return (weight * bce).sum(), weight.sum()
 
 
+def _lesion_dice_eager(logits: Tensor, target: Tensor, weight: Tensor, B: int) -> Tensor:
+    # les2: per scan (its num_samples rows) and channel, 1 - squared soft Dice over the weighted visible sub-blocks;
+    # the mean over (scan, channel) pairs with > 0.25 weighted lesion sub-blocks
+    nb = target.shape[-1]
+    y = target.float().reshape(B, -1, target.numel() // (target.shape[0] * nb), nb)
+    p = torch.sigmoid(logits.float().reshape(y.shape))
+    w = weight.float().reshape(B, -1, 1, nb)
+    wy = w * y
+    inter, den = (p * wy).sum((1, 3)), (w * (p.square() + y.square())).sum((1, 3))
+    has = wy.sum((1, 3)) > 0.25
+    return torch.where(has, 1.0 - 2.0 * inter / (den + 1e-2), 0.0).sum() / has.sum().clamp_min(1)
+
+
 def _wmse_eager(pred: Tensor, target: Tensor, weight: Tensor) -> tuple[Tensor, Tensor]:
     return (weight * F.mse_loss(pred, target, reduction="none")).sum(), weight.sum()
 
@@ -3001,6 +3050,7 @@ def _wmse_eager(pred: Tensor, target: Tensor, weight: Tensor) -> tuple[Tensor, T
 # compiled_loss (speed): the loss reductions as compiled kernels (the same elementwise math, fused sums)
 _wbce = torch.compile(_wbce_eager, dynamic=False)
 _wmse = torch.compile(_wmse_eager, dynamic=True)
+_lesion_dice = torch.compile(_lesion_dice_eager, dynamic=False)
 
 
 def flat_rows(tensors: list[Tensor]) -> Tensor:

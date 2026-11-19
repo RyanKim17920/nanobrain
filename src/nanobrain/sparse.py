@@ -196,10 +196,12 @@ def _frac_kernel(gtab, G, rimg, geo, line, bits, pre, out, NT, TB: tl.constexpr,
 @triton.jit(do_not_specialize=["G", "NK", "V", "SEQ"])
 def _gather_kernel(
     gtab, G, tok, rimg, geo, nrm, bits, pre, vals, mass, ti, tf, knots, img_out, msk_out, les_out, NK,
-    t_img, t_w, V, SEQ, rim_out, hot,
+    t_img, t_w, V, SEQ, rim_out, hot, sml_out, sml,
     TUMOR: tl.constexpr, LES: tl.constexpr, BLOCK: tl.constexpr, SPLIT: tl.constexpr = False, NC: tl.constexpr = 10,
-    RIM: tl.constexpr = False,
+    RIM: tl.constexpr = False, SML: tl.constexpr = False,
 ):
+    # les2: mass (per image: first mass, masses) pasted one after another, the soft masks their max; SML (lesion_typed,
+    # with RIM): + the whole soft mask of masses flagged small (sml) to sml_out
     # RIM (lesion_rim_weight, with LES): + the rim-only soft mask (max(outer - core, 0) x the mass' hot flag) to rim_out
     # one row of (image, box token) per program, rows of every group: the normalized image / mask voxels (+ the
     # pasted tumour, its soft mask). group table rows (NC 10): first row, P, PX, PY, PZ, GY, GZ, rows per image,
@@ -230,7 +232,11 @@ def _gather_kernel(
         on = tl.where(vis, 1.0, invp)
         o1 = tl.where(vis, img_out, t_img)
         o2 = tl.where(vis, msk_out, t_w)
-    k = tl.load(mass + img) if TUMOR else -1
+    k0 = tl.load(mass + 2 * img) if TUMOR else 0
+    nk = tl.load(mass + 2 * img + 1) if TUMOR else 0
+    c0 = tid // (GY * GZ) * PX  # the token's low box corner
+    c1 = (tid // GZ) % GY * PY
+    c2 = tid % GZ * PZ
     for q0 in range(0, P, BLOCK):
         q = q0 + tl.arange(0, BLOCK)
         qm = q < P
@@ -238,50 +244,58 @@ def _gather_kernel(
         v, inm = _lookup(f, valid & qm, bits, pre, vals, img, nrm)
         les = tl.zeros([BLOCK], dtype=tl.float32)
         rim = tl.zeros([BLOCK], dtype=tl.float32)
+        sm = tl.zeros([BLOCK], dtype=tl.float32)
         if TUMOR:
-            if k >= 0:
-                # plan_tumors' mass value at these box voxels (the knot noise trilinear on the mass' 5^3 block)
-                l0 = b0 - tl.load(ti + k * 6)
-                l1 = b1 - tl.load(ti + k * 6 + 1)
-                l2 = b2 - tl.load(ti + k * 6 + 2)
-                inbox = (l0 >= 0) & (l0 < tl.load(ti + k * 6 + 3)) & (l1 >= 0) & (l1 < tl.load(ti + k * 6 + 4))
-                inbox = inbox & (l2 >= 0) & (l2 < tl.load(ti + k * 6 + 5))
-                fp = tf + k * 19
-                r0 = (l0.to(tl.float32) - tl.load(fp + 14)) * tl.load(fp)
-                r1 = (l1.to(tl.float32) - tl.load(fp + 15)) * tl.load(fp + 1)
-                r2 = (l2.to(tl.float32) - tl.load(fp + 16)) * tl.load(fp + 2)
-                a0 = r0 * tl.load(fp + 3)
-                a1 = r1 * tl.load(fp + 4)
-                a2 = r2 * tl.load(fp + 5)
-                d = tl.sqrt(a0 * a0 + a1 * a1 + a2 * a2)
-                ib = tl.load(fp + 6)
-                u0 = (tl.minimum(tl.maximum(r0 * ib, -1.0), 1.0) + 1.0) * 2.0
-                u1 = (tl.minimum(tl.maximum(r1 * ib, -1.0), 1.0) + 1.0) * 2.0
-                u2 = (tl.minimum(tl.maximum(r2 * ib, -1.0), 1.0) + 1.0) * 2.0
-                i0 = tl.minimum(u0.to(tl.int32), 3)
-                i1 = tl.minimum(u1.to(tl.int32), 3)
-                i2 = tl.minimum(u2.to(tl.int32), 3)
-                f0 = u0 - i0.to(tl.float32)
-                f1 = u1 - i1.to(tl.float32)
-                f2 = u2 - i2.to(tl.float32)
-                base = knots + (k * 5 + i0) * 25 + i1 * 5 + i2
-                bump = tl.zeros([BLOCK], dtype=tl.float32)
-                thick = tl.zeros([BLOCK], dtype=tl.float32)
-                for c in tl.static_range(8):
-                    w = (f0 if c & 4 else 1.0 - f0) * (f1 if c & 2 else 1.0 - f1) * (f2 if c & 1 else 1.0 - f2)
-                    oc = (25 if c & 4 else 0) + (5 if c & 2 else 0) + (1 if c & 1 else 0)
-                    bump += w * tl.load(base + oc, mask=qm, other=0.0)
-                    thick += w * tl.load(base + NK * 125 + oc, mask=qm, other=0.0)
-                depth = (1.0 - d * (1.0 + bump)) * tl.load(fp + 7)
-                outer = tl.sigmoid(depth * tl.load(fp + 8))
-                core = tl.sigmoid((depth - tl.load(fp + 9) * (1.0 + 2.0 * thick)) * 1.1) * tl.load(fp + 10)
-                val = tl.load(fp + 11) * (outer - core) - tl.load(fp + 12) * core
-                inside = inm & inbox
-                new = tl.minimum(tl.maximum(v + val, tl.load(fp + 17)), tl.load(fp + 18))
-                v = tl.where(inside, new, v)
-                les = tl.where(inside, outer, 0.0)
-                if RIM:
-                    rim = tl.where(inside, tl.maximum(outer - core, 0.0) * tl.load(hot + k), 0.0)
+            for k in range(k0, k0 + nk):
+                # a mass whose box misses this token leaves its voxels unchanged
+                hit = (tl.load(ti + k * 6) < c0 + PX) & (tl.load(ti + k * 6) + tl.load(ti + k * 6 + 3) > c0)
+                hit = hit & (tl.load(ti + k * 6 + 1) < c1 + PY) & (tl.load(ti + k * 6 + 1) + tl.load(ti + k * 6 + 4) > c1)
+                hit = hit & (tl.load(ti + k * 6 + 2) < c2 + PZ) & (tl.load(ti + k * 6 + 2) + tl.load(ti + k * 6 + 5) > c2)
+                if hit:
+                    # plan_tumors' mass value at these box voxels (the knot noise trilinear on the mass' 5^3 block)
+                    l0 = b0 - tl.load(ti + k * 6)
+                    l1 = b1 - tl.load(ti + k * 6 + 1)
+                    l2 = b2 - tl.load(ti + k * 6 + 2)
+                    inbox = (l0 >= 0) & (l0 < tl.load(ti + k * 6 + 3)) & (l1 >= 0) & (l1 < tl.load(ti + k * 6 + 4))
+                    inbox = inbox & (l2 >= 0) & (l2 < tl.load(ti + k * 6 + 5))
+                    fp = tf + k * 19
+                    r0 = (l0.to(tl.float32) - tl.load(fp + 14)) * tl.load(fp)
+                    r1 = (l1.to(tl.float32) - tl.load(fp + 15)) * tl.load(fp + 1)
+                    r2 = (l2.to(tl.float32) - tl.load(fp + 16)) * tl.load(fp + 2)
+                    a0 = r0 * tl.load(fp + 3)
+                    a1 = r1 * tl.load(fp + 4)
+                    a2 = r2 * tl.load(fp + 5)
+                    d = tl.sqrt(a0 * a0 + a1 * a1 + a2 * a2)
+                    ib = tl.load(fp + 6)
+                    u0 = (tl.minimum(tl.maximum(r0 * ib, -1.0), 1.0) + 1.0) * 2.0
+                    u1 = (tl.minimum(tl.maximum(r1 * ib, -1.0), 1.0) + 1.0) * 2.0
+                    u2 = (tl.minimum(tl.maximum(r2 * ib, -1.0), 1.0) + 1.0) * 2.0
+                    i0 = tl.minimum(u0.to(tl.int32), 3)
+                    i1 = tl.minimum(u1.to(tl.int32), 3)
+                    i2 = tl.minimum(u2.to(tl.int32), 3)
+                    f0 = u0 - i0.to(tl.float32)
+                    f1 = u1 - i1.to(tl.float32)
+                    f2 = u2 - i2.to(tl.float32)
+                    base = knots + (k * 5 + i0) * 25 + i1 * 5 + i2
+                    bump = tl.zeros([BLOCK], dtype=tl.float32)
+                    thick = tl.zeros([BLOCK], dtype=tl.float32)
+                    for c in tl.static_range(8):
+                        w = (f0 if c & 4 else 1.0 - f0) * (f1 if c & 2 else 1.0 - f1) * (f2 if c & 1 else 1.0 - f2)
+                        oc = (25 if c & 4 else 0) + (5 if c & 2 else 0) + (1 if c & 1 else 0)
+                        bump += w * tl.load(base + oc, mask=qm, other=0.0)
+                        thick += w * tl.load(base + NK * 125 + oc, mask=qm, other=0.0)
+                    depth = (1.0 - d * (1.0 + bump)) * tl.load(fp + 7)
+                    outer = tl.sigmoid(depth * tl.load(fp + 8))
+                    core = tl.sigmoid((depth - tl.load(fp + 9) * (1.0 + 2.0 * thick)) * 1.1) * tl.load(fp + 10)
+                    val = tl.load(fp + 11) * (outer - core) - tl.load(fp + 12) * core
+                    inside = inm & inbox
+                    new = tl.minimum(tl.maximum(v + val, tl.load(fp + 17)), tl.load(fp + 18))
+                    v = tl.where(inside, new, v)
+                    les = tl.where(inside, tl.maximum(les, outer), les)
+                    if RIM:
+                        rim = tl.where(inside, tl.maximum(rim, tl.maximum(outer - core, 0.0) * tl.load(hot + k)), rim)
+                    if SML:
+                        sm = tl.where(inside, tl.maximum(sm, outer * tl.load(sml + k)), sm)
         o = obase + q
         if SPLIT:
             tl.store(o1 + o, v, mask=qm)
@@ -290,6 +304,8 @@ def _gather_kernel(
                 tl.store(les_out + o, les, mask=qm & want)
                 if RIM:
                     tl.store(rim_out + o, rim, mask=qm & want)
+                if SML:
+                    tl.store(sml_out + o, sm, mask=qm & want)
         else:
             tl.store(img_out + o, v, mask=qm)
             tl.store(msk_out + o, inm.to(tl.float32), mask=qm)
@@ -297,6 +313,8 @@ def _gather_kernel(
                 tl.store(les_out + o, les, mask=qm)
                 if RIM:
                     tl.store(rim_out + o, rim, mask=qm)
+                if SML:
+                    tl.store(sml_out + o, sm, mask=qm)
 
 
 @triton.jit(do_not_specialize=["R", "P", "T"])
@@ -653,20 +671,24 @@ class SparseVolumes:
         self.geo, self.line, *rimg = _pack(self.device, [np.asarray(rows, np.int64), line, *groups.values()])
         self.rimg = dict(zip(groups, rimg))
         self.mass = None
-        self.hot = None
+        self.hot = self.sml = None
 
     def tumors(self, plan: dict | None) -> None:
         # plan_tumors' sparse plan: per mass box (lo, num) and its float parameters, the knot noise
         if not plan:
             return
-        self.mass = torch.full((self.B,), -1, dtype=torch.int32)
-        self.mass[plan["owners"]] = torch.arange(len(plan["owners"]), dtype=torch.int32)
-        self.mass = _to(self.device, self.mass)
+        # per image: first mass, masses (an image's masses adjacent in the plan)
+        own = torch.tensor(plan["owners"], dtype=torch.int64)
+        mass = torch.zeros((self.B, 2), dtype=torch.int32)
+        mass[:, 1].index_add_(0, own, torch.ones(len(own), dtype=torch.int32))
+        mass[:, 0].scatter_reduce_(0, own, torch.arange(len(own), dtype=torch.int32), "amin", include_self=False)
+        self.mass = _to(self.device, mass.reshape(-1))
         self.ti = torch.cat([plan["lo"], plan["num"]], 1).contiguous()
         self.tf = plan["par"].contiguous()
         self.knots = plan["knots"].contiguous()
         # lesion_rim_weight: per mass 1 = rim / nodule (enhancing), 0 = diffuse
         self.hot = plan["hot"].contiguous() if "hot" in plan else None
+        self.sml = plan["sml"].contiguous() if "sml" in plan else None  # les2 lesion_typed
 
     def gather(self, specs: list[tuple], cfg: tuple = (512, 4)) -> list[tuple]:
         # specs (group, tok, rimg, rows per image, lesion) -> (image, mask, lesion | None, rim | None) [R, P] each, in
@@ -694,7 +716,7 @@ class SparseVolumes:
             tab, len(specs), tok, rimg, self.geo, self.nrm, self.bits, self.pre, self.vals,
             self.mass if tumor else d, self.ti if tumor else d, self.tf if tumor else d, self.knots if tumor else d,
             img, msk, les, (self.knots.shape[2] // 5) if tumor else 1, img, img, 0, 1, rim,
-            self.hot if rim_on else img, TUMOR=tumor, LES=lesion, BLOCK=cfg[0], num_warps=cfg[1], RIM=rim_on,
+            self.hot if rim_on else img, img, img, TUMOR=tumor, LES=lesion, BLOCK=cfg[0], num_warps=cfg[1], RIM=rim_on,
         )
         out, o0 = [], 0
         for G, tok, _, _, want in specs:
@@ -982,6 +1004,8 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     # lesion_rim_weight: the rim-only mask beside the lesion (hot flags in the plan)
     rim_on = lesion and vol.hot is not None
     vrim = torch.empty(vb, **f32) if rim_on else vimg
+    sml_on = rim_on and vol.sml is not None  # les2 lesion_typed: + the small-mass channel
+    vsml = torch.empty(vb, **f32) if sml_on else vimg
     timg, tw = torch.empty(tb, **f32), torch.empty(tb, **f32)
     tmin = torch.empty(R * V, **f32)
     out = torch.empty(vb, **f32)
@@ -1037,8 +1061,8 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
         rimg, vol.geo, vol.nrm, vol.bits, vol.pre, vol.vals,
         vol.mass if tumor else d, vol.ti if tumor else d, vol.tf if tumor else d, vol.knots if tumor else d,
         vimg, vmsk, vles, (vol.knots.shape[2] // 5) if tumor else 1, timg, tw, V, seq, vrim,
-        vol.hot if rim_on else vimg, TUMOR=tumor, LES=lesion, BLOCK=GATHER_CFG[0], SPLIT=True, NC=13,
-        num_warps=GATHER_CFG[1], RIM=rim_on,
+        vol.hot if rim_on else vimg, vsml, vol.sml if sml_on else vimg, TUMOR=tumor, LES=lesion, BLOCK=GATHER_CFG[0],
+        SPLIT=True, NC=13, num_warps=GATHER_CFG[1], RIM=rim_on, SML=sml_on,
     )
     # token centres: every group's table in one gather
     ctr = geoms[parts[0]["spacing"]][3][0] if len(parts) == 1 else torch.cat([geoms[p["spacing"]][3][0] for p in parts])
@@ -1089,11 +1113,11 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     _pool_all_kernel[(blk, 1 if FAST_POOL else T + 2)](ptab, len(gs), out, vmsk, vles, thr, pooled, T,
                                                        T + 1 if FAST_POOL else 0, BR=64, BK=64, NB=NB, SUB=sub,
                                                        NC=8 + 3 * sub)
-    rpool = None
-    if rim_on:
-        # the rim channel alone: _pool_all_kernel's lesion branch with T = -1 (channel 0 = T + 1, rows of 1 channel)
-        rpool = torch.empty(R * V, 1, NB, **f32)
-        _pool_all_kernel[(blk, 1)](ptab, len(gs), out, vmsk, vrim, thr, rpool, -1, 0, BR=64, BK=64, NB=NB, SUB=sub,
+    xpool = []
+    for vx in [vrim] * rim_on + [vsml] * sml_on:
+        # the rim (small) channel alone: _pool_all_kernel's lesion branch with T = -1 (channel 0 = T + 1, rows of 1)
+        xpool.append(torch.empty(R * V, 1, NB, **f32))
+        _pool_all_kernel[(blk, 1)](ptab, len(gs), out, vmsk, vx, thr, xpool[-1], -1, 0, BR=64, BK=64, NB=NB, SUB=sub,
                                    NC=8 + 3 * sub)
     pooled = (pooled if NB == sub**3 else pooled[..., : sub**3]).reshape(R * V, T + 2, sub, sub, sub)
     w = pooled[:, :1]
@@ -1103,7 +1127,13 @@ def fast_tokens(model, vol: "SparseVolumes", parts: list[dict], order_all: Tenso
     keep = ~altered.reshape(-1, 1)
     les_w = torch.where(keep, w, 0.0)
     les_t = torch.where(keep, pooled[:, 1 + T].flatten(1) / w.clamp_min(1e-6), 0.0)
-    rim_t = None if rpool is None else torch.where(keep, rpool[..., : sub**3].flatten(1) / w.clamp_min(1e-6), 0.0)
+    xt = [torch.where(keep, xp[..., : sub**3].flatten(1) / w.clamp_min(1e-6), 0.0) for xp in xpool]
+    rim_t = xt[0] if xt else None
+    if getattr(model, "lesion_typed", False):
+        # lesion_typed: targets [N, 3 (whole, rim, small), NB], weights [N, 1, NB]
+        assert lesion is False or len(xt) == 2, "lesion_typed: the typed channels missing"
+        les_t = torch.stack([les_t, *xt], 1) if xt else les_t[:, None].expand(-1, 3, -1)
+        les_w, rim_t = les_w[:, None], None
     syn = ~altered
     for p, g, order in zip(parts, gs, order_all.split([g["rows"] for g in gs])):
         a, z, P = g["r0"], g["r0"] + g["rows"], g["P"]
